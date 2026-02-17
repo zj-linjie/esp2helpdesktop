@@ -28,7 +28,8 @@ interface SystemData {
   timestamp: string;
   cpu: number;
   memory: number;
-  network: number;
+  networkUpload: number;
+  networkDownload: number;
 }
 
 interface LogMessage {
@@ -38,22 +39,32 @@ interface LogMessage {
   message: string;
 }
 
-interface Device {
-  id: string;
-  name: string;
-  type: string;
+interface ESP32Device {
+  deviceId: string;
   status: 'online' | 'offline';
-  lastSeen: string;
-  ip?: string;
+  uptime: number;
+  wifiSignal: number;
+  lastHeartbeat: number;
+  connectedAt: number;
 }
 
 function App() {
   const [isConnected, setIsConnected] = useState(false);
   const [reconnectAttempts, setReconnectAttempts] = useState(0);
-  const [systemData, setSystemData] = useState<SystemData[]>([]);
-  const [currentStats, setCurrentStats] = useState({ cpu: 0, memory: 0, network: 0 });
+
+  // macOS 系统数据
+  const [macosSystemData, setMacosSystemData] = useState<SystemData[]>([]);
+  const [currentMacosStats, setCurrentMacosStats] = useState({
+    cpu: 0,
+    memory: 0,
+    networkUpload: 0,
+    networkDownload: 0
+  });
+
+  // ESP32 设备数据
+  const [esp32Devices, setEsp32Devices] = useState<Map<string, ESP32Device>>(new Map());
+
   const [messages, setMessages] = useState<LogMessage[]>([]);
-  const [devices, setDevices] = useState<Device[]>([]);
   const [currentTab, setCurrentTab] = useState(0);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -84,66 +95,54 @@ function App() {
         setIsConnected(true);
         setReconnectAttempts(0);
         addMessage('success', 'WebSocket 连接成功');
-        console.log('WebSocket connected');
+        console.log('[Control Panel] WebSocket connected');
+
+        // 发送握手消息，标识为控制面板
+        ws.send(JSON.stringify({
+          type: 'handshake',
+          clientType: 'control_panel'
+        }));
       };
 
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          // console.log('Received data:', data); // 关闭日志
+          console.log('[Control Panel] 收到消息:', data.type);
 
-          if (data.type === 'system_info') {
-            const timestamp = new Date().toLocaleTimeString('zh-CN', {
-              hour: '2-digit',
-              minute: '2-digit',
-              second: '2-digit'
-            });
+          switch (data.type) {
+            case 'handshake_ack':
+              addMessage('success', `握手成功 - 服务器版本: ${data.data.serverVersion}`);
+              break;
 
-            const newDataPoint: SystemData = {
-              timestamp,
-              cpu: data.cpu || 0,
-              memory: data.memory || 0,
-              network: data.network || 0,
-            };
+            case 'system_stats':
+              // macOS 系统数据（注意：这个消息只发给 ESP32 设备，控制面板不应该收到）
+              // 但为了兼容性，我们也处理一下
+              handleSystemStats(data.data);
+              break;
 
-            setSystemData(prev => {
-              const updated = [...prev, newDataPoint];
-              return updated.slice(-MAX_DATA_POINTS);
-            });
+            case 'device_heartbeat':
+              // ESP32 设备心跳数据
+              handleDeviceHeartbeat(data.data);
+              break;
 
-            setCurrentStats({
-              cpu: data.cpu || 0,
-              memory: data.memory || 0,
-              network: data.network || 0,
-            });
+            case 'device_connected':
+              // 设备连接通知
+              handleDeviceConnected(data.data);
+              break;
 
-            addMessage('info', `系统信息更新 - CPU: ${data.cpu?.toFixed(1)}%, 内存: ${data.memory?.toFixed(1)}%`);
-          } else if (data.type === 'device_connected') {
-            const newDevice: Device = {
-              id: data.deviceId || Date.now().toString(),
-              name: data.deviceName || '未知设备',
-              type: data.deviceType || 'ESP32',
-              status: 'online',
-              lastSeen: new Date().toLocaleTimeString('zh-CN'),
-              ip: data.ip,
-            };
-            setDevices(prev => {
-              const existing = prev.find(d => d.id === newDevice.id);
-              if (existing) {
-                return prev.map(d => d.id === newDevice.id ? { ...d, status: 'online', lastSeen: newDevice.lastSeen } : d);
-              }
-              return [...prev, newDevice];
-            });
-            addMessage('success', `设备已连接: ${newDevice.name}`);
-          } else if (data.type === 'device_disconnected') {
-            setDevices(prev => prev.map(d =>
-              d.id === data.deviceId
-                ? { ...d, status: 'offline', lastSeen: new Date().toLocaleTimeString('zh-CN') }
-                : d
-            ));
-            addMessage('warning', `设备已断开: ${data.deviceName || data.deviceId}`);
-          } else {
-            addMessage('info', `收到消息: ${JSON.stringify(data)}`);
+            case 'device_disconnected':
+              // 设备断开通知
+              handleDeviceDisconnected(data.data);
+              break;
+
+            case 'connected_devices':
+              // 当前在线设备列表
+              handleConnectedDevices(data.data);
+              break;
+
+            default:
+              console.log('[Control Panel] 未知消息类型:', data.type);
+              addMessage('info', `收到消息: ${data.type}`);
           }
         } catch (error) {
           console.error('Error parsing message:', error);
@@ -159,7 +158,7 @@ function App() {
       ws.onclose = () => {
         setIsConnected(false);
         addMessage('warning', 'WebSocket 连接已关闭');
-        console.log('WebSocket disconnected');
+        console.log('[Control Panel] WebSocket disconnected');
 
         // Auto reconnect
         setReconnectAttempts(prev => prev + 1);
@@ -176,22 +175,125 @@ function App() {
     }
   };
 
+  const handleSystemStats = (data: any) => {
+    const timestamp = new Date().toLocaleTimeString('zh-CN', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    });
+
+    const newDataPoint: SystemData = {
+      timestamp,
+      cpu: data.cpu || 0,
+      memory: data.memory || 0,
+      networkUpload: data.network?.upload || 0,
+      networkDownload: data.network?.download || 0,
+    };
+
+    setMacosSystemData(prev => {
+      const updated = [...prev, newDataPoint];
+      return updated.slice(-MAX_DATA_POINTS);
+    });
+
+    setCurrentMacosStats({
+      cpu: data.cpu || 0,
+      memory: data.memory || 0,
+      networkUpload: data.network?.upload || 0,
+      networkDownload: data.network?.download || 0,
+    });
+  };
+
+  const handleDeviceHeartbeat = (data: any) => {
+    const { deviceId, uptime, wifiSignal } = data;
+
+    setEsp32Devices(prev => {
+      const updated = new Map(prev);
+      const existing = updated.get(deviceId);
+
+      if (existing) {
+        updated.set(deviceId, {
+          ...existing,
+          status: 'online',
+          uptime,
+          wifiSignal,
+          lastHeartbeat: Date.now()
+        });
+      } else {
+        // 如果设备不存在，创建新设备
+        updated.set(deviceId, {
+          deviceId,
+          status: 'online',
+          uptime,
+          wifiSignal,
+          lastHeartbeat: Date.now(),
+          connectedAt: Date.now()
+        });
+      }
+
+      return updated;
+    });
+  };
+
+  const handleDeviceConnected = (data: any) => {
+    const { deviceId } = data;
+
+    setEsp32Devices(prev => {
+      const updated = new Map(prev);
+      updated.set(deviceId, {
+        deviceId,
+        status: 'online',
+        uptime: 0,
+        wifiSignal: -50,
+        lastHeartbeat: Date.now(),
+        connectedAt: Date.now()
+      });
+      return updated;
+    });
+
+    addMessage('success', `ESP32 设备已连接: ${deviceId}`);
+  };
+
+  const handleDeviceDisconnected = (data: any) => {
+    const { deviceId } = data;
+
+    setEsp32Devices(prev => {
+      const updated = new Map(prev);
+      const device = updated.get(deviceId);
+      if (device) {
+        updated.set(deviceId, {
+          ...device,
+          status: 'offline'
+        });
+      }
+      return updated;
+    });
+
+    addMessage('warning', `ESP32 设备已断开: ${deviceId}`);
+  };
+
+  const handleConnectedDevices = (data: any) => {
+    const { devices } = data;
+
+    devices.forEach((device: any) => {
+      setEsp32Devices(prev => {
+        const updated = new Map(prev);
+        updated.set(device.deviceId, {
+          deviceId: device.deviceId,
+          status: 'online',
+          uptime: 0,
+          wifiSignal: -50,
+          lastHeartbeat: device.lastHeartbeat,
+          connectedAt: device.connectedAt
+        });
+        return updated;
+      });
+    });
+
+    addMessage('info', `收到在线设备列表: ${devices.length} 个设备`);
+  };
+
   useEffect(() => {
     connectWebSocket();
-
-    // Simulate initial device for demo
-    setTimeout(() => {
-      setDevices([
-        {
-          id: 'demo-1',
-          name: 'ESP32 开发板',
-          type: 'ESP32',
-          status: 'offline',
-          lastSeen: new Date().toLocaleTimeString('zh-CN'),
-          ip: '192.168.1.100',
-        },
-      ]);
-    }, 1000);
 
     return () => {
       if (reconnectTimeoutRef.current) {
@@ -244,15 +346,43 @@ function App() {
                 />
               </Grid>
 
-              {/* System Monitor */}
+              {/* macOS System Monitor */}
               <Grid size={{ xs: 12 }}>
-                <SystemMonitor data={systemData} currentStats={currentStats} />
+                <Typography variant="h5" sx={{ mb: 2, fontWeight: 600 }}>
+                  macOS 系统状态
+                </Typography>
+                <SystemMonitor
+                  data={macosSystemData}
+                  currentStats={{
+                    cpu: currentMacosStats.cpu,
+                    memory: currentMacosStats.memory,
+                    network: (currentMacosStats.networkUpload + currentMacosStats.networkDownload) / 1024
+                  }}
+                />
               </Grid>
 
-              {/* Device List and Message Log */}
-              <Grid size={{ xs: 12, md: 6 }}>
-                <DeviceList devices={devices} />
+              {/* ESP32 Devices Section */}
+              <Grid size={{ xs: 12 }}>
+                <Typography variant="h5" sx={{ mb: 2, fontWeight: 600 }}>
+                  连接的 ESP32 设备
+                </Typography>
               </Grid>
+
+              {/* ESP32 Device List */}
+              <Grid size={{ xs: 12, md: 6 }}>
+                <DeviceList
+                  devices={Array.from(esp32Devices.values()).map(device => ({
+                    id: device.deviceId,
+                    name: device.deviceId,
+                    type: 'ESP32',
+                    status: device.status,
+                    lastSeen: new Date(device.lastHeartbeat).toLocaleTimeString('zh-CN'),
+                    ip: undefined
+                  }))}
+                />
+              </Grid>
+
+              {/* Message Log */}
               <Grid size={{ xs: 12, md: 6 }}>
                 <MessageLog messages={messages} maxMessages={50} />
               </Grid>
