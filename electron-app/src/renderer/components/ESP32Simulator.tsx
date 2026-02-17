@@ -7,6 +7,7 @@ import ClockPage from './simulator/ClockPage';
 import PomodoroPage from './simulator/PomodoroPage';
 import WeatherPage from './simulator/WeatherPage';
 import PhotoFramePage from './simulator/PhotoFramePage';
+import AppLauncherPage from './simulator/AppLauncherPage';
 
 interface ESP32SimulatorProps {
   systemStats: {
@@ -46,6 +47,8 @@ const ESP32Simulator: React.FC<ESP32SimulatorProps> = ({ systemStats }) => {
         return <WeatherPage onBack={handleBack} />;
       case 'photo':
         return <PhotoFramePage onBack={handleBack} />;
+      case 'quick':
+        return <AppLauncherPage onBack={handleBack} />;
       case 'home':
       default:
         return <NavigationDial onNavigate={handleNavigate} />;

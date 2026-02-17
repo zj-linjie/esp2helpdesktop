@@ -21,10 +21,11 @@ import {
   InputLabel,
   Chip,
 } from '@mui/material';
-import { Delete, Add, Save, Visibility, VisibilityOff, FolderOpen, Palette } from '@mui/icons-material';
+import { Delete, Add, Save, Visibility, VisibilityOff, FolderOpen, Palette, Apps, Refresh } from '@mui/icons-material';
 import { settingsService, CityConfig } from '../services/settingsService';
 import { weatherConfig } from '../config/weatherConfig';
 import { photoThemes } from '../config/photoThemes';
+import { appLauncherService, MacApp } from '../services/appLauncherService';
 
 const SettingsPanel: React.FC = () => {
   const [cities, setCities] = useState<CityConfig[]>([]);
@@ -42,11 +43,19 @@ const SettingsPanel: React.FC = () => {
   const [autoCompress, setAutoCompress] = useState(true);
   const [photoSaveSuccess, setPhotoSaveSuccess] = useState(false);
 
+  // App Launcher settings
+  const [apps, setApps] = useState<MacApp[]>([]);
+  const [allApps, setAllApps] = useState<MacApp[]>([]);
+  const [isScanning, setIsScanning] = useState(false);
+  const [appSaveSuccess, setAppSaveSuccess] = useState(false);
+  const [appSearchQuery, setAppSearchQuery] = useState('');
+
   // Load cities and API key
   useEffect(() => {
     loadCities();
     loadApiKey();
     loadPhotoSettings();
+    loadApps();
   }, []);
 
   const loadCities = () => {
@@ -67,6 +76,50 @@ const SettingsPanel: React.FC = () => {
     setPhotoTheme(settings.theme);
     setMaxFileSize(settings.maxFileSize);
     setAutoCompress(settings.autoCompress);
+  };
+
+  const loadApps = () => {
+    const savedApps = appLauncherService.getApps();
+    setApps(savedApps);
+  };
+
+  const handleScanApps = async () => {
+    setIsScanning(true);
+    try {
+      const scannedApps = await appLauncherService.scanApplications();
+      setAllApps(scannedApps);
+    } catch (error) {
+      console.error('扫描应用失败:', error);
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
+  const handleAddApp = (app: MacApp) => {
+    appLauncherService.addApp(app);
+    loadApps();
+    setAppSaveSuccess(true);
+    setTimeout(() => setAppSaveSuccess(false), 2000);
+  };
+
+  const handleRemoveApp = (appId: string) => {
+    appLauncherService.removeApp(appId);
+    loadApps();
+  };
+
+  // 过滤可添加的应用
+  const getFilteredAvailableApps = () => {
+    const availableApps = allApps.filter(app => !apps.find(a => a.path === app.path));
+
+    if (!appSearchQuery.trim()) {
+      return availableApps;
+    }
+
+    const query = appSearchQuery.toLowerCase();
+    return availableApps.filter(app =>
+      app.name.toLowerCase().includes(query) ||
+      app.path.toLowerCase().includes(query)
+    );
   };
 
   const handleAddCity = () => {
@@ -355,6 +408,253 @@ const SettingsPanel: React.FC = () => {
             <br />
             • 等硬件到货后，可以通过 ESP32 配网页面配置城市
           </Typography>
+        </CardContent>
+      </Card>
+
+      {/* App Launcher Settings Card */}
+      <Card
+        sx={{
+          backgroundColor: '#1e1e1e',
+          borderRadius: 2,
+          mt: 3,
+        }}
+      >
+        <CardContent>
+          <Typography variant="h6" sx={{ mb: 2, fontWeight: 600 }}>
+            应用启动器管理
+          </Typography>
+
+          <Typography
+            variant="body2"
+            sx={{ mb: 2, color: 'rgba(255, 255, 255, 0.7)' }}
+          >
+            管理快捷启动的 macOS 应用，支持无限数量应用。
+          </Typography>
+
+          {appSaveSuccess && (
+            <Alert severity="success" sx={{ mb: 2 }}>
+              应用列表已更新！
+            </Alert>
+          )}
+
+          {/* Scan Apps Button */}
+          <Button
+            variant="outlined"
+            startIcon={isScanning ? null : <Refresh />}
+            onClick={handleScanApps}
+            disabled={isScanning}
+            fullWidth
+            sx={{
+              mb: 3,
+              borderColor: 'rgba(255, 255, 255, 0.2)',
+              color: '#1976d2',
+              '&:hover': {
+                borderColor: '#1976d2',
+                backgroundColor: 'rgba(25, 118, 210, 0.1)',
+              },
+            }}
+          >
+            {isScanning ? '扫描中...' : '扫描 /Applications 文件夹'}
+          </Button>
+
+          <Divider sx={{ mb: 2, borderColor: 'rgba(255, 255, 255, 0.1)' }} />
+
+          {/* Current Apps */}
+          <Typography variant="subtitle2" sx={{ mb: 1, color: 'rgba(255, 255, 255, 0.7)' }}>
+            已添加的应用 ({apps.length})
+          </Typography>
+
+          {apps.length === 0 ? (
+            <Typography
+              variant="body2"
+              sx={{ color: 'rgba(255, 255, 255, 0.5)', textAlign: 'center', py: 3 }}
+            >
+              暂无应用，请扫描并添加
+            </Typography>
+          ) : (
+            <List sx={{ py: 0, mb: 3 }}>
+              {apps.map((app) => (
+                <ListItem
+                  key={app.id}
+                  sx={{
+                    backgroundColor: 'rgba(255, 255, 255, 0.03)',
+                    borderRadius: 1,
+                    mb: 1,
+                    '&:hover': {
+                      backgroundColor: 'rgba(255, 255, 255, 0.06)',
+                    },
+                  }}
+                  secondaryAction={
+                    <IconButton
+                      edge="end"
+                      onClick={() => handleRemoveApp(app.id)}
+                      sx={{
+                        color: '#f44336',
+                        '&:hover': {
+                          backgroundColor: 'rgba(244, 67, 54, 0.1)',
+                        },
+                      }}
+                    >
+                      <Delete />
+                    </IconButton>
+                  }
+                >
+                  <Box
+                    sx={{
+                      width: '32px',
+                      height: '32px',
+                      borderRadius: '50%',
+                      backgroundColor: app.icon?.startsWith('LETTER:')
+                        ? app.icon.split(':')[2]
+                        : '#2a2a2a',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      mr: 2,
+                      flexShrink: 0,
+                    }}
+                  >
+                    {app.icon?.startsWith('LETTER:') ? (
+                      <span style={{
+                        fontSize: '1rem',
+                        fontWeight: 'bold',
+                        color: '#ffffff',
+                      }}>
+                        {app.icon.split(':')[1]}
+                      </span>
+                    ) : (
+                      <span style={{ fontSize: '1.2rem' }}>{app.icon || '📱'}</span>
+                    )}
+                  </Box>
+                  <ListItemText
+                    primary={app.name}
+                    secondary={app.path}
+                    primaryTypographyProps={{
+                      fontWeight: 500,
+                    }}
+                    secondaryTypographyProps={{
+                      sx: {
+                        color: 'rgba(255, 255, 255, 0.5)',
+                        fontSize: '0.7rem',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      },
+                    }}
+                  />
+                </ListItem>
+              ))}
+            </List>
+          )}
+
+          {/* Available Apps */}
+          {allApps.length > 0 && (
+            <>
+              <Divider sx={{ mb: 2, borderColor: 'rgba(255, 255, 255, 0.1)' }} />
+              <Typography variant="subtitle2" sx={{ mb: 1, color: 'rgba(255, 255, 255, 0.7)' }}>
+                可添加的应用 ({getFilteredAvailableApps().length})
+              </Typography>
+
+              {/* Search Box */}
+              <TextField
+                fullWidth
+                size="small"
+                placeholder="搜索应用名称..."
+                value={appSearchQuery}
+                onChange={(e) => setAppSearchQuery(e.target.value)}
+                sx={{
+                  mb: 2,
+                  '& .MuiOutlinedInput-root': {
+                    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+                    '& fieldset': {
+                      borderColor: 'rgba(255, 255, 255, 0.2)',
+                    },
+                    '&:hover fieldset': {
+                      borderColor: 'rgba(255, 255, 255, 0.3)',
+                    },
+                  },
+                }}
+                InputProps={{
+                  startAdornment: (
+                    <Apps sx={{ mr: 1, color: 'rgba(255, 255, 255, 0.5)', fontSize: '1.2rem' }} />
+                  ),
+                }}
+              />
+
+              <List sx={{ py: 0, maxHeight: '300px', overflow: 'auto' }}>
+                {getFilteredAvailableApps().length === 0 ? (
+                  <Typography
+                    variant="body2"
+                    sx={{ color: 'rgba(255, 255, 255, 0.5)', textAlign: 'center', py: 3 }}
+                  >
+                    {appSearchQuery ? '未找到匹配的应用' : '所有应用已添加'}
+                  </Typography>
+                ) : (
+                  getFilteredAvailableApps().map((app) => (
+                    <ListItem
+                      key={app.id}
+                      sx={{
+                        backgroundColor: 'rgba(255, 255, 255, 0.03)',
+                        borderRadius: 1,
+                        mb: 1,
+                        '&:hover': {
+                          backgroundColor: 'rgba(255, 255, 255, 0.06)',
+                        },
+                      }}
+                      secondaryAction={
+                        <IconButton
+                          edge="end"
+                          onClick={() => handleAddApp(app)}
+                          sx={{
+                            color: '#4caf50',
+                            '&:hover': {
+                              backgroundColor: 'rgba(76, 175, 80, 0.1)',
+                            },
+                          }}
+                        >
+                          <Add />
+                        </IconButton>
+                      }
+                    >
+                      <Box
+                        sx={{
+                          width: '32px',
+                          height: '32px',
+                          borderRadius: '50%',
+                          backgroundColor: app.icon?.startsWith('LETTER:')
+                            ? app.icon.split(':')[2]
+                            : '#2a2a2a',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          mr: 2,
+                          flexShrink: 0,
+                        }}
+                      >
+                        {app.icon?.startsWith('LETTER:') ? (
+                          <span style={{
+                            fontSize: '1rem',
+                            fontWeight: 'bold',
+                            color: '#ffffff',
+                          }}>
+                            {app.icon.split(':')[1]}
+                          </span>
+                        ) : (
+                          <span style={{ fontSize: '1.2rem' }}>{app.icon || '📱'}</span>
+                        )}
+                      </Box>
+                      <ListItemText
+                        primary={app.name}
+                        primaryTypographyProps={{
+                          fontWeight: 500,
+                        }}
+                      />
+                    </ListItem>
+                  ))
+                )}
+              </List>
+            </>
+          )}
         </CardContent>
       </Card>
 

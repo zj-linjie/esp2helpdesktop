@@ -7,8 +7,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "electron": "electron .",
-    "start": "concurrently \"npm run dev\" \"wait-on http://localhost:5173 && npm run electron\""
+    "electron": "NODE_ENV=development electron .",
+    "start": "concurrently \"npm run dev\" \"wait-on http://localhost:5174 && npm run electron\""
   },
   "keywords": [],
   "author": "",
