@@ -47,7 +47,7 @@ class WeatherService {
    * 配置天气服务
    */
   configure(config: WeatherConfig) {
-    this.apiKey = config.apiKey;
+    // this.apiKey = config.apiKey; // 已移除，使用动态获取
     this.lang = config.lang || 'zh';
   }
 

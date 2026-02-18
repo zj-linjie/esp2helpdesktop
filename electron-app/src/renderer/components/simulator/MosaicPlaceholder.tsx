@@ -14,7 +14,7 @@ interface MosaicPlaceholderProps {
 const MosaicPlaceholder: React.FC<MosaicPlaceholderProps> = ({ size = 360 }) => {
   // 生成马赛克图案
   const generateMosaic = () => {
-    const tiles: JSX.Element[] = [];
+    const tiles: React.ReactElement[] = [];
     const tileSize = 40; // 每个方块大小
     const cols = Math.ceil(size / tileSize);
     const rows = Math.ceil(size / tileSize);
