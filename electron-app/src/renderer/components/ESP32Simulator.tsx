@@ -10,6 +10,7 @@ import PhotoFramePage from './simulator/PhotoFramePage';
 import AppLauncherPage from './simulator/AppLauncherPage';
 import QuickSettingsPage from './simulator/QuickSettingsPage';
 import VoicePage from './simulator/VoicePage';
+import AIPage from './simulator/AIPage';
 
 const ESP32Simulator: React.FC = () => {
   const [currentPage, setCurrentPage] = useState<string>('home');
@@ -174,6 +175,8 @@ const ESP32Simulator: React.FC = () => {
         return <QuickSettingsPage onBack={handleBack} />;
       case 'voice':
         return <VoicePage onBack={handleBack} onNavigate={handleNavigate} />;
+      case 'ai':
+        return <AIPage onBack={handleBack} />;
       case 'home':
       default:
         return <NavigationDial onNavigate={handleNavigate} />;
