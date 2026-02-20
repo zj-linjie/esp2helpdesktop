@@ -28,7 +28,7 @@ const StopwatchControls: React.FC<StopwatchControlsProps> = ({
         onTouchStart={(e) => e.stopPropagation()}
         sx={{
           position: 'absolute',
-          left: '50%',
+          left: '40%',
           bottom: '100px',
           transform: 'translateX(-50%)',
           zIndex: 100

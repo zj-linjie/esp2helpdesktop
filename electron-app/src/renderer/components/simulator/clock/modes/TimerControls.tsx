@@ -51,7 +51,11 @@ const TimerControls: React.FC<TimerControlsProps> = ({
           <Chip
             key={preset.seconds}
             label={preset.label}
-            onClick={() => onSetDuration(preset.seconds)}
+            onClick={() => {
+              onSetDuration(preset.seconds);
+              // 设置时长后自动开始倒计时
+              setTimeout(() => onStart(), 100);
+            }}
             disabled={isRunning}
             sx={{
               backgroundColor: 'rgba(255, 152, 0, 0.9)',
@@ -84,7 +88,7 @@ const TimerControls: React.FC<TimerControlsProps> = ({
         onTouchStart={(e) => e.stopPropagation()}
         sx={{
           position: 'absolute',
-          left: '50%',
+          left: '40%',
           bottom: '100px',
           transform: 'translateX(-50%)',
           zIndex: 100
