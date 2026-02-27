@@ -857,6 +857,21 @@ static void pomodoroControlCallback(lv_event_t *e) {
   updatePomodoroDisplay();
 }
 
+static const char* translateWeatherCondition(const char* condition) {
+  // 将中文天气状况转换为英文
+  if (strstr(condition, "晴")) return "Sunny";
+  if (strstr(condition, "多云")) return "Cloudy";
+  if (strstr(condition, "阴")) return "Overcast";
+  if (strstr(condition, "雨")) return "Rainy";
+  if (strstr(condition, "雪")) return "Snowy";
+  if (strstr(condition, "雾")) return "Foggy";
+  if (strstr(condition, "霾")) return "Haze";
+  if (strstr(condition, "雷")) return "Thunder";
+  if (strstr(condition, "风")) return "Windy";
+  // 如果已经是英文或未知，直接返回
+  return condition;
+}
+
 static void updateWeatherDisplay() {
   if (weatherTempLabel == nullptr) {
     return;
@@ -864,7 +879,7 @@ static void updateWeatherDisplay() {
 
   if (currentWeather.valid) {
     lv_label_set_text_fmt(weatherTempLabel, "%d", (int)currentWeather.temperature);
-    lv_label_set_text(weatherConditionLabel, currentWeather.condition);
+    lv_label_set_text(weatherConditionLabel, translateWeatherCondition(currentWeather.condition));
     lv_label_set_text(weatherCityLabel, currentWeather.city);
     lv_label_set_text_fmt(weatherHumidityLabel, "%d%%", currentWeather.humidity);
     lv_label_set_text_fmt(weatherFeelsLikeLabel, "%d°", (int)currentWeather.feelsLike);
