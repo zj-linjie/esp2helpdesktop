@@ -908,14 +908,22 @@ static void fetchWeatherData() {
     return;
   }
 
+  Serial.println("[Weather] Starting fetch...");
+
   HTTPClient http;
+  http.setTimeout(5000); // 5 second timeout
+
   String url = String("https://devapi.qweather.com/v7/weather/now?location=") +
                WEATHER_CITY_ID + "&key=" + WEATHER_API_KEY;
 
   Serial.printf("[Weather] Fetching: %s\n", url.c_str());
 
+  // Set insecure mode to skip certificate validation
   http.begin(url);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
   int httpCode = http.GET();
+  Serial.printf("[Weather] HTTP code: %d\n", httpCode);
 
   if (httpCode == HTTP_CODE_OK) {
     String payload = http.getString();
@@ -954,15 +962,19 @@ static void fetchWeatherData() {
         pushInboxMessage("weather", "Weather Updated", currentWeather.condition);
       } else {
         Serial.printf("[Weather] API error code: %s\n", code);
+        currentWeather.valid = false;
       }
     } else {
       Serial.printf("[Weather] JSON parse error: %s\n", error.c_str());
+      currentWeather.valid = false;
     }
   } else {
     Serial.printf("[Weather] HTTP error: %d\n", httpCode);
+    currentWeather.valid = false;
   }
 
   http.end();
+  Serial.println("[Weather] Fetch complete");
 }
 
 static void weatherTimerCallback(lv_timer_t *timer) {
