@@ -94,8 +94,6 @@ static lv_obj_t *weatherConditionLabel = nullptr;
 static lv_obj_t *weatherCityLabel = nullptr;
 static lv_obj_t *weatherHumidityLabel = nullptr;
 static lv_obj_t *weatherFeelsLikeLabel = nullptr;
-static lv_obj_t *weatherUpdateLabel = nullptr;
-static lv_obj_t *weatherIconLabel = nullptr;
 
 static bool ntpConfigured = false;
 static bool ntpSynced = false;
@@ -859,46 +857,23 @@ static void pomodoroControlCallback(lv_event_t *e) {
   updatePomodoroDisplay();
 }
 
-static const char* getWeatherIcon(const char* condition) {
-  // 根据天气状况返回emoji图标
-  if (strstr(condition, "晴") || strstr(condition, "Sunny")) return "☀️";
-  if (strstr(condition, "云") || strstr(condition, "Cloud")) return "☁️";
-  if (strstr(condition, "雨") || strstr(condition, "Rain")) return "🌧️";
-  if (strstr(condition, "雪") || strstr(condition, "Snow")) return "❄️";
-  if (strstr(condition, "雾") || strstr(condition, "Fog")) return "🌫️";
-  if (strstr(condition, "雷") || strstr(condition, "Thunder")) return "⚡";
-  return "🌤️";
-}
-
 static void updateWeatherDisplay() {
   if (weatherTempLabel == nullptr) {
     return;
   }
 
   if (currentWeather.valid) {
-    lv_label_set_text_fmt(weatherTempLabel, "%d°C", (int)currentWeather.temperature);
+    lv_label_set_text_fmt(weatherTempLabel, "%d", (int)currentWeather.temperature);
     lv_label_set_text(weatherConditionLabel, currentWeather.condition);
     lv_label_set_text(weatherCityLabel, currentWeather.city);
-    lv_label_set_text_fmt(weatherHumidityLabel, "Humidity: %d%%", currentWeather.humidity);
-    lv_label_set_text_fmt(weatherFeelsLikeLabel, "Feels like: %d°C", (int)currentWeather.feelsLike);
-
-    if (weatherIconLabel != nullptr) {
-      lv_label_set_text(weatherIconLabel, getWeatherIcon(currentWeather.condition));
-    }
-
-    if (weatherUpdateLabel != nullptr && currentWeather.updateTime[0] != '\0') {
-      lv_label_set_text_fmt(weatherUpdateLabel, "Updated: %s", currentWeather.updateTime);
-    }
+    lv_label_set_text_fmt(weatherHumidityLabel, "%d%%", currentWeather.humidity);
+    lv_label_set_text_fmt(weatherFeelsLikeLabel, "%d°", (int)currentWeather.feelsLike);
   } else {
-    lv_label_set_text(weatherTempLabel, "--°C");
+    lv_label_set_text(weatherTempLabel, "--");
     lv_label_set_text(weatherConditionLabel, "Loading...");
     lv_label_set_text(weatherCityLabel, currentWeather.city);
-    lv_label_set_text(weatherHumidityLabel, "Humidity: --%");
-    lv_label_set_text(weatherFeelsLikeLabel, "Feels like: --°C");
-
-    if (weatherIconLabel != nullptr) {
-      lv_label_set_text(weatherIconLabel, "🌤️");
-    }
+    lv_label_set_text(weatherHumidityLabel, "--%");
+    lv_label_set_text(weatherFeelsLikeLabel, "--°");
   }
 }
 
@@ -1409,50 +1384,58 @@ static void createUi() {
 
   // Page 7: Weather
   pages[UI_PAGE_WEATHER] = createBasePage();
-  lv_obj_t *weatherTitle = lv_label_create(pages[UI_PAGE_WEATHER]);
-  lv_label_set_text(weatherTitle, "Weather");
-  lv_obj_align(weatherTitle, LV_ALIGN_TOP_MID, 0, 14);
 
   weatherCityLabel = lv_label_create(pages[UI_PAGE_WEATHER]);
   lv_label_set_text(weatherCityLabel, currentWeather.city);
   lv_obj_set_style_text_color(weatherCityLabel, lv_color_hex(0x90CAF9), LV_PART_MAIN);
-  lv_obj_align(weatherCityLabel, LV_ALIGN_TOP_MID, 0, 38);
-
-  weatherIconLabel = lv_label_create(pages[UI_PAGE_WEATHER]);
-  lv_label_set_text(weatherIconLabel, "🌤️");
-  lv_obj_set_style_text_font(weatherIconLabel, &lv_font_montserrat_32, LV_PART_MAIN);
-  lv_obj_align(weatherIconLabel, LV_ALIGN_CENTER, 0, -40);
+  lv_obj_set_style_text_font(weatherCityLabel, &lv_font_montserrat_16, LV_PART_MAIN);
+  lv_obj_align(weatherCityLabel, LV_ALIGN_TOP_MID, 0, 30);
 
   weatherTempLabel = lv_label_create(pages[UI_PAGE_WEATHER]);
-  lv_label_set_text(weatherTempLabel, "--°C");
+  lv_label_set_text(weatherTempLabel, "--");
   lv_obj_set_style_text_font(weatherTempLabel, &lv_font_montserrat_32, LV_PART_MAIN);
-  lv_obj_align(weatherTempLabel, LV_ALIGN_CENTER, 0, 20);
+  lv_obj_align(weatherTempLabel, LV_ALIGN_CENTER, 0, -20);
+
+  lv_obj_t *degreeLabel = lv_label_create(pages[UI_PAGE_WEATHER]);
+  lv_label_set_text(degreeLabel, "°C");
+  lv_obj_set_style_text_font(degreeLabel, &lv_font_montserrat_22, LV_PART_MAIN);
+  lv_obj_align(degreeLabel, LV_ALIGN_CENTER, 40, -30);
 
   weatherConditionLabel = lv_label_create(pages[UI_PAGE_WEATHER]);
   lv_label_set_text(weatherConditionLabel, "Loading...");
-  lv_obj_set_style_text_color(weatherConditionLabel, lv_color_hex(0xA0A0A0), LV_PART_MAIN);
-  lv_obj_align(weatherConditionLabel, LV_ALIGN_CENTER, 0, 55);
+  lv_obj_set_style_text_color(weatherConditionLabel, lv_color_hex(0xC0C0C0), LV_PART_MAIN);
+  lv_obj_align(weatherConditionLabel, LV_ALIGN_CENTER, 0, 30);
 
+  // Bottom info panel
   lv_obj_t *weatherInfoPanel = lv_obj_create(pages[UI_PAGE_WEATHER]);
-  lv_obj_set_size(weatherInfoPanel, 280, 70);
-  lv_obj_align(weatherInfoPanel, LV_ALIGN_BOTTOM_MID, 0, -50);
-  lv_obj_set_style_radius(weatherInfoPanel, 10, LV_PART_MAIN);
+  lv_obj_set_size(weatherInfoPanel, 280, 80);
+  lv_obj_align(weatherInfoPanel, LV_ALIGN_BOTTOM_MID, 0, -40);
+  lv_obj_set_style_radius(weatherInfoPanel, 12, LV_PART_MAIN);
   lv_obj_set_style_bg_color(weatherInfoPanel, lv_color_hex(0x1A1A1A), LV_PART_MAIN);
   lv_obj_set_style_border_width(weatherInfoPanel, 0, LV_PART_MAIN);
   lv_obj_clear_flag(weatherInfoPanel, LV_OBJ_FLAG_SCROLLABLE);
 
-  weatherHumidityLabel = lv_label_create(weatherInfoPanel);
-  lv_label_set_text(weatherHumidityLabel, "Humidity: --%");
-  lv_obj_align(weatherHumidityLabel, LV_ALIGN_TOP_LEFT, 12, 10);
+  // Feels Like (left)
+  lv_obj_t *feelsLikeTitle = lv_label_create(weatherInfoPanel);
+  lv_label_set_text(feelsLikeTitle, "FEELS LIKE");
+  lv_obj_set_style_text_color(feelsLikeTitle, lv_color_hex(0x808080), LV_PART_MAIN);
+  lv_obj_align(feelsLikeTitle, LV_ALIGN_TOP_LEFT, 20, 12);
 
   weatherFeelsLikeLabel = lv_label_create(weatherInfoPanel);
-  lv_label_set_text(weatherFeelsLikeLabel, "Feels like: --°C");
-  lv_obj_align(weatherFeelsLikeLabel, LV_ALIGN_TOP_LEFT, 12, 32);
+  lv_label_set_text(weatherFeelsLikeLabel, "--°");
+  lv_obj_set_style_text_font(weatherFeelsLikeLabel, &lv_font_montserrat_22, LV_PART_MAIN);
+  lv_obj_align(weatherFeelsLikeLabel, LV_ALIGN_TOP_LEFT, 20, 35);
 
-  weatherUpdateLabel = lv_label_create(pages[UI_PAGE_WEATHER]);
-  lv_label_set_text(weatherUpdateLabel, "Tap to refresh");
-  lv_obj_set_style_text_color(weatherUpdateLabel, lv_color_hex(0x707070), LV_PART_MAIN);
-  lv_obj_align(weatherUpdateLabel, LV_ALIGN_BOTTOM_MID, 0, -20);
+  // Humidity (right)
+  lv_obj_t *humidityTitle = lv_label_create(weatherInfoPanel);
+  lv_label_set_text(humidityTitle, "HUMIDITY");
+  lv_obj_set_style_text_color(humidityTitle, lv_color_hex(0x808080), LV_PART_MAIN);
+  lv_obj_align(humidityTitle, LV_ALIGN_TOP_RIGHT, -20, 12);
+
+  weatherHumidityLabel = lv_label_create(weatherInfoPanel);
+  lv_label_set_text(weatherHumidityLabel, "--%");
+  lv_obj_set_style_text_font(weatherHumidityLabel, &lv_font_montserrat_22, LV_PART_MAIN);
+  lv_obj_align(weatherHumidityLabel, LV_ALIGN_TOP_RIGHT, -20, 35);
 
   // Global page indicator
   pageIndicatorLabel = lv_label_create(lv_scr_act());
