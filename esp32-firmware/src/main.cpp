@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
+#include <HTTPClient.h>
 #include <lvgl.h>
 #include <Preferences.h>
 #include <stdint.h>
@@ -22,7 +23,8 @@ enum UiPage {
   UI_PAGE_SETTINGS = 3,
   UI_PAGE_INBOX = 4,
   UI_PAGE_POMODORO = 5,
-  UI_PAGE_COUNT = 6
+  UI_PAGE_WEATHER = 6,
+  UI_PAGE_COUNT = 7
 };
 
 struct TouchGestureState {
@@ -87,6 +89,14 @@ static lv_obj_t *pomodoroModeLabel = nullptr;
 static lv_obj_t *pomodoroCountLabel = nullptr;
 static lv_obj_t *pomodoroStatusLabel = nullptr;
 
+static lv_obj_t *weatherTempLabel = nullptr;
+static lv_obj_t *weatherConditionLabel = nullptr;
+static lv_obj_t *weatherCityLabel = nullptr;
+static lv_obj_t *weatherHumidityLabel = nullptr;
+static lv_obj_t *weatherFeelsLikeLabel = nullptr;
+static lv_obj_t *weatherUpdateLabel = nullptr;
+static lv_obj_t *weatherIconLabel = nullptr;
+
 static bool ntpConfigured = false;
 static bool ntpSynced = false;
 static uint32_t lastNtpSyncAttemptMs = 0;
@@ -114,6 +124,22 @@ static uint32_t pomodoroStartMs = 0;
 static uint32_t pomodoroElapsedMs = 0;
 static uint32_t pomodoroDurationMs = 25 * 60 * 1000; // 25 minutes
 static int pomodoroCompletedCount = 0;
+
+struct WeatherData {
+  float temperature = 0.0f;
+  float feelsLike = 0.0f;
+  int humidity = 0;
+  char condition[32] = "Loading...";
+  char city[32] = "Beijing";
+  char updateTime[32] = "";
+  bool valid = false;
+};
+
+static WeatherData currentWeather;
+static uint32_t lastWeatherUpdateMs = 0;
+static constexpr uint32_t WEATHER_UPDATE_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+static const char *WEATHER_API_KEY = "598a41cf8b404383a148d15a41fa0b55";
+static const char *WEATHER_CITY_ID = "101010100"; // Beijing default
 
 static constexpr uint32_t NTP_RETRY_INTERVAL_MS = 30000;
 static const char *NTP_TZ_INFO = "UTC-8";
@@ -833,6 +859,121 @@ static void pomodoroControlCallback(lv_event_t *e) {
   updatePomodoroDisplay();
 }
 
+static const char* getWeatherIcon(const char* condition) {
+  // 根据天气状况返回emoji图标
+  if (strstr(condition, "晴") || strstr(condition, "Sunny")) return "☀️";
+  if (strstr(condition, "云") || strstr(condition, "Cloud")) return "☁️";
+  if (strstr(condition, "雨") || strstr(condition, "Rain")) return "🌧️";
+  if (strstr(condition, "雪") || strstr(condition, "Snow")) return "❄️";
+  if (strstr(condition, "雾") || strstr(condition, "Fog")) return "🌫️";
+  if (strstr(condition, "雷") || strstr(condition, "Thunder")) return "⚡";
+  return "🌤️";
+}
+
+static void updateWeatherDisplay() {
+  if (weatherTempLabel == nullptr) {
+    return;
+  }
+
+  if (currentWeather.valid) {
+    lv_label_set_text_fmt(weatherTempLabel, "%.1f°C", currentWeather.temperature);
+    lv_label_set_text(weatherConditionLabel, currentWeather.condition);
+    lv_label_set_text(weatherCityLabel, currentWeather.city);
+    lv_label_set_text_fmt(weatherHumidityLabel, "Humidity: %d%%", currentWeather.humidity);
+    lv_label_set_text_fmt(weatherFeelsLikeLabel, "Feels like: %.1f°C", currentWeather.feelsLike);
+
+    if (weatherIconLabel != nullptr) {
+      lv_label_set_text(weatherIconLabel, getWeatherIcon(currentWeather.condition));
+    }
+
+    if (weatherUpdateLabel != nullptr && currentWeather.updateTime[0] != '\0') {
+      lv_label_set_text_fmt(weatherUpdateLabel, "Updated: %s", currentWeather.updateTime);
+    }
+  } else {
+    lv_label_set_text(weatherTempLabel, "--°C");
+    lv_label_set_text(weatherConditionLabel, "Loading...");
+    lv_label_set_text(weatherCityLabel, currentWeather.city);
+    lv_label_set_text(weatherHumidityLabel, "Humidity: --%");
+    lv_label_set_text(weatherFeelsLikeLabel, "Feels like: --°C");
+
+    if (weatherIconLabel != nullptr) {
+      lv_label_set_text(weatherIconLabel, "🌤️");
+    }
+  }
+}
+
+static void fetchWeatherData() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[Weather] WiFi not connected");
+    return;
+  }
+
+  HTTPClient http;
+  String url = String("https://devapi.qweather.com/v7/weather/now?location=") +
+               WEATHER_CITY_ID + "&key=" + WEATHER_API_KEY;
+
+  Serial.printf("[Weather] Fetching: %s\n", url.c_str());
+
+  http.begin(url);
+  int httpCode = http.GET();
+
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    Serial.printf("[Weather] Response: %s\n", payload.c_str());
+
+    StaticJsonDocument<1024> doc;
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (!error) {
+      const char* code = doc["code"];
+      if (strcmp(code, "200") == 0) {
+        JsonObject now = doc["now"];
+        currentWeather.temperature = now["temp"].as<float>();
+        currentWeather.feelsLike = now["feelsLike"].as<float>();
+        currentWeather.humidity = now["humidity"].as<int>();
+
+        const char* text = now["text"];
+        if (text) {
+          snprintf(currentWeather.condition, sizeof(currentWeather.condition), "%s", text);
+        }
+
+        const char* obsTime = now["obsTime"];
+        if (obsTime) {
+          snprintf(currentWeather.updateTime, sizeof(currentWeather.updateTime), "%s", obsTime);
+        }
+
+        currentWeather.valid = true;
+        lastWeatherUpdateMs = millis();
+
+        Serial.printf("[Weather] Updated: %.1f°C, %s, %d%%\n",
+                     currentWeather.temperature,
+                     currentWeather.condition,
+                     currentWeather.humidity);
+
+        updateWeatherDisplay();
+        pushInboxMessage("weather", "Weather Updated", currentWeather.condition);
+      } else {
+        Serial.printf("[Weather] API error code: %s\n", code);
+      }
+    } else {
+      Serial.printf("[Weather] JSON parse error: %s\n", error.c_str());
+    }
+  } else {
+    Serial.printf("[Weather] HTTP error: %d\n", httpCode);
+  }
+
+  http.end();
+}
+
+static void weatherTimerCallback(lv_timer_t *timer) {
+  (void)timer;
+
+  // 检查是否需要更新天气
+  if (!currentWeather.valid || (millis() - lastWeatherUpdateMs) >= WEATHER_UPDATE_INTERVAL_MS) {
+    fetchWeatherData();
+  }
+}
+
 static void updateClockDisplay() {
   if (clockLabel == nullptr) {
     return;
@@ -1301,6 +1442,53 @@ static void createUi() {
   lv_label_set_text(skipLabel, "Skip");
   lv_obj_center(skipLabel);
 
+  // Page 7: Weather
+  pages[UI_PAGE_WEATHER] = createBasePage();
+  lv_obj_t *weatherTitle = lv_label_create(pages[UI_PAGE_WEATHER]);
+  lv_label_set_text(weatherTitle, "Weather");
+  lv_obj_align(weatherTitle, LV_ALIGN_TOP_MID, 0, 14);
+
+  weatherCityLabel = lv_label_create(pages[UI_PAGE_WEATHER]);
+  lv_label_set_text(weatherCityLabel, currentWeather.city);
+  lv_obj_set_style_text_color(weatherCityLabel, lv_color_hex(0x90CAF9), LV_PART_MAIN);
+  lv_obj_align(weatherCityLabel, LV_ALIGN_TOP_MID, 0, 38);
+
+  weatherIconLabel = lv_label_create(pages[UI_PAGE_WEATHER]);
+  lv_label_set_text(weatherIconLabel, "🌤️");
+  lv_obj_set_style_text_font(weatherIconLabel, &lv_font_montserrat_32, LV_PART_MAIN);
+  lv_obj_align(weatherIconLabel, LV_ALIGN_CENTER, 0, -40);
+
+  weatherTempLabel = lv_label_create(pages[UI_PAGE_WEATHER]);
+  lv_label_set_text(weatherTempLabel, "--°C");
+  lv_obj_set_style_text_font(weatherTempLabel, &lv_font_montserrat_32, LV_PART_MAIN);
+  lv_obj_align(weatherTempLabel, LV_ALIGN_CENTER, 0, 20);
+
+  weatherConditionLabel = lv_label_create(pages[UI_PAGE_WEATHER]);
+  lv_label_set_text(weatherConditionLabel, "Loading...");
+  lv_obj_set_style_text_color(weatherConditionLabel, lv_color_hex(0xA0A0A0), LV_PART_MAIN);
+  lv_obj_align(weatherConditionLabel, LV_ALIGN_CENTER, 0, 55);
+
+  lv_obj_t *weatherInfoPanel = lv_obj_create(pages[UI_PAGE_WEATHER]);
+  lv_obj_set_size(weatherInfoPanel, 280, 70);
+  lv_obj_align(weatherInfoPanel, LV_ALIGN_BOTTOM_MID, 0, -50);
+  lv_obj_set_style_radius(weatherInfoPanel, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(weatherInfoPanel, lv_color_hex(0x1A1A1A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(weatherInfoPanel, 0, LV_PART_MAIN);
+  lv_obj_clear_flag(weatherInfoPanel, LV_OBJ_FLAG_SCROLLABLE);
+
+  weatherHumidityLabel = lv_label_create(weatherInfoPanel);
+  lv_label_set_text(weatherHumidityLabel, "Humidity: --%");
+  lv_obj_align(weatherHumidityLabel, LV_ALIGN_TOP_LEFT, 12, 10);
+
+  weatherFeelsLikeLabel = lv_label_create(weatherInfoPanel);
+  lv_label_set_text(weatherFeelsLikeLabel, "Feels like: --°C");
+  lv_obj_align(weatherFeelsLikeLabel, LV_ALIGN_TOP_LEFT, 12, 32);
+
+  weatherUpdateLabel = lv_label_create(pages[UI_PAGE_WEATHER]);
+  lv_label_set_text(weatherUpdateLabel, "Tap to refresh");
+  lv_obj_set_style_text_color(weatherUpdateLabel, lv_color_hex(0x707070), LV_PART_MAIN);
+  lv_obj_align(weatherUpdateLabel, LV_ALIGN_BOTTOM_MID, 0, -20);
+
   // Global page indicator
   pageIndicatorLabel = lv_label_create(lv_scr_act());
   lv_obj_set_style_text_color(pageIndicatorLabel, lv_color_hex(0x8F8F8F), LV_PART_MAIN);
@@ -1315,6 +1503,10 @@ static void createUi() {
   lv_timer_create(clockTimerCallback, 1000, nullptr);
   lv_timer_create(diagnosticsTimerCallback, 1000, nullptr);
   lv_timer_create(pomodoroTimerCallback, 100, nullptr);
+  lv_timer_create(weatherTimerCallback, 60000, nullptr); // Check every minute
+
+  // Initialize weather display
+  updateWeatherDisplay();
 }
 
 static void setWifiStatus(const String &text) {
@@ -1560,6 +1752,10 @@ void setup() {
   Serial.printf("Connecting WebSocket: %s:%d\n", WS_SERVER_HOST, WS_SERVER_PORT);
   beginWebSocketClient();
   updateDiagnosticStatus();
+
+  // Fetch initial weather data
+  Serial.println("Fetching initial weather data...");
+  fetchWeatherData();
 }
 
 void loop() {
