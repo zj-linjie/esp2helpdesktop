@@ -1587,6 +1587,9 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
       setWsStatus("WS: connected");
       pushInboxMessage("event", "WebSocket", "Connected to server");
       sendHandshake();
+
+      // Request weather data immediately after connection
+      fetchWeatherData();
       break;
 
     case WStype_TEXT: {
