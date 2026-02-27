@@ -968,6 +968,11 @@ static void fetchWeatherData() {
 static void weatherTimerCallback(lv_timer_t *timer) {
   (void)timer;
 
+  // Skip if not enough time has passed since boot
+  if (millis() < 10000) {
+    return; // Wait at least 10 seconds after boot
+  }
+
   // 检查是否需要更新天气
   if (!currentWeather.valid || (millis() - lastWeatherUpdateMs) >= WEATHER_UPDATE_INTERVAL_MS) {
     fetchWeatherData();
