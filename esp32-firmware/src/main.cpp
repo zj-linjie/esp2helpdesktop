@@ -876,11 +876,11 @@ static void updateWeatherDisplay() {
   }
 
   if (currentWeather.valid) {
-    lv_label_set_text_fmt(weatherTempLabel, "%.1f°C", currentWeather.temperature);
+    lv_label_set_text_fmt(weatherTempLabel, "%d°C", (int)currentWeather.temperature);
     lv_label_set_text(weatherConditionLabel, currentWeather.condition);
     lv_label_set_text(weatherCityLabel, currentWeather.city);
     lv_label_set_text_fmt(weatherHumidityLabel, "Humidity: %d%%", currentWeather.humidity);
-    lv_label_set_text_fmt(weatherFeelsLikeLabel, "Feels like: %.1f°C", currentWeather.feelsLike);
+    lv_label_set_text_fmt(weatherFeelsLikeLabel, "Feels like: %d°C", (int)currentWeather.feelsLike);
 
     if (weatherIconLabel != nullptr) {
       lv_label_set_text(weatherIconLabel, getWeatherIcon(currentWeather.condition));
