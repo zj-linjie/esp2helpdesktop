@@ -3,18 +3,24 @@
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <lvgl.h>
+#include <Preferences.h>
+#include <stdint.h>
 #include <time.h>
 #include "config.h"
 #include "display/scr_st77916.h"
 
 WebSocketsClient webSocket;
+Preferences settingsStore;
 bool isConnected = false;
+
+void webSocketEvent(WStype_t type, uint8_t *payload, size_t length);
 
 enum UiPage {
   UI_PAGE_HOME = 0,
   UI_PAGE_MONITOR = 1,
   UI_PAGE_CLOCK = 2,
-  UI_PAGE_COUNT = 3
+  UI_PAGE_SETTINGS = 3,
+  UI_PAGE_COUNT = 4
 };
 
 struct TouchGestureState {
@@ -53,16 +59,46 @@ static lv_obj_t *clockSecondLabel = nullptr;
 static lv_obj_t *clockDateLabel = nullptr;
 static lv_obj_t *clockSecondArc = nullptr;
 
+static lv_obj_t *diagWifiLabel = nullptr;
+static lv_obj_t *diagWsLabel = nullptr;
+static lv_obj_t *diagNtpLabel = nullptr;
+static lv_obj_t *diagIpLabel = nullptr;
+static lv_obj_t *diagRssiLabel = nullptr;
+static lv_obj_t *diagUptimeLabel = nullptr;
+static lv_obj_t *diagServerLabel = nullptr;
+static lv_obj_t *diagActionLabel = nullptr;
+static lv_obj_t *brightnessSlider = nullptr;
+static lv_obj_t *brightnessValueLabel = nullptr;
+
 static bool ntpConfigured = false;
 static bool ntpSynced = false;
 static uint32_t lastNtpSyncAttemptMs = 0;
+static bool settingsStoreReady = false;
+static uint8_t screenBrightness = 100;
 
 static constexpr uint32_t NTP_RETRY_INTERVAL_MS = 30000;
-static const char *NTP_TZ_INFO = "CST-8";
+static const char *NTP_TZ_INFO = "UTC-8";
 static const char *NTP_SERVER_1 = "pool.ntp.org";
 static const char *NTP_SERVER_2 = "time.nist.gov";
 static const char *NTP_SERVER_3 = "ntp.aliyun.com";
 static const char *WEEKDAY_SHORT[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+static constexpr const char *PREF_NAMESPACE = "desktop";
+static constexpr const char *PREF_KEY_BRIGHTNESS = "brightness";
+
+enum SettingsAction {
+  SETTINGS_ACTION_NONE = 0,
+  SETTINGS_ACTION_WIFI_RECONNECT = 1,
+  SETTINGS_ACTION_WS_RECONNECT = 2,
+  SETTINGS_ACTION_NTP_SYNC = 3,
+  SETTINGS_ACTION_REBOOT = 4
+};
+
+static volatile SettingsAction pendingAction = SETTINGS_ACTION_NONE;
+
+static void updateClockDisplay();
+static void setWifiStatus(const String &text);
+static void setWsStatus(const String &text);
+static void gestureEventCallback(lv_event_t *e);
 
 static int clampPercent(float value) {
   int v = (int)(value + 0.5f);
@@ -72,9 +108,7 @@ static int clampPercent(float value) {
 }
 
 static void setupNtpTime() {
-  setenv("TZ", NTP_TZ_INFO, 1);
-  tzset();
-  configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
+  configTzTime(NTP_TZ_INFO, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
   ntpConfigured = true;
   lastNtpSyncAttemptMs = millis();
 }
@@ -90,6 +124,221 @@ static bool trySyncNtpTime(uint32_t waitMs) {
     return true;
   }
   return false;
+}
+
+static void setActionStatus(const String &text) {
+  if (diagActionLabel != nullptr) {
+    lv_label_set_text(diagActionLabel, text.c_str());
+  }
+}
+
+static void applyBrightness(uint8_t brightness, bool persist) {
+  if (brightness < 5) brightness = 5;
+  if (brightness > 100) brightness = 100;
+
+  screenBrightness = brightness;
+  set_brightness(screenBrightness);
+
+  if (brightnessSlider != nullptr && lv_slider_get_value(brightnessSlider) != screenBrightness) {
+    lv_slider_set_value(brightnessSlider, screenBrightness, LV_ANIM_OFF);
+  }
+  if (brightnessValueLabel != nullptr) {
+    lv_label_set_text_fmt(brightnessValueLabel, "%u%%", screenBrightness);
+  }
+  if (persist && settingsStoreReady) {
+    settingsStore.putUChar(PREF_KEY_BRIGHTNESS, screenBrightness);
+  }
+}
+
+static void beginWebSocketClient() {
+  setWsStatus("WS: connecting...");
+  webSocket.begin(WS_SERVER_HOST, WS_SERVER_PORT, "/");
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(5000);
+}
+
+static void updateDiagnosticStatus() {
+  if (diagNtpLabel != nullptr) {
+    lv_label_set_text(diagNtpLabel, ntpSynced ? "NTP: synced" : "NTP: syncing");
+  }
+
+  if (diagIpLabel != nullptr) {
+    if (WiFi.status() == WL_CONNECTED) {
+      lv_label_set_text_fmt(diagIpLabel, "IP: %s", WiFi.localIP().toString().c_str());
+    } else {
+      lv_label_set_text(diagIpLabel, "IP: --");
+    }
+  }
+
+  if (diagRssiLabel != nullptr) {
+    if (WiFi.status() == WL_CONNECTED) {
+      lv_label_set_text_fmt(diagRssiLabel, "RSSI: %d dBm", WiFi.RSSI());
+    } else {
+      lv_label_set_text(diagRssiLabel, "RSSI: --");
+    }
+  }
+
+  if (diagUptimeLabel != nullptr) {
+    uint32_t total = millis() / 1000;
+    uint32_t h = total / 3600;
+    uint32_t m = (total / 60) % 60;
+    uint32_t s = total % 60;
+    lv_label_set_text_fmt(diagUptimeLabel, "Uptime: %02lu:%02lu:%02lu", h, m, s);
+  }
+
+  if (diagServerLabel != nullptr) {
+    lv_label_set_text_fmt(diagServerLabel, "Server: %s:%d", WS_SERVER_HOST, WS_SERVER_PORT);
+  }
+}
+
+static void diagnosticsTimerCallback(lv_timer_t *timer) {
+  (void)timer;
+  updateDiagnosticStatus();
+}
+
+static void reconnectWifiNow() {
+  setActionStatus("Wi-Fi reconnecting...");
+  setWifiStatus("WiFi: reconnecting...");
+  setWsStatus("WS: disconnected");
+  isConnected = false;
+  webSocket.disconnect();
+
+  WiFi.disconnect(true);
+  delay(120);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  uint32_t started = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - started) < 12000) {
+    lv_timer_handler();
+    delay(80);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    setWifiStatus(String("WiFi: ") + WiFi.localIP().toString());
+    setActionStatus("Wi-Fi reconnect OK");
+    beginWebSocketClient();
+  } else {
+    setWifiStatus("WiFi: reconnect failed");
+    setActionStatus("Wi-Fi reconnect failed");
+  }
+  updateDiagnosticStatus();
+}
+
+static void reconnectWsNow() {
+  if (WiFi.status() != WL_CONNECTED) {
+    setWsStatus("WS: waiting WiFi");
+    setActionStatus("WS reconnect blocked: no Wi-Fi");
+    return;
+  }
+
+  setWsStatus("WS: reconnecting...");
+  setActionStatus("WS reconnect requested");
+  isConnected = false;
+  webSocket.disconnect();
+  delay(60);
+  beginWebSocketClient();
+}
+
+static void syncNtpNow() {
+  setActionStatus("NTP syncing...");
+  ntpSynced = false;
+  setupNtpTime();
+  if (trySyncNtpTime(2500)) {
+    setActionStatus("NTP sync OK");
+  } else {
+    setActionStatus("NTP sync pending");
+  }
+  updateClockDisplay();
+  updateDiagnosticStatus();
+}
+
+static void rebootNow() {
+  setActionStatus("Rebooting...");
+  delay(300);
+  ESP.restart();
+}
+
+static void processPendingAction() {
+  SettingsAction action = pendingAction;
+  if (action == SETTINGS_ACTION_NONE) {
+    return;
+  }
+  pendingAction = SETTINGS_ACTION_NONE;
+
+  switch (action) {
+    case SETTINGS_ACTION_WIFI_RECONNECT:
+      reconnectWifiNow();
+      break;
+    case SETTINGS_ACTION_WS_RECONNECT:
+      reconnectWsNow();
+      break;
+    case SETTINGS_ACTION_NTP_SYNC:
+      syncNtpNow();
+      break;
+    case SETTINGS_ACTION_REBOOT:
+      rebootNow();
+      break;
+    default:
+      break;
+  }
+}
+
+static void settingsActionEventCallback(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+
+  intptr_t raw = (intptr_t)lv_event_get_user_data(e);
+  SettingsAction action = (SettingsAction)raw;
+  pendingAction = action;
+
+  switch (action) {
+    case SETTINGS_ACTION_WIFI_RECONNECT:
+      setActionStatus("Queue: Wi-Fi reconnect");
+      break;
+    case SETTINGS_ACTION_WS_RECONNECT:
+      setActionStatus("Queue: WS reconnect");
+      break;
+    case SETTINGS_ACTION_NTP_SYNC:
+      setActionStatus("Queue: NTP sync");
+      break;
+    case SETTINGS_ACTION_REBOOT:
+      setActionStatus("Queue: reboot");
+      break;
+    default:
+      break;
+  }
+}
+
+static void brightnessSliderEventCallback(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code != LV_EVENT_VALUE_CHANGED && code != LV_EVENT_RELEASED) {
+    return;
+  }
+
+  lv_obj_t *slider = lv_event_get_target(e);
+  uint8_t value = (uint8_t)lv_slider_get_value(slider);
+  applyBrightness(value, code == LV_EVENT_RELEASED);
+  if (code == LV_EVENT_RELEASED) {
+    setActionStatus(String("Brightness saved: ") + value + "%");
+  }
+}
+
+static lv_obj_t *createSettingsButton(lv_obj_t *parent, const char *text, lv_coord_t x, lv_coord_t y, SettingsAction action) {
+  lv_obj_t *btn = lv_btn_create(parent);
+  lv_obj_set_size(btn, 136, 40);
+  lv_obj_align(btn, LV_ALIGN_TOP_LEFT, x, y);
+  lv_obj_set_style_radius(btn, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(0x1F1F1F), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(0x2B2B2B), LV_PART_MAIN | LV_STATE_PRESSED);
+  lv_obj_set_style_border_color(btn, lv_color_hex(0x3A3A3A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN);
+  lv_obj_add_event_cb(btn, settingsActionEventCallback, LV_EVENT_CLICKED, (void *)((intptr_t)action));
+
+  lv_obj_t *label = lv_label_create(btn);
+  lv_label_set_text(label, text);
+  lv_obj_center(label);
+  return btn;
 }
 
 static bool getActiveTouchPoint(lv_point_t *point) {
@@ -149,6 +398,11 @@ static lv_obj_t *createBasePage() {
   lv_obj_set_size(page, lv_pct(100), lv_pct(100));
   lv_obj_set_style_bg_opa(page, LV_OPA_TRANSP, LV_PART_MAIN);
   lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(page, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(page, gestureEventCallback, LV_EVENT_PRESSED, nullptr);
+  lv_obj_add_event_cb(page, gestureEventCallback, LV_EVENT_PRESSING, nullptr);
+  lv_obj_add_event_cb(page, gestureEventCallback, LV_EVENT_RELEASED, nullptr);
+  lv_obj_add_event_cb(page, gestureEventCallback, LV_EVENT_PRESS_LOST, nullptr);
   return page;
 }
 
@@ -420,27 +674,96 @@ static void createUi() {
   lv_label_set_text(clockHint, "Long-press center to return Home");
   lv_obj_align(clockHint, LV_ALIGN_BOTTOM_MID, 0, -30);
 
+  // Page 4: Settings & Diagnostics
+  pages[UI_PAGE_SETTINGS] = createBasePage();
+  lv_obj_t *settingsTitle = lv_label_create(pages[UI_PAGE_SETTINGS]);
+  lv_label_set_text(settingsTitle, "Settings & Diagnostics");
+  lv_obj_align(settingsTitle, LV_ALIGN_TOP_MID, 0, 14);
+
+  lv_obj_t *diagPanel = lv_obj_create(pages[UI_PAGE_SETTINGS]);
+  lv_obj_set_size(diagPanel, 300, 98);
+  lv_obj_align(diagPanel, LV_ALIGN_TOP_MID, 0, 36);
+  lv_obj_set_style_radius(diagPanel, 12, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(diagPanel, lv_color_hex(0x111111), LV_PART_MAIN);
+  lv_obj_set_style_border_color(diagPanel, lv_color_hex(0x2E2E2E), LV_PART_MAIN);
+  lv_obj_set_style_border_width(diagPanel, 1, LV_PART_MAIN);
+  lv_obj_clear_flag(diagPanel, LV_OBJ_FLAG_SCROLLABLE);
+
+  diagWifiLabel = lv_label_create(diagPanel);
+  lv_label_set_text(diagWifiLabel, "WiFi: connecting...");
+  lv_obj_align(diagWifiLabel, LV_ALIGN_TOP_LEFT, 10, 8);
+
+  diagWsLabel = lv_label_create(diagPanel);
+  lv_label_set_text(diagWsLabel, "WS: disconnected");
+  lv_obj_align(diagWsLabel, LV_ALIGN_TOP_LEFT, 10, 26);
+
+  diagNtpLabel = lv_label_create(diagPanel);
+  lv_label_set_text(diagNtpLabel, "NTP: syncing");
+  lv_obj_align(diagNtpLabel, LV_ALIGN_TOP_LEFT, 10, 42);
+
+  diagIpLabel = lv_label_create(diagPanel);
+  lv_label_set_text(diagIpLabel, "IP: --");
+  lv_obj_align(diagIpLabel, LV_ALIGN_TOP_LEFT, 10, 58);
+
+  diagRssiLabel = lv_label_create(diagPanel);
+  lv_label_set_text(diagRssiLabel, "RSSI: --");
+  lv_obj_align(diagRssiLabel, LV_ALIGN_TOP_LEFT, 10, 74);
+
+  diagServerLabel = lv_label_create(diagPanel);
+  lv_label_set_text(diagServerLabel, "Server: --");
+  lv_obj_align(diagServerLabel, LV_ALIGN_TOP_LEFT, 148, 74);
+
+  createSettingsButton(pages[UI_PAGE_SETTINGS], "WiFi Reconnect", 34, 142, SETTINGS_ACTION_WIFI_RECONNECT);
+  createSettingsButton(pages[UI_PAGE_SETTINGS], "WS Reconnect", 190, 142, SETTINGS_ACTION_WS_RECONNECT);
+  createSettingsButton(pages[UI_PAGE_SETTINGS], "NTP Sync", 34, 182, SETTINGS_ACTION_NTP_SYNC);
+  createSettingsButton(pages[UI_PAGE_SETTINGS], "Reboot", 190, 182, SETTINGS_ACTION_REBOOT);
+
+  lv_obj_t *brightnessPanel = lv_obj_create(pages[UI_PAGE_SETTINGS]);
+  lv_obj_set_size(brightnessPanel, 300, 54);
+  lv_obj_align(brightnessPanel, LV_ALIGN_TOP_MID, 0, 222);
+  lv_obj_set_style_radius(brightnessPanel, 12, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(brightnessPanel, lv_color_hex(0x111111), LV_PART_MAIN);
+  lv_obj_set_style_border_color(brightnessPanel, lv_color_hex(0x2E2E2E), LV_PART_MAIN);
+  lv_obj_set_style_border_width(brightnessPanel, 1, LV_PART_MAIN);
+  lv_obj_clear_flag(brightnessPanel, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *brightnessText = lv_label_create(brightnessPanel);
+  lv_label_set_text(brightnessText, "Brightness");
+  lv_obj_align(brightnessText, LV_ALIGN_TOP_LEFT, 10, 6);
+
+  brightnessSlider = lv_slider_create(brightnessPanel);
+  lv_obj_set_size(brightnessSlider, 192, 12);
+  lv_obj_align(brightnessSlider, LV_ALIGN_TOP_LEFT, 90, 10);
+  lv_slider_set_range(brightnessSlider, 5, 100);
+  lv_slider_set_value(brightnessSlider, screenBrightness, LV_ANIM_OFF);
+  lv_obj_add_event_cb(brightnessSlider, brightnessSliderEventCallback, LV_EVENT_VALUE_CHANGED, nullptr);
+  lv_obj_add_event_cb(brightnessSlider, brightnessSliderEventCallback, LV_EVENT_RELEASED, nullptr);
+
+  brightnessValueLabel = lv_label_create(brightnessPanel);
+  lv_label_set_text(brightnessValueLabel, "100%");
+  lv_obj_align(brightnessValueLabel, LV_ALIGN_TOP_RIGHT, -10, 4);
+
+  diagActionLabel = lv_label_create(brightnessPanel);
+  lv_label_set_text(diagActionLabel, "Ready");
+  lv_obj_set_style_text_color(diagActionLabel, lv_color_hex(0xAFAFAF), LV_PART_MAIN);
+  lv_obj_align(diagActionLabel, LV_ALIGN_BOTTOM_LEFT, 10, -4);
+
+  diagUptimeLabel = lv_label_create(pages[UI_PAGE_SETTINGS]);
+  lv_label_set_text(diagUptimeLabel, "Uptime: 00:00:00");
+  lv_obj_align(diagUptimeLabel, LV_ALIGN_TOP_MID, 0, 282);
+
   // Global page indicator
   pageIndicatorLabel = lv_label_create(lv_scr_act());
   lv_obj_set_style_text_color(pageIndicatorLabel, lv_color_hex(0x8F8F8F), LV_PART_MAIN);
   lv_obj_align(pageIndicatorLabel, LV_ALIGN_BOTTOM_MID, 0, -10);
 
-  // Gesture overlay
-  lv_obj_t *gestureLayer = lv_obj_create(lv_scr_act());
-  lv_obj_remove_style_all(gestureLayer);
-  lv_obj_set_size(gestureLayer, lv_pct(100), lv_pct(100));
-  lv_obj_set_style_bg_opa(gestureLayer, LV_OPA_TRANSP, LV_PART_MAIN);
-  lv_obj_clear_flag(gestureLayer, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_add_flag(gestureLayer, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(gestureLayer, gestureEventCallback, LV_EVENT_PRESSED, nullptr);
-  lv_obj_add_event_cb(gestureLayer, gestureEventCallback, LV_EVENT_PRESSING, nullptr);
-  lv_obj_add_event_cb(gestureLayer, gestureEventCallback, LV_EVENT_RELEASED, nullptr);
-  lv_obj_add_event_cb(gestureLayer, gestureEventCallback, LV_EVENT_PRESS_LOST, nullptr);
-
   lv_obj_move_foreground(pageIndicatorLabel);
   showPage(UI_PAGE_HOME);
+  applyBrightness(screenBrightness, false);
+  updateDiagnosticStatus();
   updateClockDisplay();
   lv_timer_create(clockTimerCallback, 1000, nullptr);
+  lv_timer_create(diagnosticsTimerCallback, 1000, nullptr);
 }
 
 static void setWifiStatus(const String &text) {
@@ -450,6 +773,9 @@ static void setWifiStatus(const String &text) {
   if (wifiLabel != nullptr) {
     lv_label_set_text(wifiLabel, text.c_str());
   }
+  if (diagWifiLabel != nullptr) {
+    lv_label_set_text(diagWifiLabel, text.c_str());
+  }
 }
 
 static void setWsStatus(const String &text) {
@@ -458,6 +784,9 @@ static void setWsStatus(const String &text) {
   }
   if (wsLabel != nullptr) {
     lv_label_set_text(wsLabel, text.c_str());
+  }
+  if (diagWsLabel != nullptr) {
+    lv_label_set_text(diagWsLabel, text.c_str());
   }
 }
 
@@ -588,6 +917,15 @@ void setup() {
   delay(300);
 
   Serial.println("\n=== ESP32-S3 Desktop Assistant ===");
+
+  settingsStoreReady = settingsStore.begin(PREF_NAMESPACE, false);
+  if (settingsStoreReady) {
+    screenBrightness = settingsStore.getUChar(PREF_KEY_BRIGHTNESS, 100);
+  }
+  if (screenBrightness < 5 || screenBrightness > 100) {
+    screenBrightness = 100;
+  }
+
   scr_lvgl_init();
   createUi();
 
@@ -605,22 +943,25 @@ void setup() {
   Serial.print("IP: ");
   Serial.println(WiFi.localIP());
   setWifiStatus(String("WiFi: ") + WiFi.localIP().toString());
+  setActionStatus("Wi-Fi connected");
 
   setupNtpTime();
   if (trySyncNtpTime(2500)) {
     Serial.println("NTP time sync OK");
+    setActionStatus("NTP sync OK");
   } else {
     Serial.println("NTP time sync pending (will retry in background)");
+    setActionStatus("NTP sync pending");
   }
 
   Serial.printf("Connecting WebSocket: %s:%d\n", WS_SERVER_HOST, WS_SERVER_PORT);
-  webSocket.begin(WS_SERVER_HOST, WS_SERVER_PORT, "/");
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(5000);
+  beginWebSocketClient();
+  updateDiagnosticStatus();
 }
 
 void loop() {
   webSocket.loop();
+  processPendingAction();
 
   static unsigned long lastHeartbeat = 0;
   if (isConnected && millis() - lastHeartbeat > 5000) {
