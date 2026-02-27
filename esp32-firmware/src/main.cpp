@@ -21,7 +21,8 @@ enum UiPage {
   UI_PAGE_CLOCK = 2,
   UI_PAGE_SETTINGS = 3,
   UI_PAGE_INBOX = 4,
-  UI_PAGE_COUNT = 5
+  UI_PAGE_POMODORO = 5,
+  UI_PAGE_COUNT = 6
 };
 
 struct TouchGestureState {
@@ -80,6 +81,12 @@ static lv_obj_t *inboxActionLabel = nullptr;
 static lv_obj_t *inboxAckBtn = nullptr;
 static lv_obj_t *inboxDoneBtn = nullptr;
 
+static lv_obj_t *pomodoroArc = nullptr;
+static lv_obj_t *pomodoroTimeLabel = nullptr;
+static lv_obj_t *pomodoroModeLabel = nullptr;
+static lv_obj_t *pomodoroCountLabel = nullptr;
+static lv_obj_t *pomodoroStatusLabel = nullptr;
+
 static bool ntpConfigured = false;
 static bool ntpSynced = false;
 static uint32_t lastNtpSyncAttemptMs = 0;
@@ -88,6 +95,25 @@ static uint8_t screenBrightness = 100;
 static bool aiStatusInitialized = false;
 static bool lastAiOnline = false;
 static bool lastAiTalking = false;
+
+enum PomodoroMode {
+  POMODORO_WORK = 0,
+  POMODORO_SHORT_BREAK = 1,
+  POMODORO_LONG_BREAK = 2
+};
+
+enum PomodoroState {
+  POMODORO_IDLE = 0,
+  POMODORO_RUNNING = 1,
+  POMODORO_PAUSED = 2
+};
+
+static PomodoroMode pomodoroMode = POMODORO_WORK;
+static PomodoroState pomodoroState = POMODORO_IDLE;
+static uint32_t pomodoroStartMs = 0;
+static uint32_t pomodoroElapsedMs = 0;
+static uint32_t pomodoroDurationMs = 25 * 60 * 1000; // 25 minutes
+static int pomodoroCompletedCount = 0;
 
 static constexpr uint32_t NTP_RETRY_INTERVAL_MS = 30000;
 static const char *NTP_TZ_INFO = "UTC-8";
@@ -646,6 +672,167 @@ static lv_obj_t *createBasePage() {
   return page;
 }
 
+static uint32_t getPomodoroModeDuration(PomodoroMode mode) {
+  switch (mode) {
+    case POMODORO_WORK: return 25 * 60 * 1000; // 25 minutes
+    case POMODORO_SHORT_BREAK: return 5 * 60 * 1000; // 5 minutes
+    case POMODORO_LONG_BREAK: return 15 * 60 * 1000; // 15 minutes
+    default: return 25 * 60 * 1000;
+  }
+}
+
+static const char* getPomodoroModeText(PomodoroMode mode) {
+  switch (mode) {
+    case POMODORO_WORK: return "Work";
+    case POMODORO_SHORT_BREAK: return "Short Break";
+    case POMODORO_LONG_BREAK: return "Long Break";
+    default: return "Work";
+  }
+}
+
+static uint32_t getPomodoroColor(PomodoroMode mode) {
+  switch (mode) {
+    case POMODORO_WORK: return 0xEF5350; // Red
+    case POMODORO_SHORT_BREAK: return 0x66BB6A; // Green
+    case POMODORO_LONG_BREAK: return 0x42A5F5; // Blue
+    default: return 0xEF5350;
+  }
+}
+
+static void updatePomodoroDisplay() {
+  if (pomodoroTimeLabel == nullptr || pomodoroArc == nullptr) {
+    return;
+  }
+
+  uint32_t remainingMs = 0;
+  if (pomodoroState == POMODORO_RUNNING) {
+    uint32_t elapsed = millis() - pomodoroStartMs + pomodoroElapsedMs;
+    if (elapsed >= pomodoroDurationMs) {
+      // Timer finished
+      pomodoroState = POMODORO_IDLE;
+      pomodoroElapsedMs = 0;
+
+      // Auto switch mode
+      if (pomodoroMode == POMODORO_WORK) {
+        pomodoroCompletedCount++;
+        if (pomodoroCompletedCount % 4 == 0) {
+          pomodoroMode = POMODORO_LONG_BREAK;
+        } else {
+          pomodoroMode = POMODORO_SHORT_BREAK;
+        }
+      } else {
+        pomodoroMode = POMODORO_WORK;
+      }
+
+      pomodoroDurationMs = getPomodoroModeDuration(pomodoroMode);
+
+      if (pomodoroModeLabel != nullptr) {
+        lv_label_set_text(pomodoroModeLabel, getPomodoroModeText(pomodoroMode));
+      }
+      if (pomodoroStatusLabel != nullptr) {
+        lv_label_set_text(pomodoroStatusLabel, "Tap to Start");
+      }
+
+      // Update arc color
+      lv_obj_set_style_arc_color(pomodoroArc, lv_color_hex(getPomodoroColor(pomodoroMode)), LV_PART_INDICATOR);
+
+      remainingMs = pomodoroDurationMs;
+    } else {
+      remainingMs = pomodoroDurationMs - elapsed;
+    }
+  } else if (pomodoroState == POMODORO_PAUSED) {
+    remainingMs = pomodoroDurationMs - pomodoroElapsedMs;
+  } else {
+    remainingMs = pomodoroDurationMs;
+  }
+
+  // Update time display
+  uint32_t remainingSec = remainingMs / 1000;
+  uint32_t minutes = remainingSec / 60;
+  uint32_t seconds = remainingSec % 60;
+  lv_label_set_text_fmt(pomodoroTimeLabel, "%02lu:%02lu", minutes, seconds);
+
+  // Update arc progress
+  int progress = 100 - (int)((remainingMs * 100) / pomodoroDurationMs);
+  lv_arc_set_value(pomodoroArc, progress);
+
+  // Update count label
+  if (pomodoroCountLabel != nullptr) {
+    lv_label_set_text_fmt(pomodoroCountLabel, "Completed: %d", pomodoroCompletedCount);
+  }
+
+  // Update status label
+  if (pomodoroStatusLabel != nullptr && pomodoroState != POMODORO_IDLE) {
+    if (pomodoroState == POMODORO_RUNNING) {
+      lv_label_set_text(pomodoroStatusLabel, "Running...");
+    } else {
+      lv_label_set_text(pomodoroStatusLabel, "Paused");
+    }
+  }
+}
+
+static void pomodoroTimerCallback(lv_timer_t *timer) {
+  (void)timer;
+  updatePomodoroDisplay();
+}
+
+static void pomodoroControlCallback(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+
+  intptr_t action = (intptr_t)lv_event_get_user_data(e);
+
+  if (action == 0) { // Start/Pause
+    if (pomodoroState == POMODORO_IDLE) {
+      pomodoroState = POMODORO_RUNNING;
+      pomodoroStartMs = millis();
+      pomodoroElapsedMs = 0;
+    } else if (pomodoroState == POMODORO_RUNNING) {
+      pomodoroState = POMODORO_PAUSED;
+      pomodoroElapsedMs += millis() - pomodoroStartMs;
+    } else if (pomodoroState == POMODORO_PAUSED) {
+      pomodoroState = POMODORO_RUNNING;
+      pomodoroStartMs = millis();
+    }
+  } else if (action == 1) { // Reset
+    pomodoroState = POMODORO_IDLE;
+    pomodoroElapsedMs = 0;
+    if (pomodoroStatusLabel != nullptr) {
+      lv_label_set_text(pomodoroStatusLabel, "Tap to Start");
+    }
+  } else if (action == 2) { // Skip
+    pomodoroState = POMODORO_IDLE;
+    pomodoroElapsedMs = 0;
+
+    // Switch to next mode
+    if (pomodoroMode == POMODORO_WORK) {
+      pomodoroCompletedCount++;
+      if (pomodoroCompletedCount % 4 == 0) {
+        pomodoroMode = POMODORO_LONG_BREAK;
+      } else {
+        pomodoroMode = POMODORO_SHORT_BREAK;
+      }
+    } else {
+      pomodoroMode = POMODORO_WORK;
+    }
+
+    pomodoroDurationMs = getPomodoroModeDuration(pomodoroMode);
+
+    if (pomodoroModeLabel != nullptr) {
+      lv_label_set_text(pomodoroModeLabel, getPomodoroModeText(pomodoroMode));
+    }
+    if (pomodoroStatusLabel != nullptr) {
+      lv_label_set_text(pomodoroStatusLabel, "Tap to Start");
+    }
+
+    // Update arc color
+    lv_obj_set_style_arc_color(pomodoroArc, lv_color_hex(getPomodoroColor(pomodoroMode)), LV_PART_INDICATOR);
+  }
+
+  updatePomodoroDisplay();
+}
+
 static void updateClockDisplay() {
   if (clockLabel == nullptr) {
     return;
@@ -1043,6 +1230,77 @@ static void createUi() {
   lv_obj_set_style_text_color(inboxActionLabel, lv_color_hex(0xAFAFAF), LV_PART_MAIN);
   lv_obj_align(inboxActionLabel, LV_ALIGN_TOP_MID, 0, 296);
 
+  // Page 6: Pomodoro Timer
+  pages[UI_PAGE_POMODORO] = createBasePage();
+  lv_obj_t *pomodoroTitle = lv_label_create(pages[UI_PAGE_POMODORO]);
+  lv_label_set_text(pomodoroTitle, "Pomodoro Timer");
+  lv_obj_align(pomodoroTitle, LV_ALIGN_TOP_MID, 0, 14);
+
+  pomodoroModeLabel = lv_label_create(pages[UI_PAGE_POMODORO]);
+  lv_label_set_text(pomodoroModeLabel, getPomodoroModeText(pomodoroMode));
+  lv_obj_set_style_text_font(pomodoroModeLabel, &lv_font_montserrat_22, LV_PART_MAIN);
+  lv_obj_align(pomodoroModeLabel, LV_ALIGN_TOP_MID, 0, 40);
+
+  pomodoroArc = lv_arc_create(pages[UI_PAGE_POMODORO]);
+  lv_obj_set_size(pomodoroArc, 200, 200);
+  lv_obj_align(pomodoroArc, LV_ALIGN_CENTER, 0, 0);
+  lv_arc_set_rotation(pomodoroArc, 270);
+  lv_arc_set_bg_angles(pomodoroArc, 0, 360);
+  lv_arc_set_range(pomodoroArc, 0, 100);
+  lv_arc_set_value(pomodoroArc, 0);
+  lv_obj_set_style_arc_width(pomodoroArc, 12, LV_PART_MAIN);
+  lv_obj_set_style_arc_color(pomodoroArc, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+  lv_obj_set_style_arc_width(pomodoroArc, 12, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(pomodoroArc, lv_color_hex(getPomodoroColor(pomodoroMode)), LV_PART_INDICATOR);
+  lv_obj_set_style_opa(pomodoroArc, LV_OPA_TRANSP, LV_PART_KNOB);
+  lv_obj_clear_flag(pomodoroArc, LV_OBJ_FLAG_CLICKABLE);
+
+  pomodoroTimeLabel = lv_label_create(pages[UI_PAGE_POMODORO]);
+  lv_label_set_text(pomodoroTimeLabel, "25:00");
+  lv_obj_set_style_text_font(pomodoroTimeLabel, &lv_font_montserrat_32, LV_PART_MAIN);
+  lv_obj_align(pomodoroTimeLabel, LV_ALIGN_CENTER, 0, 0);
+
+  pomodoroStatusLabel = lv_label_create(pages[UI_PAGE_POMODORO]);
+  lv_label_set_text(pomodoroStatusLabel, "Tap to Start");
+  lv_obj_set_style_text_color(pomodoroStatusLabel, lv_color_hex(0xA0A0A0), LV_PART_MAIN);
+  lv_obj_align(pomodoroStatusLabel, LV_ALIGN_CENTER, 0, 50);
+
+  pomodoroCountLabel = lv_label_create(pages[UI_PAGE_POMODORO]);
+  lv_label_set_text(pomodoroCountLabel, "Completed: 0");
+  lv_obj_set_style_text_color(pomodoroCountLabel, lv_color_hex(0x90CAF9), LV_PART_MAIN);
+  lv_obj_align(pomodoroCountLabel, LV_ALIGN_BOTTOM_MID, 0, -80);
+
+  // Control buttons
+  lv_obj_t *startBtn = lv_btn_create(pages[UI_PAGE_POMODORO]);
+  lv_obj_set_size(startBtn, 90, 36);
+  lv_obj_align(startBtn, LV_ALIGN_BOTTOM_LEFT, 30, -36);
+  lv_obj_set_style_radius(startBtn, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(startBtn, lv_color_hex(0x1E1E1E), LV_PART_MAIN);
+  lv_obj_add_event_cb(startBtn, pomodoroControlCallback, LV_EVENT_CLICKED, (void*)0);
+  lv_obj_t *startLabel = lv_label_create(startBtn);
+  lv_label_set_text(startLabel, "Start");
+  lv_obj_center(startLabel);
+
+  lv_obj_t *resetBtn = lv_btn_create(pages[UI_PAGE_POMODORO]);
+  lv_obj_set_size(resetBtn, 90, 36);
+  lv_obj_align(resetBtn, LV_ALIGN_BOTTOM_MID, 0, -36);
+  lv_obj_set_style_radius(resetBtn, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(resetBtn, lv_color_hex(0x1E1E1E), LV_PART_MAIN);
+  lv_obj_add_event_cb(resetBtn, pomodoroControlCallback, LV_EVENT_CLICKED, (void*)1);
+  lv_obj_t *resetLabel = lv_label_create(resetBtn);
+  lv_label_set_text(resetLabel, "Reset");
+  lv_obj_center(resetLabel);
+
+  lv_obj_t *skipBtn = lv_btn_create(pages[UI_PAGE_POMODORO]);
+  lv_obj_set_size(skipBtn, 90, 36);
+  lv_obj_align(skipBtn, LV_ALIGN_BOTTOM_RIGHT, -30, -36);
+  lv_obj_set_style_radius(skipBtn, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(skipBtn, lv_color_hex(0x1E1E1E), LV_PART_MAIN);
+  lv_obj_add_event_cb(skipBtn, pomodoroControlCallback, LV_EVENT_CLICKED, (void*)2);
+  lv_obj_t *skipLabel = lv_label_create(skipBtn);
+  lv_label_set_text(skipLabel, "Skip");
+  lv_obj_center(skipLabel);
+
   // Global page indicator
   pageIndicatorLabel = lv_label_create(lv_scr_act());
   lv_obj_set_style_text_color(pageIndicatorLabel, lv_color_hex(0x8F8F8F), LV_PART_MAIN);
@@ -1056,6 +1314,7 @@ static void createUi() {
   updateClockDisplay();
   lv_timer_create(clockTimerCallback, 1000, nullptr);
   lv_timer_create(diagnosticsTimerCallback, 1000, nullptr);
+  lv_timer_create(pomodoroTimerCallback, 100, nullptr);
 }
 
 static void setWifiStatus(const String &text) {
