@@ -60,3 +60,10 @@ coverage/
 .cache/
 .parcel-cache/
 .vite/
+
+# ESP32 firmware
+esp32-firmware/src/config.h
+esp32-firmware/compile_commands.json
+
+# Backups
+backups/

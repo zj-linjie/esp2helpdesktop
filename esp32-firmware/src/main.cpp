@@ -20,7 +20,8 @@ enum UiPage {
   UI_PAGE_MONITOR = 1,
   UI_PAGE_CLOCK = 2,
   UI_PAGE_SETTINGS = 3,
-  UI_PAGE_COUNT = 4
+  UI_PAGE_INBOX = 4,
+  UI_PAGE_COUNT = 5
 };
 
 struct TouchGestureState {
@@ -70,11 +71,23 @@ static lv_obj_t *diagActionLabel = nullptr;
 static lv_obj_t *brightnessSlider = nullptr;
 static lv_obj_t *brightnessValueLabel = nullptr;
 
+static lv_obj_t *inboxTypeLabel = nullptr;
+static lv_obj_t *inboxIndexLabel = nullptr;
+static lv_obj_t *inboxTitleLabel = nullptr;
+static lv_obj_t *inboxBodyLabel = nullptr;
+static lv_obj_t *inboxMetaLabel = nullptr;
+static lv_obj_t *inboxActionLabel = nullptr;
+static lv_obj_t *inboxAckBtn = nullptr;
+static lv_obj_t *inboxDoneBtn = nullptr;
+
 static bool ntpConfigured = false;
 static bool ntpSynced = false;
 static uint32_t lastNtpSyncAttemptMs = 0;
 static bool settingsStoreReady = false;
 static uint8_t screenBrightness = 100;
+static bool aiStatusInitialized = false;
+static bool lastAiOnline = false;
+static bool lastAiTalking = false;
 
 static constexpr uint32_t NTP_RETRY_INTERVAL_MS = 30000;
 static const char *NTP_TZ_INFO = "UTC-8";
@@ -95,16 +108,233 @@ enum SettingsAction {
 
 static volatile SettingsAction pendingAction = SETTINGS_ACTION_NONE;
 
+enum InboxAction {
+  INBOX_ACTION_NONE = 0,
+  INBOX_ACTION_PREV = 1,
+  INBOX_ACTION_NEXT = 2,
+  INBOX_ACTION_ACK = 3,
+  INBOX_ACTION_DONE = 4
+};
+
+struct InboxMessage {
+  char category[12];
+  char title[32];
+  char body[120];
+  char taskId[32];
+  uint32_t createdMs;
+  bool actionable;
+  bool done;
+};
+
+static constexpr int INBOX_MAX_MESSAGES = 12;
+static InboxMessage inboxMessages[INBOX_MAX_MESSAGES];
+static int inboxCount = 0;
+static int inboxStart = 0;
+static int inboxSelected = 0;
+
 static void updateClockDisplay();
 static void setWifiStatus(const String &text);
 static void setWsStatus(const String &text);
 static void gestureEventCallback(lv_event_t *e);
+static void refreshInboxView();
 
 static int clampPercent(float value) {
   int v = (int)(value + 0.5f);
   if (v < 0) return 0;
   if (v > 100) return 100;
   return v;
+}
+
+static void copyText(char *dst, size_t dstSize, const char *src) {
+  if (dst == nullptr || dstSize == 0) {
+    return;
+  }
+  if (src == nullptr) {
+    src = "";
+  }
+  snprintf(dst, dstSize, "%s", src);
+}
+
+static int inboxPhysicalIndex(int logicalIndex) {
+  if (logicalIndex < 0 || logicalIndex >= inboxCount) {
+    return -1;
+  }
+  return (inboxStart + logicalIndex) % INBOX_MAX_MESSAGES;
+}
+
+static InboxMessage *selectedInboxMessage() {
+  int idx = inboxPhysicalIndex(inboxSelected);
+  if (idx < 0) {
+    return nullptr;
+  }
+  return &inboxMessages[idx];
+}
+
+static void pushInboxMessage(
+  const char *category,
+  const char *title,
+  const char *body,
+  const char *taskId = nullptr,
+  bool actionable = false
+) {
+  int logicalIndex = 0;
+  if (inboxCount < INBOX_MAX_MESSAGES) {
+    logicalIndex = inboxCount;
+    inboxCount++;
+  } else {
+    inboxStart = (inboxStart + 1) % INBOX_MAX_MESSAGES;
+    logicalIndex = inboxCount - 1;
+  }
+
+  int physicalIndex = (inboxStart + logicalIndex) % INBOX_MAX_MESSAGES;
+  InboxMessage &msg = inboxMessages[physicalIndex];
+  copyText(msg.category, sizeof(msg.category), category);
+  copyText(msg.title, sizeof(msg.title), title);
+  copyText(msg.body, sizeof(msg.body), body);
+  copyText(msg.taskId, sizeof(msg.taskId), taskId);
+  msg.createdMs = millis();
+  msg.actionable = actionable;
+  msg.done = false;
+  inboxSelected = inboxCount - 1;
+
+  Serial.printf("[Inbox] [%s] %s - %s\n", msg.category, msg.title, msg.body);
+  refreshInboxView();
+}
+
+static void sendInboxTaskAction(const char *action, const InboxMessage &msg) {
+  if (!isConnected) {
+    return;
+  }
+
+  StaticJsonDocument<320> doc;
+  doc["type"] = "task_action";
+  JsonObject data = doc.createNestedObject("data");
+  data["deviceId"] = DEVICE_ID;
+  data["action"] = action;
+  if (msg.taskId[0] != '\0') {
+    data["taskId"] = msg.taskId;
+  }
+  data["title"] = msg.title;
+  data["timestamp"] = millis();
+
+  String output;
+  serializeJson(doc, output);
+  webSocket.sendTXT(output);
+}
+
+static void refreshInboxView() {
+  if (inboxTypeLabel == nullptr || inboxTitleLabel == nullptr || inboxBodyLabel == nullptr || inboxMetaLabel == nullptr || inboxIndexLabel == nullptr) {
+    return;
+  }
+
+  if (inboxCount <= 0) {
+    lv_label_set_text(inboxTypeLabel, "[info]");
+    lv_label_set_text(inboxIndexLabel, "0/0");
+    lv_label_set_text(inboxTitleLabel, "No messages");
+    lv_label_set_text(inboxBodyLabel, "Incoming notifications and tasks\nwill appear here.");
+    lv_label_set_text(inboxMetaLabel, "waiting for events");
+    if (inboxAckBtn != nullptr) lv_obj_add_flag(inboxAckBtn, LV_OBJ_FLAG_HIDDEN);
+    if (inboxDoneBtn != nullptr) lv_obj_add_flag(inboxDoneBtn, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+
+  if (inboxSelected < 0) inboxSelected = 0;
+  if (inboxSelected >= inboxCount) inboxSelected = inboxCount - 1;
+
+  InboxMessage *msg = selectedInboxMessage();
+  if (msg == nullptr) {
+    return;
+  }
+
+  lv_label_set_text_fmt(inboxTypeLabel, "[%s]", msg->category);
+  lv_label_set_text_fmt(inboxIndexLabel, "%d/%d", inboxSelected + 1, inboxCount);
+  lv_label_set_text(inboxTitleLabel, msg->title);
+  lv_label_set_text(inboxBodyLabel, msg->body);
+
+  uint32_t ageSec = (millis() - msg->createdMs) / 1000;
+  if (ageSec < 60) {
+    lv_label_set_text_fmt(inboxMetaLabel, "%lus ago | %s", ageSec, msg->done ? "done" : (msg->actionable ? "pending" : "info"));
+  } else if (ageSec < 3600) {
+    lv_label_set_text_fmt(inboxMetaLabel, "%lum ago | %s", ageSec / 60, msg->done ? "done" : (msg->actionable ? "pending" : "info"));
+  } else {
+    lv_label_set_text_fmt(inboxMetaLabel, "%luh ago | %s", ageSec / 3600, msg->done ? "done" : (msg->actionable ? "pending" : "info"));
+  }
+
+  if (inboxAckBtn != nullptr) {
+    lv_obj_clear_flag(inboxAckBtn, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (inboxDoneBtn != nullptr) {
+    if (msg->actionable && !msg->done) {
+      lv_obj_clear_flag(inboxDoneBtn, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(inboxDoneBtn, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+}
+
+static void inboxActionEventCallback(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+
+  intptr_t raw = (intptr_t)lv_event_get_user_data(e);
+  InboxAction action = (InboxAction)raw;
+
+  if (action == INBOX_ACTION_PREV) {
+    if (inboxCount > 0 && inboxSelected > 0) {
+      inboxSelected--;
+      refreshInboxView();
+    }
+    return;
+  }
+
+  if (action == INBOX_ACTION_NEXT) {
+    if (inboxCount > 0 && inboxSelected < inboxCount - 1) {
+      inboxSelected++;
+      refreshInboxView();
+    }
+    return;
+  }
+
+  InboxMessage *msg = selectedInboxMessage();
+  if (msg == nullptr) {
+    return;
+  }
+
+  if (action == INBOX_ACTION_ACK) {
+    sendInboxTaskAction("ack", *msg);
+    if (inboxActionLabel != nullptr) {
+      lv_label_set_text_fmt(inboxActionLabel, "ACK sent: %s", msg->title);
+    }
+    return;
+  }
+
+  if (action == INBOX_ACTION_DONE) {
+    msg->done = true;
+    sendInboxTaskAction("done", *msg);
+    if (inboxActionLabel != nullptr) {
+      lv_label_set_text_fmt(inboxActionLabel, "Done: %s", msg->title);
+    }
+    refreshInboxView();
+    return;
+  }
+}
+
+static lv_obj_t *createInboxButton(lv_obj_t *parent, const char *text, lv_coord_t x, lv_coord_t y, lv_coord_t w, InboxAction action) {
+  lv_obj_t *btn = lv_btn_create(parent);
+  lv_obj_set_size(btn, w, 34);
+  lv_obj_align(btn, LV_ALIGN_TOP_LEFT, x, y);
+  lv_obj_set_style_radius(btn, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(0x1E1E1E), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(0x2E2E2E), LV_PART_MAIN | LV_STATE_PRESSED);
+  lv_obj_set_style_border_color(btn, lv_color_hex(0x3A3A3A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN);
+  lv_obj_add_event_cb(btn, inboxActionEventCallback, LV_EVENT_CLICKED, (void *)((intptr_t)action));
+
+  lv_obj_t *label = lv_label_create(btn);
+  lv_label_set_text(label, text);
+  lv_obj_center(label);
+  return btn;
 }
 
 static void setupNtpTime() {
@@ -194,10 +424,12 @@ static void updateDiagnosticStatus() {
 static void diagnosticsTimerCallback(lv_timer_t *timer) {
   (void)timer;
   updateDiagnosticStatus();
+  refreshInboxView();
 }
 
 static void reconnectWifiNow() {
   setActionStatus("Wi-Fi reconnecting...");
+  pushInboxMessage("event", "Wi-Fi reconnect", "Trying to reconnect Wi-Fi");
   setWifiStatus("WiFi: reconnecting...");
   setWsStatus("WS: disconnected");
   isConnected = false;
@@ -216,10 +448,12 @@ static void reconnectWifiNow() {
   if (WiFi.status() == WL_CONNECTED) {
     setWifiStatus(String("WiFi: ") + WiFi.localIP().toString());
     setActionStatus("Wi-Fi reconnect OK");
+    pushInboxMessage("event", "Wi-Fi reconnect", "Wi-Fi reconnect succeeded");
     beginWebSocketClient();
   } else {
     setWifiStatus("WiFi: reconnect failed");
     setActionStatus("Wi-Fi reconnect failed");
+    pushInboxMessage("alert", "Wi-Fi reconnect", "Wi-Fi reconnect failed");
   }
   updateDiagnosticStatus();
 }
@@ -228,11 +462,13 @@ static void reconnectWsNow() {
   if (WiFi.status() != WL_CONNECTED) {
     setWsStatus("WS: waiting WiFi");
     setActionStatus("WS reconnect blocked: no Wi-Fi");
+    pushInboxMessage("alert", "WS reconnect", "Blocked: Wi-Fi is disconnected");
     return;
   }
 
   setWsStatus("WS: reconnecting...");
   setActionStatus("WS reconnect requested");
+  pushInboxMessage("event", "WS reconnect", "Reconnecting to WebSocket server");
   isConnected = false;
   webSocket.disconnect();
   delay(60);
@@ -241,12 +477,15 @@ static void reconnectWsNow() {
 
 static void syncNtpNow() {
   setActionStatus("NTP syncing...");
+  pushInboxMessage("event", "NTP sync", "Manual NTP sync requested");
   ntpSynced = false;
   setupNtpTime();
   if (trySyncNtpTime(2500)) {
     setActionStatus("NTP sync OK");
+    pushInboxMessage("event", "NTP sync", "NTP sync succeeded");
   } else {
     setActionStatus("NTP sync pending");
+    pushInboxMessage("alert", "NTP sync", "NTP sync pending");
   }
   updateClockDisplay();
   updateDiagnosticStatus();
@@ -254,6 +493,7 @@ static void syncNtpNow() {
 
 static void rebootNow() {
   setActionStatus("Rebooting...");
+  pushInboxMessage("task", "Device reboot", "Reboot command accepted");
   delay(300);
   ESP.restart();
 }
@@ -752,6 +992,57 @@ static void createUi() {
   lv_label_set_text(diagUptimeLabel, "Uptime: 00:00:00");
   lv_obj_align(diagUptimeLabel, LV_ALIGN_TOP_MID, 0, 282);
 
+  // Page 5: Inbox & Tasks
+  pages[UI_PAGE_INBOX] = createBasePage();
+  lv_obj_t *inboxPageTitle = lv_label_create(pages[UI_PAGE_INBOX]);
+  lv_label_set_text(inboxPageTitle, "Inbox & Tasks");
+  lv_obj_align(inboxPageTitle, LV_ALIGN_TOP_MID, 0, 14);
+
+  lv_obj_t *inboxCard = lv_obj_create(pages[UI_PAGE_INBOX]);
+  lv_obj_set_size(inboxCard, 300, 170);
+  lv_obj_align(inboxCard, LV_ALIGN_TOP_MID, 0, 36);
+  lv_obj_set_style_radius(inboxCard, 12, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(inboxCard, lv_color_hex(0x111111), LV_PART_MAIN);
+  lv_obj_set_style_border_color(inboxCard, lv_color_hex(0x2E2E2E), LV_PART_MAIN);
+  lv_obj_set_style_border_width(inboxCard, 1, LV_PART_MAIN);
+  lv_obj_clear_flag(inboxCard, LV_OBJ_FLAG_SCROLLABLE);
+
+  inboxTypeLabel = lv_label_create(inboxCard);
+  lv_label_set_text(inboxTypeLabel, "[info]");
+  lv_obj_set_style_text_color(inboxTypeLabel, lv_color_hex(0x90CAF9), LV_PART_MAIN);
+  lv_obj_align(inboxTypeLabel, LV_ALIGN_TOP_LEFT, 10, 8);
+
+  inboxIndexLabel = lv_label_create(inboxCard);
+  lv_label_set_text(inboxIndexLabel, "0/0");
+  lv_obj_set_style_text_color(inboxIndexLabel, lv_color_hex(0x9E9E9E), LV_PART_MAIN);
+  lv_obj_align(inboxIndexLabel, LV_ALIGN_TOP_RIGHT, -10, 8);
+
+  inboxTitleLabel = lv_label_create(inboxCard);
+  lv_label_set_text(inboxTitleLabel, "No messages");
+  lv_obj_set_style_text_font(inboxTitleLabel, &lv_font_montserrat_22, LV_PART_MAIN);
+  lv_obj_align(inboxTitleLabel, LV_ALIGN_TOP_LEFT, 10, 30);
+
+  inboxBodyLabel = lv_label_create(inboxCard);
+  lv_obj_set_width(inboxBodyLabel, 280);
+  lv_label_set_long_mode(inboxBodyLabel, LV_LABEL_LONG_WRAP);
+  lv_label_set_text(inboxBodyLabel, "Incoming notifications and tasks\nwill appear here.");
+  lv_obj_align(inboxBodyLabel, LV_ALIGN_TOP_LEFT, 10, 66);
+
+  inboxMetaLabel = lv_label_create(inboxCard);
+  lv_label_set_text(inboxMetaLabel, "waiting for events");
+  lv_obj_set_style_text_color(inboxMetaLabel, lv_color_hex(0xA0A0A0), LV_PART_MAIN);
+  lv_obj_align(inboxMetaLabel, LV_ALIGN_BOTTOM_LEFT, 10, -10);
+
+  createInboxButton(pages[UI_PAGE_INBOX], "Prev", 34, 214, 96, INBOX_ACTION_PREV);
+  createInboxButton(pages[UI_PAGE_INBOX], "Next", 230, 214, 96, INBOX_ACTION_NEXT);
+  inboxAckBtn = createInboxButton(pages[UI_PAGE_INBOX], "Acknowledge", 34, 254, 136, INBOX_ACTION_ACK);
+  inboxDoneBtn = createInboxButton(pages[UI_PAGE_INBOX], "Mark Done", 190, 254, 136, INBOX_ACTION_DONE);
+
+  inboxActionLabel = lv_label_create(pages[UI_PAGE_INBOX]);
+  lv_label_set_text(inboxActionLabel, "Swipe to browse");
+  lv_obj_set_style_text_color(inboxActionLabel, lv_color_hex(0xAFAFAF), LV_PART_MAIN);
+  lv_obj_align(inboxActionLabel, LV_ALIGN_TOP_MID, 0, 296);
+
   // Global page indicator
   pageIndicatorLabel = lv_label_create(lv_scr_act());
   lv_obj_set_style_text_color(pageIndicatorLabel, lv_color_hex(0x8F8F8F), LV_PART_MAIN);
@@ -761,6 +1052,7 @@ static void createUi() {
   showPage(UI_PAGE_HOME);
   applyBrightness(screenBrightness, false);
   updateDiagnosticStatus();
+  refreshInboxView();
   updateClockDisplay();
   lv_timer_create(clockTimerCallback, 1000, nullptr);
   lv_timer_create(diagnosticsTimerCallback, 1000, nullptr);
@@ -870,12 +1162,14 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
       Serial.println("[WebSocket] disconnected");
       isConnected = false;
       setWsStatus("WS: disconnected");
+      pushInboxMessage("alert", "WebSocket", "Connection lost");
       break;
 
     case WStype_CONNECTED:
       Serial.println("[WebSocket] connected");
       isConnected = true;
       setWsStatus("WS: connected");
+      pushInboxMessage("event", "WebSocket", "Connected to server");
       sendHandshake();
       break;
 
@@ -895,6 +1189,9 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
         const char *serverVersion = data["serverVersion"] | data["server_version"] | "unknown";
         long updateInterval = data["updateInterval"] | data["update_interval"] | 0;
         Serial.printf("[WebSocket] handshake ok: serverVersion=%s updateInterval=%ldms\n", serverVersion, updateInterval);
+        char body[96];
+        snprintf(body, sizeof(body), "Server %s, interval %ldms", serverVersion, updateInterval);
+        pushInboxMessage("event", "Handshake OK", body);
       } else if (strcmp(messageType, "system_stats") == 0) {
         handleSystemStats(doc["data"].as<JsonObjectConst>());
       } else if (strcmp(messageType, "system_info") == 0) {
@@ -902,8 +1199,52 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
         float cpuUsage = data["cpu"]["usage"] | 0;
         float memPercentage = data["memory"]["percentage"] | 0;
         setStats(cpuUsage, memPercentage, 0, 0);
+      } else if (strcmp(messageType, "ai_conversation") == 0) {
+        JsonObjectConst data = doc["data"].as<JsonObjectConst>();
+        const char *role = data["role"] | "assistant";
+        const char *text = data["text"] | data["message"] | "AI message";
+        const char *title = (strcmp(role, "user") == 0) ? "AI user" : "AI assistant";
+        pushInboxMessage("chat", title, text);
+      } else if (strcmp(messageType, "ai_status") == 0) {
+        JsonObjectConst data = doc["data"].as<JsonObjectConst>();
+        bool online = data["online"] | false;
+        bool talking = data["talking"] | false;
+        if (!aiStatusInitialized || online != lastAiOnline || talking != lastAiTalking) {
+          aiStatusInitialized = true;
+          lastAiOnline = online;
+          lastAiTalking = talking;
+          char body[96];
+          snprintf(body, sizeof(body), "online=%s talking=%s", online ? "true" : "false", talking ? "true" : "false");
+          pushInboxMessage("ai", "AI status", body);
+        }
+      } else if (
+        strcmp(messageType, "task_card") == 0 ||
+        strcmp(messageType, "task") == 0 ||
+        strcmp(messageType, "todo") == 0 ||
+        strcmp(messageType, "notification") == 0 ||
+        strcmp(messageType, "reminder") == 0
+      ) {
+        JsonObjectConst data = doc["data"].as<JsonObjectConst>();
+        const char *title = data["title"] | data["taskTitle"] | messageType;
+        const char *body = data["body"] | data["description"] | data["text"] | "New task received";
+        const char *taskId = data["taskId"] | data["id"] | "";
+        bool actionable = data["actionable"] | true;
+        pushInboxMessage(actionable ? "task" : "info", title, body, taskId, actionable);
+      } else if (
+        strcmp(messageType, "app_launched") == 0 ||
+        strcmp(messageType, "launch_app_response") == 0 ||
+        strcmp(messageType, "command_result") == 0
+      ) {
+        JsonObjectConst data = doc["data"].as<JsonObjectConst>();
+        bool success = data["success"] | false;
+        const char *title = success ? "Command success" : "Command failed";
+        const char *body = data["message"] | data["appName"] | data["reason"] | messageType;
+        pushInboxMessage(success ? "event" : "alert", title, body);
       } else {
         Serial.printf("[WebSocket] unhandled type: %s\n", messageType);
+        char body[96];
+        snprintf(body, sizeof(body), "Unhandled message type: %s", messageType);
+        pushInboxMessage("info", "Unhandled message", body);
       }
       break;
     }
@@ -944,14 +1285,17 @@ void setup() {
   Serial.println(WiFi.localIP());
   setWifiStatus(String("WiFi: ") + WiFi.localIP().toString());
   setActionStatus("Wi-Fi connected");
+  pushInboxMessage("event", "Wi-Fi connected", WiFi.localIP().toString().c_str());
 
   setupNtpTime();
   if (trySyncNtpTime(2500)) {
     Serial.println("NTP time sync OK");
     setActionStatus("NTP sync OK");
+    pushInboxMessage("event", "NTP sync", "NTP time synchronized");
   } else {
     Serial.println("NTP time sync pending (will retry in background)");
     setActionStatus("NTP sync pending");
+    pushInboxMessage("alert", "NTP sync", "NTP sync pending");
   }
 
   Serial.printf("Connecting WebSocket: %s:%d\n", WS_SERVER_HOST, WS_SERVER_PORT);
@@ -973,6 +1317,7 @@ void loop() {
     lastNtpSyncAttemptMs = millis();
     if (trySyncNtpTime(300)) {
       Serial.println("NTP time sync OK");
+      pushInboxMessage("event", "NTP sync", "Background NTP sync succeeded");
     } else {
       Serial.println("NTP retry failed");
     }
