@@ -135,6 +135,10 @@ export class DeviceWebSocketServer {
         this.handleAIConfig(ws, client, message)
         break
 
+      case 'task_action':
+        this.handleTaskAction(ws, client, message)
+        break
+
       default:
         console.log('未知消息类型:', message.type)
     }
@@ -181,6 +185,32 @@ export class DeviceWebSocketServer {
         })
       }
     })
+  }
+
+  private handleTaskAction(ws: WebSocket, client: ClientInfo, message: any) {
+    if (client.type !== 'esp32_device') return
+
+    const { action, taskId, title, timestamp } = message.data
+    console.log(`[任务操作] 设备: ${client.deviceId}, 动作: ${action}, 任务: ${title}${taskId ? ` (ID: ${taskId})` : ''}`)
+
+    // 转发任务操作到所有控制面板
+    this.broadcastToControlPanels({
+      type: 'task_action',
+      data: {
+        deviceId: client.deviceId,
+        action,
+        taskId,
+        title,
+        timestamp: timestamp || Date.now()
+      }
+    })
+
+    // 可选：根据action类型执行特定逻辑
+    if (action === 'done') {
+      console.log(`  → 任务已完成: ${title}`)
+    } else if (action === 'ack') {
+      console.log(`  → 任务已确认: ${title}`)
+    }
   }
 
   private handleHandshake(ws: WebSocket, client: ClientInfo, message: any) {
