@@ -1753,9 +1753,8 @@ void setup() {
   beginWebSocketClient();
   updateDiagnosticStatus();
 
-  // Fetch initial weather data
-  Serial.println("Fetching initial weather data...");
-  fetchWeatherData();
+  // Schedule weather fetch (don't block startup)
+  Serial.println("Weather fetch scheduled...");
 }
 
 void loop() {
