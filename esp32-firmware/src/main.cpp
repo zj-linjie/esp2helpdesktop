@@ -3,6 +3,7 @@
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <lvgl.h>
+#include <time.h>
 #include "config.h"
 #include "display/scr_st77916.h"
 
@@ -40,8 +41,56 @@ static lv_obj_t *homeWsLabel = nullptr;
 static lv_obj_t *wifiLabel = nullptr;
 static lv_obj_t *wsLabel = nullptr;
 static lv_obj_t *statsLabel = nullptr;
+static lv_obj_t *cpuArc = nullptr;
+static lv_obj_t *memArc = nullptr;
+static lv_obj_t *cpuValueLabel = nullptr;
+static lv_obj_t *memValueLabel = nullptr;
+static lv_obj_t *upValueLabel = nullptr;
+static lv_obj_t *downValueLabel = nullptr;
 
 static lv_obj_t *clockLabel = nullptr;
+static lv_obj_t *clockSecondLabel = nullptr;
+static lv_obj_t *clockDateLabel = nullptr;
+static lv_obj_t *clockSecondArc = nullptr;
+
+static bool ntpConfigured = false;
+static bool ntpSynced = false;
+static uint32_t lastNtpSyncAttemptMs = 0;
+
+static constexpr uint32_t NTP_RETRY_INTERVAL_MS = 30000;
+static const char *NTP_TZ_INFO = "CST-8";
+static const char *NTP_SERVER_1 = "pool.ntp.org";
+static const char *NTP_SERVER_2 = "time.nist.gov";
+static const char *NTP_SERVER_3 = "ntp.aliyun.com";
+static const char *WEEKDAY_SHORT[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+
+static int clampPercent(float value) {
+  int v = (int)(value + 0.5f);
+  if (v < 0) return 0;
+  if (v > 100) return 100;
+  return v;
+}
+
+static void setupNtpTime() {
+  setenv("TZ", NTP_TZ_INFO, 1);
+  tzset();
+  configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
+  ntpConfigured = true;
+  lastNtpSyncAttemptMs = millis();
+}
+
+static bool trySyncNtpTime(uint32_t waitMs) {
+  if (!ntpConfigured) {
+    return false;
+  }
+
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, waitMs)) {
+    ntpSynced = true;
+    return true;
+  }
+  return false;
+}
 
 static bool getActiveTouchPoint(lv_point_t *point) {
   lv_indev_t *indev = lv_indev_get_act();
@@ -108,11 +157,49 @@ static void updateClockDisplay() {
     return;
   }
 
+  if (ntpConfigured) {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 5)) {
+      ntpSynced = true;
+      lv_label_set_text_fmt(clockLabel, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+
+      if (clockSecondLabel != nullptr) {
+        lv_label_set_text_fmt(clockSecondLabel, ":%02d", timeinfo.tm_sec);
+      }
+      if (clockDateLabel != nullptr) {
+        int wday = (timeinfo.tm_wday >= 0 && timeinfo.tm_wday < 7) ? timeinfo.tm_wday : 0;
+        lv_label_set_text_fmt(
+          clockDateLabel,
+          "%04d-%02d-%02d %s",
+          timeinfo.tm_year + 1900,
+          timeinfo.tm_mon + 1,
+          timeinfo.tm_mday,
+          WEEKDAY_SHORT[wday]
+        );
+      }
+      if (clockSecondArc != nullptr) {
+        lv_arc_set_value(clockSecondArc, timeinfo.tm_sec);
+      }
+      return;
+    }
+  }
+
   uint32_t totalSeconds = millis() / 1000;
+  uint32_t days = totalSeconds / 86400;
   uint32_t h = (totalSeconds / 3600) % 24;
   uint32_t m = (totalSeconds / 60) % 60;
   uint32_t s = totalSeconds % 60;
-  lv_label_set_text_fmt(clockLabel, "%02lu:%02lu:%02lu", h, m, s);
+  lv_label_set_text_fmt(clockLabel, "%02lu:%02lu", h, m);
+
+  if (clockSecondLabel != nullptr) {
+    lv_label_set_text_fmt(clockSecondLabel, ":%02lu", s);
+  }
+  if (clockDateLabel != nullptr) {
+    lv_label_set_text_fmt(clockDateLabel, "NTP syncing... Uptime %lud %02luh", days, h);
+  }
+  if (clockSecondArc != nullptr) {
+    lv_arc_set_value(clockSecondArc, (int)s);
+  }
 }
 
 static void clockTimerCallback(lv_timer_t *timer) {
@@ -220,29 +307,118 @@ static void createUi() {
 
   wifiLabel = lv_label_create(pages[UI_PAGE_MONITOR]);
   lv_label_set_text(wifiLabel, "WiFi: connecting...");
-  lv_obj_align(wifiLabel, LV_ALIGN_TOP_LEFT, 16, 58);
+  lv_obj_align(wifiLabel, LV_ALIGN_TOP_MID, 0, 44);
 
   wsLabel = lv_label_create(pages[UI_PAGE_MONITOR]);
   lv_label_set_text(wsLabel, "WS: disconnected");
-  lv_obj_align(wsLabel, LV_ALIGN_TOP_LEFT, 16, 84);
+  lv_obj_align(wsLabel, LV_ALIGN_TOP_MID, 0, 62);
+
+  cpuArc = lv_arc_create(pages[UI_PAGE_MONITOR]);
+  lv_obj_set_size(cpuArc, 120, 120);
+  lv_obj_align(cpuArc, LV_ALIGN_TOP_LEFT, 34, 88);
+  lv_arc_set_rotation(cpuArc, 135);
+  lv_arc_set_bg_angles(cpuArc, 0, 270);
+  lv_arc_set_range(cpuArc, 0, 100);
+  lv_arc_set_value(cpuArc, 0);
+  lv_obj_set_style_arc_width(cpuArc, 10, LV_PART_MAIN);
+  lv_obj_set_style_arc_color(cpuArc, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+  lv_obj_set_style_arc_width(cpuArc, 10, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(cpuArc, lv_color_hex(0x26C6DA), LV_PART_INDICATOR);
+  lv_obj_set_style_opa(cpuArc, LV_OPA_TRANSP, LV_PART_KNOB);
+  lv_obj_clear_flag(cpuArc, LV_OBJ_FLAG_CLICKABLE);
+
+  cpuValueLabel = lv_label_create(pages[UI_PAGE_MONITOR]);
+  lv_label_set_text(cpuValueLabel, "CPU\n0%");
+  lv_obj_set_style_text_align(cpuValueLabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_align(cpuValueLabel, LV_ALIGN_TOP_LEFT, 76, 128);
+
+  memArc = lv_arc_create(pages[UI_PAGE_MONITOR]);
+  lv_obj_set_size(memArc, 120, 120);
+  lv_obj_align(memArc, LV_ALIGN_TOP_RIGHT, -34, 88);
+  lv_arc_set_rotation(memArc, 135);
+  lv_arc_set_bg_angles(memArc, 0, 270);
+  lv_arc_set_range(memArc, 0, 100);
+  lv_arc_set_value(memArc, 0);
+  lv_obj_set_style_arc_width(memArc, 10, LV_PART_MAIN);
+  lv_obj_set_style_arc_color(memArc, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+  lv_obj_set_style_arc_width(memArc, 10, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(memArc, lv_color_hex(0x66BB6A), LV_PART_INDICATOR);
+  lv_obj_set_style_opa(memArc, LV_OPA_TRANSP, LV_PART_KNOB);
+  lv_obj_clear_flag(memArc, LV_OBJ_FLAG_CLICKABLE);
+
+  memValueLabel = lv_label_create(pages[UI_PAGE_MONITOR]);
+  lv_label_set_text(memValueLabel, "MEM\n0%");
+  lv_obj_set_style_text_align(memValueLabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_align(memValueLabel, LV_ALIGN_TOP_RIGHT, -76, 128);
+
+  lv_obj_t *netPanel = lv_obj_create(pages[UI_PAGE_MONITOR]);
+  lv_obj_set_size(netPanel, 292, 62);
+  lv_obj_align(netPanel, LV_ALIGN_BOTTOM_MID, 0, -38);
+  lv_obj_set_style_radius(netPanel, 12, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(netPanel, lv_color_hex(0x111111), LV_PART_MAIN);
+  lv_obj_set_style_border_color(netPanel, lv_color_hex(0x2E2E2E), LV_PART_MAIN);
+  lv_obj_set_style_border_width(netPanel, 1, LV_PART_MAIN);
+  lv_obj_clear_flag(netPanel, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *upLabel = lv_label_create(netPanel);
+  lv_label_set_text(upLabel, "UP");
+  lv_obj_set_style_text_color(upLabel, lv_color_hex(0x90CAF9), LV_PART_MAIN);
+  lv_obj_align(upLabel, LV_ALIGN_LEFT_MID, 14, -10);
+
+  upValueLabel = lv_label_create(netPanel);
+  lv_label_set_text(upValueLabel, "-- KB/s");
+  lv_obj_align(upValueLabel, LV_ALIGN_LEFT_MID, 44, -10);
+
+  lv_obj_t *downLabel = lv_label_create(netPanel);
+  lv_label_set_text(downLabel, "DOWN");
+  lv_obj_set_style_text_color(downLabel, lv_color_hex(0xA5D6A7), LV_PART_MAIN);
+  lv_obj_align(downLabel, LV_ALIGN_LEFT_MID, 14, 14);
+
+  downValueLabel = lv_label_create(netPanel);
+  lv_label_set_text(downValueLabel, "-- KB/s");
+  lv_obj_align(downValueLabel, LV_ALIGN_LEFT_MID, 64, 14);
 
   statsLabel = lv_label_create(pages[UI_PAGE_MONITOR]);
-  lv_label_set_text(statsLabel, "CPU : --\nMEM : --\nUP  : --\nDOWN: --");
-  lv_obj_align(statsLabel, LV_ALIGN_TOP_LEFT, 16, 122);
+  lv_label_set_text(statsLabel, "");
+  lv_obj_add_flag(statsLabel, LV_OBJ_FLAG_HIDDEN);
 
   // Page 3: Clock
   pages[UI_PAGE_CLOCK] = createBasePage();
   lv_obj_t *clockTitle = lv_label_create(pages[UI_PAGE_CLOCK]);
   lv_label_set_text(clockTitle, "Clock");
-  lv_obj_align(clockTitle, LV_ALIGN_TOP_MID, 0, 18);
+  lv_obj_align(clockTitle, LV_ALIGN_TOP_MID, 0, 20);
+
+  clockSecondArc = lv_arc_create(pages[UI_PAGE_CLOCK]);
+  lv_obj_set_size(clockSecondArc, 232, 232);
+  lv_obj_align(clockSecondArc, LV_ALIGN_CENTER, 0, 8);
+  lv_arc_set_rotation(clockSecondArc, 270);
+  lv_arc_set_bg_angles(clockSecondArc, 0, 360);
+  lv_arc_set_range(clockSecondArc, 0, 59);
+  lv_arc_set_value(clockSecondArc, 0);
+  lv_obj_set_style_arc_width(clockSecondArc, 8, LV_PART_MAIN);
+  lv_obj_set_style_arc_color(clockSecondArc, lv_color_hex(0x252525), LV_PART_MAIN);
+  lv_obj_set_style_arc_width(clockSecondArc, 8, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(clockSecondArc, lv_color_hex(0xFFA726), LV_PART_INDICATOR);
+  lv_obj_set_style_opa(clockSecondArc, LV_OPA_TRANSP, LV_PART_KNOB);
+  lv_obj_clear_flag(clockSecondArc, LV_OBJ_FLAG_CLICKABLE);
 
   clockLabel = lv_label_create(pages[UI_PAGE_CLOCK]);
-  lv_label_set_text(clockLabel, "00:00:00");
+  lv_label_set_text(clockLabel, "00:00");
+  lv_obj_set_style_text_font(clockLabel, &lv_font_montserrat_32, LV_PART_MAIN);
   lv_obj_align(clockLabel, LV_ALIGN_CENTER, 0, -6);
+
+  clockSecondLabel = lv_label_create(pages[UI_PAGE_CLOCK]);
+  lv_label_set_text(clockSecondLabel, ":00");
+  lv_obj_set_style_text_color(clockSecondLabel, lv_color_hex(0xFFCC80), LV_PART_MAIN);
+  lv_obj_align(clockSecondLabel, LV_ALIGN_CENTER, 0, 36);
+
+  clockDateLabel = lv_label_create(pages[UI_PAGE_CLOCK]);
+  lv_label_set_text(clockDateLabel, "Uptime 0d 00h 00m");
+  lv_obj_align(clockDateLabel, LV_ALIGN_BOTTOM_MID, 0, -54);
 
   lv_obj_t *clockHint = lv_label_create(pages[UI_PAGE_CLOCK]);
   lv_label_set_text(clockHint, "Long-press center to return Home");
-  lv_obj_align(clockHint, LV_ALIGN_BOTTOM_MID, 0, -36);
+  lv_obj_align(clockHint, LV_ALIGN_BOTTOM_MID, 0, -30);
 
   // Global page indicator
   pageIndicatorLabel = lv_label_create(lv_scr_act());
@@ -286,6 +462,28 @@ static void setWsStatus(const String &text) {
 }
 
 static void setStats(float cpu, float memory, float upload, float download) {
+  int cpuPercent = clampPercent(cpu);
+  int memPercent = clampPercent(memory);
+
+  if (cpuArc != nullptr) {
+    lv_arc_set_value(cpuArc, cpuPercent);
+  }
+  if (memArc != nullptr) {
+    lv_arc_set_value(memArc, memPercent);
+  }
+  if (cpuValueLabel != nullptr) {
+    lv_label_set_text_fmt(cpuValueLabel, "CPU\n%d%%", cpuPercent);
+  }
+  if (memValueLabel != nullptr) {
+    lv_label_set_text_fmt(memValueLabel, "MEM\n%d%%", memPercent);
+  }
+  if (upValueLabel != nullptr) {
+    lv_label_set_text_fmt(upValueLabel, "%.1f KB/s", upload);
+  }
+  if (downValueLabel != nullptr) {
+    lv_label_set_text_fmt(downValueLabel, "%.1f KB/s", download);
+  }
+
   if (statsLabel != nullptr) {
     lv_label_set_text_fmt(
       statsLabel,
@@ -408,6 +606,13 @@ void setup() {
   Serial.println(WiFi.localIP());
   setWifiStatus(String("WiFi: ") + WiFi.localIP().toString());
 
+  setupNtpTime();
+  if (trySyncNtpTime(2500)) {
+    Serial.println("NTP time sync OK");
+  } else {
+    Serial.println("NTP time sync pending (will retry in background)");
+  }
+
   Serial.printf("Connecting WebSocket: %s:%d\n", WS_SERVER_HOST, WS_SERVER_PORT);
   webSocket.begin(WS_SERVER_HOST, WS_SERVER_PORT, "/");
   webSocket.onEvent(webSocketEvent);
@@ -421,6 +626,15 @@ void loop() {
   if (isConnected && millis() - lastHeartbeat > 5000) {
     sendHeartbeat();
     lastHeartbeat = millis();
+  }
+
+  if (!ntpSynced && WiFi.status() == WL_CONNECTED && (millis() - lastNtpSyncAttemptMs > NTP_RETRY_INTERVAL_MS)) {
+    lastNtpSyncAttemptMs = millis();
+    if (trySyncNtpTime(300)) {
+      Serial.println("NTP time sync OK");
+    } else {
+      Serial.println("NTP retry failed");
+    }
   }
 
   lv_timer_handler();
