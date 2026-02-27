@@ -139,6 +139,10 @@ export class DeviceWebSocketServer {
         this.handleTaskAction(ws, client, message)
         break
 
+      case 'weather_request':
+        this.handleWeatherRequest(ws, client, message)
+        break
+
       default:
         console.log('未知消息类型:', message.type)
     }
@@ -210,6 +214,69 @@ export class DeviceWebSocketServer {
       console.log(`  → 任务已完成: ${title}`)
     } else if (action === 'ack') {
       console.log(`  → 任务已确认: ${title}`)
+    }
+  }
+
+  private async handleWeatherRequest(ws: WebSocket, client: ClientInfo, message: any) {
+    if (client.type !== 'esp32_device') return
+
+    console.log(`[天气请求] 设备: ${client.deviceId}`)
+
+    try {
+      // 使用和风天气API获取天气数据
+      const apiKey = '598a41cf8b404383a148d15a41fa0b55'
+      const cityId = message.data.cityId || '101010100' // 默认北京
+      const url = `https://devapi.qweather.com/v7/weather/now?location=${cityId}&key=${apiKey}`
+
+      const response = await fetch(url)
+      const data = await response.json()
+
+      if (data.code === '200' && data.now) {
+        const weatherData = {
+          temperature: parseFloat(data.now.temp),
+          feelsLike: parseFloat(data.now.feelsLike),
+          humidity: parseInt(data.now.humidity),
+          condition: data.now.text,
+          city: 'Beijing',
+          updateTime: data.now.obsTime
+        }
+
+        console.log(`[天气数据] ${weatherData.temperature}°C, ${weatherData.condition}`)
+
+        // 发送天气数据给请求的设备
+        this.sendMessage(ws, {
+          type: 'weather_data',
+          data: weatherData
+        })
+      } else {
+        console.error('[天气API] 错误:', data.code)
+        // 发送默认数据
+        this.sendMessage(ws, {
+          type: 'weather_data',
+          data: {
+            temperature: 22,
+            feelsLike: 20,
+            humidity: 65,
+            condition: 'Unknown',
+            city: 'Beijing',
+            updateTime: new Date().toISOString()
+          }
+        })
+      }
+    } catch (error) {
+      console.error('[天气请求] 失败:', error)
+      // 发送默认数据
+      this.sendMessage(ws, {
+        type: 'weather_data',
+        data: {
+          temperature: 22,
+          feelsLike: 20,
+          humidity: 65,
+          condition: 'Error',
+          city: 'Beijing',
+          updateTime: new Date().toISOString()
+        }
+      })
     }
   }
 

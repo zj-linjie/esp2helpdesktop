@@ -903,78 +903,26 @@ static void updateWeatherDisplay() {
 }
 
 static void fetchWeatherData() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[Weather] WiFi not connected");
+  if (!isConnected) {
+    Serial.println("[Weather] WebSocket not connected");
     return;
   }
 
-  Serial.println("[Weather] Starting fetch...");
+  Serial.println("[Weather] Requesting weather via WebSocket...");
 
-  HTTPClient http;
-  http.setTimeout(5000); // 5 second timeout
+  // Send weather request to server
+  StaticJsonDocument<256> doc;
+  doc["type"] = "weather_request";
 
-  String url = String("https://devapi.qweather.com/v7/weather/now?location=") +
-               WEATHER_CITY_ID + "&key=" + WEATHER_API_KEY;
+  JsonObject data = doc.createNestedObject("data");
+  data["deviceId"] = DEVICE_ID;
+  data["cityId"] = WEATHER_CITY_ID;
 
-  Serial.printf("[Weather] Fetching: %s\n", url.c_str());
+  String output;
+  serializeJson(doc, output);
+  webSocket.sendTXT(output);
 
-  // Set insecure mode to skip certificate validation
-  http.begin(url);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-
-  int httpCode = http.GET();
-  Serial.printf("[Weather] HTTP code: %d\n", httpCode);
-
-  if (httpCode == HTTP_CODE_OK) {
-    String payload = http.getString();
-    Serial.printf("[Weather] Response: %s\n", payload.c_str());
-
-    StaticJsonDocument<1024> doc;
-    DeserializationError error = deserializeJson(doc, payload);
-
-    if (!error) {
-      const char* code = doc["code"];
-      if (strcmp(code, "200") == 0) {
-        JsonObject now = doc["now"];
-        currentWeather.temperature = now["temp"].as<float>();
-        currentWeather.feelsLike = now["feelsLike"].as<float>();
-        currentWeather.humidity = now["humidity"].as<int>();
-
-        const char* text = now["text"];
-        if (text) {
-          snprintf(currentWeather.condition, sizeof(currentWeather.condition), "%s", text);
-        }
-
-        const char* obsTime = now["obsTime"];
-        if (obsTime) {
-          snprintf(currentWeather.updateTime, sizeof(currentWeather.updateTime), "%s", obsTime);
-        }
-
-        currentWeather.valid = true;
-        lastWeatherUpdateMs = millis();
-
-        Serial.printf("[Weather] Updated: %.1f°C, %s, %d%%\n",
-                     currentWeather.temperature,
-                     currentWeather.condition,
-                     currentWeather.humidity);
-
-        updateWeatherDisplay();
-        pushInboxMessage("weather", "Weather Updated", currentWeather.condition);
-      } else {
-        Serial.printf("[Weather] API error code: %s\n", code);
-        currentWeather.valid = false;
-      }
-    } else {
-      Serial.printf("[Weather] JSON parse error: %s\n", error.c_str());
-      currentWeather.valid = false;
-    }
-  } else {
-    Serial.printf("[Weather] HTTP error: %d\n", httpCode);
-    currentWeather.valid = false;
-  }
-
-  http.end();
-  Serial.println("[Weather] Fetch complete");
+  Serial.println("[Weather] Request sent");
 }
 
 static void weatherTimerCallback(lv_timer_t *timer) {
@@ -1708,6 +1656,22 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
         const char *title = success ? "Command success" : "Command failed";
         const char *body = data["message"] | data["appName"] | data["reason"] | messageType;
         pushInboxMessage(success ? "event" : "alert", title, body);
+      } else if (strcmp(messageType, "weather_data") == 0) {
+        JsonObjectConst data = doc["data"].as<JsonObjectConst>();
+        currentWeather.temperature = data["temperature"] | 0.0f;
+        currentWeather.feelsLike = data["feelsLike"] | 0.0f;
+        currentWeather.humidity = data["humidity"] | 0;
+        const char *condition = data["condition"] | "Unknown";
+        const char *city = data["city"] | "Beijing";
+        snprintf(currentWeather.condition, sizeof(currentWeather.condition), "%s", condition);
+        snprintf(currentWeather.city, sizeof(currentWeather.city), "%s", city);
+        currentWeather.valid = true;
+        lastWeatherUpdateMs = millis();
+        Serial.printf("[Weather] Received: %.1f°C, %s, %d%%\n",
+                     currentWeather.temperature,
+                     currentWeather.condition,
+                     currentWeather.humidity);
+        updateWeatherDisplay();
       } else {
         Serial.printf("[WebSocket] unhandled type: %s\n", messageType);
         char body[96];
