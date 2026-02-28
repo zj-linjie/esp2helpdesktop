@@ -56,6 +56,9 @@ static constexpr int16_t SWIPE_HOME_THRESHOLD = 60;
 static constexpr int16_t SWIPE_HOME_DIRECTION_MARGIN = 12;
 static constexpr int16_t SWIPE_HOME_MAX_X_DRIFT = 120;
 static constexpr uint32_t CLICK_SUPPRESS_MS_AFTER_HOME = 320;
+static constexpr uint32_t CLICK_SUPPRESS_MS_AFTER_CAROUSEL = 220;
+static constexpr int16_t HOME_CAROUSEL_SWIPE_THRESHOLD = 42;
+static constexpr int16_t HOME_CAROUSEL_DIRECTION_MARGIN = 12;
 static constexpr float HOME_DEG_TO_RAD = 0.01745329252f;
 static uint32_t suppressClickUntilMs = 0;
 
@@ -73,27 +76,41 @@ static lv_obj_t *homeDateLabel = nullptr;
 struct HomeShortcutConfig {
   const char *label;
   const char *icon;
+  uint8_t iconKind;
   UiPage page;
   uint32_t accentColor;
 };
 
+enum HomeIconKind : uint8_t {
+  HOME_ICON_SYMBOL = 0,
+  HOME_ICON_MONITOR = 1,
+  HOME_ICON_POMODORO = 2,
+  HOME_ICON_CLOCK = 3,
+  HOME_ICON_WEATHER = 4,
+  HOME_ICON_APPS = 5
+};
+
 static const HomeShortcutConfig HOME_SHORTCUTS[] = {
-  {"Monitor", LV_SYMBOL_CHARGE, UI_PAGE_MONITOR, 0x6A1B9A},
-  {"Pomodoro", LV_SYMBOL_BELL, UI_PAGE_POMODORO, 0x7B1FA2},
-  {"Settings", LV_SYMBOL_SETTINGS, UI_PAGE_SETTINGS, 0x5E35B1},
-  {"Photo", LV_SYMBOL_IMAGE, UI_PAGE_PHOTO_FRAME, 0x673AB7},
-  {"Weather", LV_SYMBOL_GPS, UI_PAGE_WEATHER, 0x7E57C2},
-  {"Clock", LV_SYMBOL_REFRESH, UI_PAGE_CLOCK, 0x6A1B9A},
-  {"Apps", LV_SYMBOL_DIRECTORY, UI_PAGE_APP_LAUNCHER, 0x5E35B1},
-  {"Music", LV_SYMBOL_AUDIO, UI_PAGE_AUDIO_PLAYER, 0x5B2DA8},
-  {"Inbox", LV_SYMBOL_LIST, UI_PAGE_INBOX, 0x7B1FA2},
+  {"Monitor", LV_SYMBOL_VIDEO, HOME_ICON_MONITOR, UI_PAGE_MONITOR, 0x3949AB},
+  {"Pomodoro", LV_SYMBOL_BELL, HOME_ICON_POMODORO, UI_PAGE_POMODORO, 0xE53935},
+  {"Settings", LV_SYMBOL_SETTINGS, HOME_ICON_SYMBOL, UI_PAGE_SETTINGS, 0x5E35B1},
+  {"Photo", LV_SYMBOL_IMAGE, HOME_ICON_SYMBOL, UI_PAGE_PHOTO_FRAME, 0x8E24AA},
+  {"Weather", LV_SYMBOL_TINT, HOME_ICON_WEATHER, UI_PAGE_WEATHER, 0x039BE5},
+  {"Clock", LV_SYMBOL_REFRESH, HOME_ICON_CLOCK, UI_PAGE_CLOCK, 0x1E88E5},
+  {"Apps", LV_SYMBOL_BARS, HOME_ICON_APPS, UI_PAGE_APP_LAUNCHER, 0x5E35B1},
+  {"Music", LV_SYMBOL_AUDIO, HOME_ICON_SYMBOL, UI_PAGE_AUDIO_PLAYER, 0x43A047},
+  {"Inbox", LV_SYMBOL_LIST, HOME_ICON_SYMBOL, UI_PAGE_INBOX, 0x546E7A},
 };
 
 static constexpr uint8_t HOME_SHORTCUT_COUNT = sizeof(HOME_SHORTCUTS) / sizeof(HOME_SHORTCUTS[0]);
-static lv_obj_t *homeShortcutSlots[HOME_SHORTCUT_COUNT] = {nullptr};
-static lv_obj_t *homeShortcutButtons[HOME_SHORTCUT_COUNT] = {nullptr};
-static lv_obj_t *homeShortcutIcons[HOME_SHORTCUT_COUNT] = {nullptr};
-static lv_obj_t *homeShortcutLabels[HOME_SHORTCUT_COUNT] = {nullptr};
+static constexpr uint8_t HOME_VISIBLE_SLOT_COUNT = 8;
+static lv_obj_t *homeShortcutSlots[HOME_VISIBLE_SLOT_COUNT] = {nullptr};
+static lv_obj_t *homeShortcutButtons[HOME_VISIBLE_SLOT_COUNT] = {nullptr};
+static lv_obj_t *homeShortcutIcons[HOME_VISIBLE_SLOT_COUNT] = {nullptr};
+static int8_t homeSlotToShortcut[HOME_VISIBLE_SLOT_COUNT] = {-1, -1, -1, -1, -1, -1, -1, -1};
+static lv_obj_t *homeCurrentShortcutLabel = nullptr;
+static lv_obj_t *homeSwipeHintLabel = nullptr;
+static int homeCarouselOffset = 0;
 
 static lv_obj_t *wifiLabel = nullptr;
 static lv_obj_t *wsLabel = nullptr;
@@ -414,8 +431,12 @@ static void sendSdUploadBeginAck(const char *uploadId, bool success, const char 
 static void sendSdUploadChunkAck(const char *uploadId, int seq, bool success, const char *reason);
 static void sendSdUploadCommitAck(const char *uploadId, bool success, const char *finalPath, const char *reason);
 static bool shouldSuppressClick();
+static void suppressClicksForMs(uint32_t durationMs);
 static void suppressClicksAfterHome();
 static void homeShortcutEventCallback(lv_event_t *e);
+static void renderHomeShortcutIcon(uint8_t slotIdx, const HomeShortcutConfig &item);
+static void refreshHomeShortcutSlots();
+static void shiftHomeCarousel(int delta);
 static void layoutHomeShortcuts();
 
 static int clampPercent(float value) {
@@ -2877,6 +2898,10 @@ static bool shouldSuppressClick() {
   return (int32_t)(millis() - suppressClickUntilMs) < 0;
 }
 
+static void suppressClicksForMs(uint32_t durationMs) {
+  suppressClickUntilMs = millis() + durationMs;
+}
+
 static bool getActiveTouchPoint(lv_point_t *point) {
   if (point == nullptr) {
     return false;
@@ -2890,7 +2915,7 @@ static bool getActiveTouchPoint(lv_point_t *point) {
 }
 
 static void suppressClicksAfterHome() {
-  suppressClickUntilMs = millis() + CLICK_SUPPRESS_MS_AFTER_HOME;
+  suppressClicksForMs(CLICK_SUPPRESS_MS_AFTER_HOME);
 }
 
 static void updatePageIndicator() {
@@ -2918,6 +2943,9 @@ static void showPage(int pageIndex) {
       lv_obj_add_flag(pages[i], LV_OBJ_FLAG_HIDDEN);
     }
   }
+  if (currentPage == UI_PAGE_HOME) {
+    refreshHomeShortcutSlots();
+  }
   if (currentPage == UI_PAGE_PHOTO_FRAME) {
     if (sdMounted && sdPhotoCount <= 0) {
       loadSdPhotoList();
@@ -2935,6 +2963,281 @@ static void showPage(int pageIndex) {
   updatePageIndicator();
 }
 
+static int wrapHomeShortcutIndex(int index) {
+  if (HOME_SHORTCUT_COUNT <= 0) {
+    return -1;
+  }
+
+  int wrapped = index % (int)HOME_SHORTCUT_COUNT;
+  if (wrapped < 0) {
+    wrapped += HOME_SHORTCUT_COUNT;
+  }
+  return wrapped;
+}
+
+static void renderHomeShortcutIcon(uint8_t slotIdx, const HomeShortcutConfig &item) {
+  if (slotIdx >= HOME_VISIBLE_SLOT_COUNT) {
+    return;
+  }
+
+  lv_obj_t *root = homeShortcutIcons[slotIdx];
+  if (root == nullptr) {
+    return;
+  }
+
+  lv_obj_clean(root);
+  lv_obj_set_style_bg_opa(root, LV_OPA_TRANSP, LV_PART_MAIN);
+
+  const lv_color_t fg = lv_color_hex(0xF5EEFF);
+
+  if (item.iconKind == HOME_ICON_SYMBOL) {
+    lv_obj_t *label = lv_label_create(root);
+    lv_label_set_text(label, item.icon);
+    lv_obj_set_style_text_color(label, fg, LV_PART_MAIN);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_22, LV_PART_MAIN);
+    lv_obj_center(label);
+    return;
+  }
+
+  if (item.iconKind == HOME_ICON_MONITOR) {
+    lv_obj_t *screen = lv_obj_create(root);
+    lv_obj_remove_style_all(screen);
+    lv_obj_set_size(screen, 24, 16);
+    lv_obj_align(screen, LV_ALIGN_CENTER, 0, -4);
+    lv_obj_set_style_radius(screen, 3, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_20, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(screen, fg, LV_PART_MAIN);
+    lv_obj_set_style_border_width(screen, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(screen, fg, LV_PART_MAIN);
+
+    lv_obj_t *stem = lv_obj_create(root);
+    lv_obj_remove_style_all(stem);
+    lv_obj_set_size(stem, 4, 5);
+    lv_obj_align(stem, LV_ALIGN_CENTER, 0, 7);
+    lv_obj_set_style_bg_opa(stem, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(stem, fg, LV_PART_MAIN);
+    lv_obj_set_style_radius(stem, 1, LV_PART_MAIN);
+
+    lv_obj_t *base = lv_obj_create(root);
+    lv_obj_remove_style_all(base);
+    lv_obj_set_size(base, 16, 2);
+    lv_obj_align(base, LV_ALIGN_CENTER, 0, 11);
+    lv_obj_set_style_bg_opa(base, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(base, fg, LV_PART_MAIN);
+    lv_obj_set_style_radius(base, 1, LV_PART_MAIN);
+    return;
+  }
+
+  if (item.iconKind == HOME_ICON_POMODORO) {
+    lv_obj_t *fruit = lv_obj_create(root);
+    lv_obj_remove_style_all(fruit);
+    lv_obj_set_size(fruit, 22, 22);
+    lv_obj_align(fruit, LV_ALIGN_CENTER, 0, 2);
+    lv_obj_set_style_radius(fruit, 11, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(fruit, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(fruit, lv_color_hex(0xFF5252), LV_PART_MAIN);
+    lv_obj_set_style_border_width(fruit, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(fruit, lv_color_hex(0xFFCDD2), LV_PART_MAIN);
+
+    lv_obj_t *leafL = lv_obj_create(root);
+    lv_obj_remove_style_all(leafL);
+    lv_obj_set_size(leafL, 7, 3);
+    lv_obj_align(leafL, LV_ALIGN_CENTER, -4, -9);
+    lv_obj_set_style_radius(leafL, 2, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(leafL, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(leafL, lv_color_hex(0x66BB6A), LV_PART_MAIN);
+
+    lv_obj_t *leafR = lv_obj_create(root);
+    lv_obj_remove_style_all(leafR);
+    lv_obj_set_size(leafR, 7, 3);
+    lv_obj_align(leafR, LV_ALIGN_CENTER, 4, -9);
+    lv_obj_set_style_radius(leafR, 2, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(leafR, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(leafR, lv_color_hex(0x66BB6A), LV_PART_MAIN);
+
+    lv_obj_t *stem = lv_obj_create(root);
+    lv_obj_remove_style_all(stem);
+    lv_obj_set_size(stem, 2, 4);
+    lv_obj_align(stem, LV_ALIGN_CENTER, 0, -11);
+    lv_obj_set_style_radius(stem, 1, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(stem, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(stem, lv_color_hex(0xA5D6A7), LV_PART_MAIN);
+    return;
+  }
+
+  if (item.iconKind == HOME_ICON_CLOCK) {
+    lv_obj_t *dial = lv_obj_create(root);
+    lv_obj_remove_style_all(dial);
+    lv_obj_set_size(dial, 24, 24);
+    lv_obj_align(dial, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(dial, 12, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(dial, LV_OPA_10, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(dial, fg, LV_PART_MAIN);
+    lv_obj_set_style_border_width(dial, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(dial, fg, LV_PART_MAIN);
+
+    lv_obj_t *hourHand = lv_obj_create(root);
+    lv_obj_remove_style_all(hourHand);
+    lv_obj_set_size(hourHand, 7, 2);
+    lv_obj_align(hourHand, LV_ALIGN_CENTER, 2, 1);
+    lv_obj_set_style_radius(hourHand, 1, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(hourHand, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(hourHand, fg, LV_PART_MAIN);
+
+    lv_obj_t *minuteHand = lv_obj_create(root);
+    lv_obj_remove_style_all(minuteHand);
+    lv_obj_set_size(minuteHand, 2, 8);
+    lv_obj_align(minuteHand, LV_ALIGN_CENTER, 0, -3);
+    lv_obj_set_style_radius(minuteHand, 1, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(minuteHand, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(minuteHand, fg, LV_PART_MAIN);
+
+    lv_obj_t *centerDot = lv_obj_create(root);
+    lv_obj_remove_style_all(centerDot);
+    lv_obj_set_size(centerDot, 4, 4);
+    lv_obj_align(centerDot, LV_ALIGN_CENTER, 0, 1);
+    lv_obj_set_style_radius(centerDot, 2, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(centerDot, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(centerDot, fg, LV_PART_MAIN);
+    return;
+  }
+
+  if (item.iconKind == HOME_ICON_WEATHER) {
+    lv_obj_t *sun = lv_obj_create(root);
+    lv_obj_remove_style_all(sun);
+    lv_obj_set_size(sun, 11, 11);
+    lv_obj_align(sun, LV_ALIGN_CENTER, 7, -8);
+    lv_obj_set_style_radius(sun, 6, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(sun, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(sun, lv_color_hex(0xFFD54F), LV_PART_MAIN);
+
+    lv_obj_t *cloud1 = lv_obj_create(root);
+    lv_obj_remove_style_all(cloud1);
+    lv_obj_set_size(cloud1, 11, 11);
+    lv_obj_align(cloud1, LV_ALIGN_CENTER, -6, 1);
+    lv_obj_set_style_radius(cloud1, 6, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(cloud1, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(cloud1, fg, LV_PART_MAIN);
+
+    lv_obj_t *cloud2 = lv_obj_create(root);
+    lv_obj_remove_style_all(cloud2);
+    lv_obj_set_size(cloud2, 13, 13);
+    lv_obj_align(cloud2, LV_ALIGN_CENTER, 1, -1);
+    lv_obj_set_style_radius(cloud2, 7, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(cloud2, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(cloud2, fg, LV_PART_MAIN);
+
+    lv_obj_t *cloud3 = lv_obj_create(root);
+    lv_obj_remove_style_all(cloud3);
+    lv_obj_set_size(cloud3, 11, 11);
+    lv_obj_align(cloud3, LV_ALIGN_CENTER, 9, 2);
+    lv_obj_set_style_radius(cloud3, 6, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(cloud3, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(cloud3, fg, LV_PART_MAIN);
+
+    lv_obj_t *cloudBase = lv_obj_create(root);
+    lv_obj_remove_style_all(cloudBase);
+    lv_obj_set_size(cloudBase, 24, 8);
+    lv_obj_align(cloudBase, LV_ALIGN_CENTER, 1, 5);
+    lv_obj_set_style_radius(cloudBase, 4, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(cloudBase, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(cloudBase, fg, LV_PART_MAIN);
+    return;
+  }
+
+  if (item.iconKind == HOME_ICON_APPS) {
+    static const lv_point_t line1[] = {{0, 14}, {14, 0}};
+    static const lv_point_t line2[] = {{0, 18}, {18, 0}};
+    static const lv_point_t line3[] = {{0, 22}, {22, 0}};
+
+    lv_obj_t *l1 = lv_line_create(root);
+    lv_line_set_points(l1, line1, 2);
+    lv_obj_set_size(l1, 16, 16);
+    lv_obj_align(l1, LV_ALIGN_CENTER, -4, -6);
+    lv_obj_set_style_line_color(l1, fg, LV_PART_MAIN);
+    lv_obj_set_style_line_width(l1, 2, LV_PART_MAIN);
+    lv_obj_set_style_line_rounded(l1, true, LV_PART_MAIN);
+
+    lv_obj_t *l2 = lv_line_create(root);
+    lv_line_set_points(l2, line2, 2);
+    lv_obj_set_size(l2, 20, 20);
+    lv_obj_align(l2, LV_ALIGN_CENTER, -1, -2);
+    lv_obj_set_style_line_color(l2, fg, LV_PART_MAIN);
+    lv_obj_set_style_line_width(l2, 2, LV_PART_MAIN);
+    lv_obj_set_style_line_rounded(l2, true, LV_PART_MAIN);
+
+    lv_obj_t *l3 = lv_line_create(root);
+    lv_line_set_points(l3, line3, 2);
+    lv_obj_set_size(l3, 24, 24);
+    lv_obj_align(l3, LV_ALIGN_CENTER, 2, 2);
+    lv_obj_set_style_line_color(l3, fg, LV_PART_MAIN);
+    lv_obj_set_style_line_width(l3, 2, LV_PART_MAIN);
+    lv_obj_set_style_line_rounded(l3, true, LV_PART_MAIN);
+    return;
+  }
+
+  lv_obj_t *fallback = lv_label_create(root);
+  lv_label_set_text(fallback, item.icon);
+  lv_obj_set_style_text_color(fallback, fg, LV_PART_MAIN);
+  lv_obj_set_style_text_font(fallback, &lv_font_montserrat_22, LV_PART_MAIN);
+  lv_obj_center(fallback);
+}
+
+static void refreshHomeShortcutSlots() {
+  uint8_t visible = HOME_VISIBLE_SLOT_COUNT;
+  if (visible > HOME_SHORTCUT_COUNT) {
+    visible = HOME_SHORTCUT_COUNT;
+  }
+
+  for (uint8_t i = 0; i < HOME_VISIBLE_SLOT_COUNT; ++i) {
+    if (homeShortcutSlots[i] == nullptr || homeShortcutButtons[i] == nullptr || homeShortcutIcons[i] == nullptr) {
+      continue;
+    }
+
+    if (i < visible) {
+      int shortcutIdx = wrapHomeShortcutIndex(homeCarouselOffset + i);
+      if (shortcutIdx < 0) {
+        lv_obj_add_flag(homeShortcutSlots[i], LV_OBJ_FLAG_HIDDEN);
+        homeSlotToShortcut[i] = -1;
+        continue;
+      }
+
+      const HomeShortcutConfig &item = HOME_SHORTCUTS[shortcutIdx];
+      homeSlotToShortcut[i] = (int8_t)shortcutIdx;
+      lv_obj_clear_flag(homeShortcutSlots[i], LV_OBJ_FLAG_HIDDEN);
+      lv_obj_set_style_bg_color(homeShortcutButtons[i], lv_color_hex(item.accentColor), LV_PART_MAIN);
+      lv_obj_set_style_shadow_color(homeShortcutButtons[i], lv_color_hex(item.accentColor), LV_PART_MAIN);
+      renderHomeShortcutIcon(i, item);
+
+      bool isFocused = (i == 0);
+      lv_obj_set_style_border_width(homeShortcutButtons[i], isFocused ? 2 : 1, LV_PART_MAIN);
+      lv_obj_set_style_border_color(homeShortcutButtons[i], isFocused ? lv_color_hex(0xF3E5FF) : lv_color_hex(0xD1C4E9), LV_PART_MAIN);
+      lv_obj_set_style_shadow_width(homeShortcutButtons[i], isFocused ? 18 : 12, LV_PART_MAIN);
+    } else {
+      homeSlotToShortcut[i] = -1;
+      lv_obj_add_flag(homeShortcutSlots[i], LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+
+  if (homeCurrentShortcutLabel != nullptr) {
+    int idx = homeSlotToShortcut[0];
+    if (idx >= 0 && idx < HOME_SHORTCUT_COUNT) {
+      lv_label_set_text_fmt(homeCurrentShortcutLabel, "%s  (%d/%d)", HOME_SHORTCUTS[idx].label, idx + 1, HOME_SHORTCUT_COUNT);
+    } else {
+      lv_label_set_text(homeCurrentShortcutLabel, "--");
+    }
+  }
+}
+
+static void shiftHomeCarousel(int delta) {
+  if (HOME_SHORTCUT_COUNT <= 1) {
+    return;
+  }
+
+  homeCarouselOffset = wrapHomeShortcutIndex(homeCarouselOffset + delta);
+  refreshHomeShortcutSlots();
+}
+
 static void homeShortcutEventCallback(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
     return;
@@ -2943,12 +3246,17 @@ static void homeShortcutEventCallback(lv_event_t *e) {
     return;
   }
 
-  intptr_t idxRaw = (intptr_t)lv_event_get_user_data(e);
-  if (idxRaw < 0 || idxRaw >= HOME_SHORTCUT_COUNT) {
+  intptr_t slotRaw = (intptr_t)lv_event_get_user_data(e);
+  if (slotRaw < 0 || slotRaw >= HOME_VISIBLE_SLOT_COUNT) {
     return;
   }
 
-  UiPage page = HOME_SHORTCUTS[idxRaw].page;
+  int shortcutIdx = homeSlotToShortcut[slotRaw];
+  if (shortcutIdx < 0 || shortcutIdx >= HOME_SHORTCUT_COUNT) {
+    return;
+  }
+
+  UiPage page = HOME_SHORTCUTS[shortcutIdx].page;
   if (page >= 0 && page < UI_PAGE_COUNT) {
     showPage((int)page);
   }
@@ -2962,61 +3270,39 @@ static void layoutHomeShortcuts() {
 
   int16_t cx = lv_disp_get_hor_res(disp) / 2;
   int16_t cy = lv_disp_get_ver_res(disp) / 2 + 4;
-  uint8_t total = HOME_SHORTCUT_COUNT;
-  uint8_t outerCount = (total > 8) ? 8 : total;
-  uint8_t innerCount = (total > outerCount) ? (total - outerCount) : 0;
+  uint8_t visible = HOME_VISIBLE_SLOT_COUNT;
+  if (visible > HOME_SHORTCUT_COUNT) {
+    visible = HOME_SHORTCUT_COUNT;
+  }
 
-  for (uint8_t i = 0; i < outerCount; ++i) {
-    if (homeShortcutSlots[i] == nullptr || homeShortcutButtons[i] == nullptr || homeShortcutIcons[i] == nullptr || homeShortcutLabels[i] == nullptr) {
+  for (uint8_t i = 0; i < HOME_VISIBLE_SLOT_COUNT; ++i) {
+    if (homeShortcutSlots[i] == nullptr || homeShortcutButtons[i] == nullptr || homeShortcutIcons[i] == nullptr) {
       continue;
     }
 
-    float angleDeg = -90.0f + (360.0f * (float)i / (float)outerCount);
+    if (i >= visible) {
+      homeSlotToShortcut[i] = -1;
+      lv_obj_add_flag(homeShortcutSlots[i], LV_OBJ_FLAG_HIDDEN);
+      continue;
+    }
+
+    float angleDeg = -90.0f + (360.0f * (float)i / (float)visible);
     float rad = angleDeg * HOME_DEG_TO_RAD;
-    int16_t slotSize = 88;
-    int16_t buttonSize = 56;
+    int16_t slotSize = 64;
+    int16_t buttonSize = 52;
     int16_t radius = 124;
     int16_t x = cx + (int16_t)lroundf(cosf(rad) * radius) - slotSize / 2;
     int16_t y = cy + (int16_t)lroundf(sinf(rad) * radius) - slotSize / 2;
 
+    lv_obj_clear_flag(homeShortcutSlots[i], LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_size(homeShortcutSlots[i], slotSize, slotSize);
     lv_obj_set_pos(homeShortcutSlots[i], x, y);
     lv_obj_set_size(homeShortcutButtons[i], buttonSize, buttonSize);
     lv_obj_set_style_radius(homeShortcutButtons[i], buttonSize / 2, LV_PART_MAIN);
-    lv_obj_align(homeShortcutButtons[i], LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_text_font(homeShortcutIcons[i], &lv_font_montserrat_22, LV_PART_MAIN);
-    lv_obj_center(homeShortcutIcons[i]);
-    lv_obj_set_style_text_font(homeShortcutLabels[i], &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_align(homeShortcutLabels[i], LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_align(homeShortcutButtons[i], LV_ALIGN_CENTER, 0, 0);
   }
 
-  for (uint8_t i = 0; i < innerCount; ++i) {
-    uint8_t idx = outerCount + i;
-    if (idx >= HOME_SHORTCUT_COUNT) {
-      break;
-    }
-    if (homeShortcutSlots[idx] == nullptr || homeShortcutButtons[idx] == nullptr || homeShortcutIcons[idx] == nullptr || homeShortcutLabels[idx] == nullptr) {
-      continue;
-    }
-
-    float angleDeg = -90.0f + (360.0f * (float)i / (float)innerCount) + (180.0f / (float)innerCount);
-    float rad = angleDeg * HOME_DEG_TO_RAD;
-    int16_t slotSize = 72;
-    int16_t buttonSize = 44;
-    int16_t radius = 84;
-    int16_t x = cx + (int16_t)lroundf(cosf(rad) * radius) - slotSize / 2;
-    int16_t y = cy + (int16_t)lroundf(sinf(rad) * radius) - slotSize / 2;
-
-    lv_obj_set_size(homeShortcutSlots[idx], slotSize, slotSize);
-    lv_obj_set_pos(homeShortcutSlots[idx], x, y);
-    lv_obj_set_size(homeShortcutButtons[idx], buttonSize, buttonSize);
-    lv_obj_set_style_radius(homeShortcutButtons[idx], buttonSize / 2, LV_PART_MAIN);
-    lv_obj_align(homeShortcutButtons[idx], LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_text_font(homeShortcutIcons[idx], &lv_font_montserrat_16, LV_PART_MAIN);
-    lv_obj_center(homeShortcutIcons[idx]);
-    lv_obj_set_style_text_font(homeShortcutLabels[idx], &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_align(homeShortcutLabels[idx], LV_ALIGN_BOTTOM_MID, 0, 0);
-  }
+  refreshHomeShortcutSlots();
 }
 
 static void attachGestureHandlers(lv_obj_t *obj) {
@@ -3933,7 +4219,7 @@ static void gestureEventCallback(lv_event_t *e) {
       return;
     }
 
-    if (!gestureState.longPressHandled && currentPage != UI_PAGE_HOME) {
+    if (!gestureState.longPressHandled) {
       lv_point_t endPoint = gestureState.startPoint;
       if (getActiveTouchPoint(&endPoint)) {
         int32_t dx = (int32_t)endPoint.x - (int32_t)gestureState.startPoint.x;
@@ -3941,12 +4227,21 @@ static void gestureEventCallback(lv_event_t *e) {
         int32_t adx = (dx >= 0) ? dx : -dx;
         int32_t ady = (dy >= 0) ? dy : -dy;
 
-        bool swipeUp = (dy <= -SWIPE_HOME_THRESHOLD) &&
-                       (ady > (adx + SWIPE_HOME_DIRECTION_MARGIN)) &&
-                       (adx <= SWIPE_HOME_MAX_X_DRIFT);
-        if (swipeUp) {
-          showPage(UI_PAGE_HOME);
-          suppressClicksAfterHome();
+        if (currentPage == UI_PAGE_HOME) {
+          bool swipeHorizontal = (adx >= HOME_CAROUSEL_SWIPE_THRESHOLD) &&
+                                 (adx > (ady + HOME_CAROUSEL_DIRECTION_MARGIN));
+          if (swipeHorizontal) {
+            shiftHomeCarousel((dx < 0) ? 1 : -1);
+            suppressClicksForMs(CLICK_SUPPRESS_MS_AFTER_CAROUSEL);
+          }
+        } else {
+          bool swipeUp = (dy <= -SWIPE_HOME_THRESHOLD) &&
+                         (ady > (adx + SWIPE_HOME_DIRECTION_MARGIN)) &&
+                         (adx <= SWIPE_HOME_MAX_X_DRIFT);
+          if (swipeUp) {
+            showPage(UI_PAGE_HOME);
+            suppressClicksAfterHome();
+          }
         }
       }
     }
@@ -3991,12 +4286,12 @@ static void createUi() {
   lv_obj_clear_flag(homeInner, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_clear_flag(homeInner, LV_OBJ_FLAG_CLICKABLE);
 
-  for (uint8_t i = 0; i < HOME_SHORTCUT_COUNT; ++i) {
-    const HomeShortcutConfig &item = HOME_SHORTCUTS[i];
+  for (uint8_t i = 0; i < HOME_VISIBLE_SLOT_COUNT; ++i) {
+    const HomeShortcutConfig &item = HOME_SHORTCUTS[i % HOME_SHORTCUT_COUNT];
 
     homeShortcutSlots[i] = lv_obj_create(pages[UI_PAGE_HOME]);
     lv_obj_remove_style_all(homeShortcutSlots[i]);
-    lv_obj_set_size(homeShortcutSlots[i], 88, 88);
+    lv_obj_set_size(homeShortcutSlots[i], 64, 64);
     lv_obj_set_style_bg_opa(homeShortcutSlots[i], LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_clear_flag(homeShortcutSlots[i], LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(homeShortcutSlots[i], LV_OBJ_FLAG_CLICKABLE);
@@ -4004,33 +4299,30 @@ static void createUi() {
     attachGestureHandlers(homeShortcutSlots[i]);
 
     homeShortcutButtons[i] = lv_btn_create(homeShortcutSlots[i]);
-    lv_obj_set_size(homeShortcutButtons[i], 56, 56);
-    lv_obj_align(homeShortcutButtons[i], LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_radius(homeShortcutButtons[i], 28, LV_PART_MAIN);
+    lv_obj_set_size(homeShortcutButtons[i], 52, 52);
+    lv_obj_align(homeShortcutButtons[i], LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(homeShortcutButtons[i], 26, LV_PART_MAIN);
     lv_obj_set_style_bg_color(homeShortcutButtons[i], lv_color_hex(item.accentColor), LV_PART_MAIN);
-    lv_obj_set_style_bg_grad_color(homeShortcutButtons[i], lv_color_hex(0x8E24AA), LV_PART_MAIN);
+    lv_obj_set_style_bg_grad_color(homeShortcutButtons[i], lv_color_hex(0x7E57C2), LV_PART_MAIN);
     lv_obj_set_style_bg_grad_dir(homeShortcutButtons[i], LV_GRAD_DIR_VER, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(homeShortcutButtons[i], lv_color_hex(0x4A148C), LV_PART_MAIN | LV_STATE_PRESSED);
-    lv_obj_set_style_shadow_width(homeShortcutButtons[i], 14, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(homeShortcutButtons[i], lv_color_hex(0x4527A0), LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_shadow_width(homeShortcutButtons[i], 12, LV_PART_MAIN);
     lv_obj_set_style_shadow_color(homeShortcutButtons[i], lv_color_hex(item.accentColor), LV_PART_MAIN);
-    lv_obj_set_style_shadow_opa(homeShortcutButtons[i], LV_OPA_60, LV_PART_MAIN);
+    lv_obj_set_style_shadow_opa(homeShortcutButtons[i], LV_OPA_70, LV_PART_MAIN);
     lv_obj_set_style_border_width(homeShortcutButtons[i], 1, LV_PART_MAIN);
     lv_obj_set_style_border_color(homeShortcutButtons[i], lv_color_hex(0xD1C4E9), LV_PART_MAIN);
     lv_obj_add_flag(homeShortcutButtons[i], LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_PRESS_LOCK);
     attachGestureHandlers(homeShortcutButtons[i]);
     lv_obj_add_event_cb(homeShortcutButtons[i], homeShortcutEventCallback, LV_EVENT_CLICKED, (void *)((intptr_t)i));
 
-    homeShortcutIcons[i] = lv_label_create(homeShortcutButtons[i]);
-    lv_label_set_text(homeShortcutIcons[i], item.icon);
-    lv_obj_set_style_text_color(homeShortcutIcons[i], lv_color_hex(0xF5EEFF), LV_PART_MAIN);
-    lv_obj_set_style_text_font(homeShortcutIcons[i], &lv_font_montserrat_22, LV_PART_MAIN);
+    homeShortcutIcons[i] = lv_obj_create(homeShortcutButtons[i]);
+    lv_obj_remove_style_all(homeShortcutIcons[i]);
+    lv_obj_set_size(homeShortcutIcons[i], 36, 36);
     lv_obj_center(homeShortcutIcons[i]);
-
-    homeShortcutLabels[i] = lv_label_create(homeShortcutSlots[i]);
-    lv_label_set_text(homeShortcutLabels[i], item.label);
-    lv_obj_set_style_text_color(homeShortcutLabels[i], lv_color_hex(0xC8D0FF), LV_PART_MAIN);
-    lv_obj_set_style_text_font(homeShortcutLabels[i], &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_align(homeShortcutLabels[i], LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_opa(homeShortcutIcons[i], LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_clear_flag(homeShortcutIcons[i], LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(homeShortcutIcons[i], LV_OBJ_FLAG_CLICKABLE);
+    renderHomeShortcutIcon(i, item);
   }
 
   lv_obj_t *homeCenter = lv_obj_create(pages[UI_PAGE_HOME]);
@@ -4060,10 +4352,19 @@ static void createUi() {
   lv_obj_set_style_text_color(homeDateLabel, lv_color_hex(0xB7D1FF), LV_PART_MAIN);
   lv_obj_align(homeDateLabel, LV_ALIGN_CENTER, 0, 26);
 
-  lv_obj_t *homeHint = lv_label_create(pages[UI_PAGE_HOME]);
-  lv_label_set_text(homeHint, "Tap icon to open");
-  lv_obj_set_style_text_color(homeHint, lv_color_hex(0x8A93C8), LV_PART_MAIN);
-  lv_obj_align(homeHint, LV_ALIGN_BOTTOM_MID, 0, -10);
+  homeCurrentShortcutLabel = lv_label_create(pages[UI_PAGE_HOME]);
+  lv_label_set_text(homeCurrentShortcutLabel, "--");
+  lv_obj_set_style_text_color(homeCurrentShortcutLabel, lv_color_hex(0xD5DBFF), LV_PART_MAIN);
+  lv_obj_set_style_text_font(homeCurrentShortcutLabel, &lv_font_montserrat_16, LV_PART_MAIN);
+  lv_obj_set_style_text_align(homeCurrentShortcutLabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_align(homeCurrentShortcutLabel, LV_ALIGN_BOTTOM_MID, 0, -30);
+
+  homeSwipeHintLabel = lv_label_create(pages[UI_PAGE_HOME]);
+  lv_label_set_text(homeSwipeHintLabel, "Swipe <- / ->   Tap to open");
+  lv_obj_set_style_text_color(homeSwipeHintLabel, lv_color_hex(0x8A93C8), LV_PART_MAIN);
+  lv_obj_set_style_text_font(homeSwipeHintLabel, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_set_style_text_align(homeSwipeHintLabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_align(homeSwipeHintLabel, LV_ALIGN_BOTTOM_MID, 0, -10);
 
   layoutHomeShortcuts();
 
