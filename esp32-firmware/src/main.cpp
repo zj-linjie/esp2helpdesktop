@@ -13,6 +13,11 @@
 #include <math.h>
 #include "config.h"
 #include "display/scr_st77916.h"
+#include <AudioFileSourceFS.h>
+#include <AudioFileSourceBuffer.h>
+#include <AudioGeneratorMP3.h>
+#include <AudioGeneratorWAV.h>
+#include <AudioOutputI2S.h>
 
 #if LV_USE_SJPG
 extern "C" void lv_split_jpeg_init(void);
@@ -35,7 +40,8 @@ enum UiPage {
   UI_PAGE_WEATHER = 6,
   UI_PAGE_APP_LAUNCHER = 7,
   UI_PAGE_PHOTO_FRAME = 8,
-  UI_PAGE_COUNT = 9
+  UI_PAGE_AUDIO_PLAYER = 9,
+  UI_PAGE_COUNT = 10
 };
 
 struct TouchGestureState {
@@ -79,6 +85,7 @@ static const HomeShortcutConfig HOME_SHORTCUTS[] = {
   {"Weather", LV_SYMBOL_GPS, UI_PAGE_WEATHER, 0x7E57C2},
   {"Clock", LV_SYMBOL_REFRESH, UI_PAGE_CLOCK, 0x6A1B9A},
   {"Apps", LV_SYMBOL_DIRECTORY, UI_PAGE_APP_LAUNCHER, 0x5E35B1},
+  {"Music", LV_SYMBOL_AUDIO, UI_PAGE_AUDIO_PLAYER, 0x5B2DA8},
   {"Inbox", LV_SYMBOL_LIST, UI_PAGE_INBOX, 0x7B1FA2},
 };
 
@@ -155,6 +162,15 @@ static lv_obj_t *photoFramePrevBtn = nullptr;
 static lv_obj_t *photoFrameReloadBtn = nullptr;
 static lv_obj_t *photoFrameNextBtn = nullptr;
 
+static lv_obj_t *audioStatusLabel = nullptr;
+static lv_obj_t *audioTrackLabel = nullptr;
+static lv_obj_t *audioTimeLabel = nullptr;
+static lv_obj_t *audioIndexLabel = nullptr;
+static lv_obj_t *audioPrevBtn = nullptr;
+static lv_obj_t *audioPlayBtn = nullptr;
+static lv_obj_t *audioPlayBtnLabel = nullptr;
+static lv_obj_t *audioNextBtn = nullptr;
+
 struct MacApp {
   char name[32];
   char path[128];
@@ -202,6 +218,43 @@ static uint8_t *photoDecodedData = nullptr;
 static size_t photoDecodedDataSize = 0;
 static lv_img_dsc_t photoDecodedDsc;
 
+struct SdAudioFile {
+  char path[192];
+  char name[64];
+  uint32_t size;
+  uint32_t durationSec;
+  bool durationChecked;
+  bool durationEstimated;
+};
+
+static SdAudioFile sdAudioFiles[96];
+static int sdAudioCount = 0;
+static int sdAudioIndex = 0;
+static AudioFileSourceFS *audioFileSource = nullptr;
+static AudioFileSourceBuffer *audioBufferedSource = nullptr;
+static AudioGeneratorMP3 *audioMp3 = nullptr;
+static AudioGeneratorWAV *audioWav = nullptr;
+static AudioOutputI2S *audioOutput = nullptr;
+static bool audioOutputReady = false;
+static bool audioPaused = false;
+static uint32_t audioLastControlMs = 0;
+static uint32_t audioElapsedAccumMs = 0;
+static uint32_t audioPlaybackResumeMs = 0;
+static uint32_t audioLastTimeLabelRefreshMs = 0;
+static uint32_t audioShownElapsedSec = 0xFFFFFFFF;
+static uint32_t audioShownDurationSec = 0xFFFFFFFF;
+static constexpr uint32_t AUDIO_CONTROL_COOLDOWN_MS = 220;
+
+enum AudioControlAction {
+  AUDIO_CONTROL_NONE = -1,
+  AUDIO_CONTROL_PREV = 0,
+  AUDIO_CONTROL_TOGGLE = 1,
+  AUDIO_CONTROL_NEXT = 2,
+  AUDIO_CONTROL_RESCAN = 3,
+};
+
+static volatile int pendingAudioControlAction = AUDIO_CONTROL_NONE;
+
 struct PhotoFrameRemoteSettings {
   uint16_t slideshowIntervalSec = 5;
   bool autoPlay = true;
@@ -211,6 +264,35 @@ struct PhotoFrameRemoteSettings {
   uint16_t maxPhotoCount = 20;
   bool valid = false;
 };
+
+struct SdBrowserFile {
+  char path[192];
+  char name[64];
+  char type[8];
+  uint32_t size;
+};
+
+static SdBrowserFile sdBrowserFiles[120];
+static int sdBrowserFileCount = 0;
+static constexpr int SD_BROWSER_RESPONSE_MAX_FILES = 24;
+static StaticJsonDocument<8192> sdListResponseDoc;
+
+struct SdUploadSession {
+  bool active;
+  bool waitingBinary;
+  bool overwrite;
+  char uploadId[48];
+  char targetPath[192];
+  char tempPath[208];
+  uint32_t expectedSize;
+  uint32_t receivedSize;
+  int expectedSeq;
+  int pendingSeq;
+  int pendingLen;
+  File file;
+};
+
+static SdUploadSession sdUploadSession;
 
 static PhotoFrameRemoteSettings photoFrameSettings;
 static uint32_t lastPhotoSettingsRequestMs = 0;
@@ -317,6 +399,20 @@ static void requestPhotoFrameSettings(bool force = false);
 static void processPhotoFrameAutoPlay();
 static void sendPhotoFrameState(const char *reason, bool force = false);
 static void handlePhotoControlCommand(const JsonObjectConst &data);
+static void loadSdAudioList();
+static void showCurrentAudioTrack();
+static void processAudioPlayback();
+static void processPendingAudioControl();
+static bool startAudioPlayback(int index);
+static void stopAudioPlayback(bool keepStatus = false);
+static void refreshAudioTimeLabel(bool force = false);
+static void sendSdListResponse(const char *requestId, int offset, int limit);
+static void sendSdDeleteResponse(const char *requestId, const char *targetPath, bool success, const char *reason);
+static void resetSdUploadSession(bool removeTempFile);
+static bool ensureSdParentDirectories(const char *targetPath, char *reason, size_t reasonSize);
+static void sendSdUploadBeginAck(const char *uploadId, bool success, const char *reason);
+static void sendSdUploadChunkAck(const char *uploadId, int seq, bool success, const char *reason);
+static void sendSdUploadCommitAck(const char *uploadId, bool success, const char *finalPath, const char *reason);
 static bool shouldSuppressClick();
 static void suppressClicksAfterHome();
 static void homeShortcutEventCallback(lv_event_t *e);
@@ -757,6 +853,50 @@ static bool hasPhotoExtension(const char *path) {
   }
 
   return equalsIgnoreCase(dot, ".jpg") || equalsIgnoreCase(dot, ".jpeg") || equalsIgnoreCase(dot, ".sjpg");
+}
+
+static bool hasAudioExtension(const char *path) {
+  if (path == nullptr) {
+    return false;
+  }
+
+  const char *dot = strrchr(path, '.');
+  if (dot == nullptr) {
+    return false;
+  }
+
+  return equalsIgnoreCase(dot, ".mp3") || equalsIgnoreCase(dot, ".wav");
+}
+
+static bool hasVideoExtension(const char *path) {
+  if (path == nullptr) {
+    return false;
+  }
+
+  const char *dot = strrchr(path, '.');
+  if (dot == nullptr) {
+    return false;
+  }
+
+  return equalsIgnoreCase(dot, ".mp4") ||
+         equalsIgnoreCase(dot, ".mov") ||
+         equalsIgnoreCase(dot, ".mkv") ||
+         equalsIgnoreCase(dot, ".avi") ||
+         equalsIgnoreCase(dot, ".mjpeg") ||
+         equalsIgnoreCase(dot, ".mjpg");
+}
+
+static const char *classifySdFileType(const char *path) {
+  if (hasPhotoExtension(path)) {
+    return "image";
+  }
+  if (hasAudioExtension(path)) {
+    return "audio";
+  }
+  if (hasVideoExtension(path)) {
+    return "video";
+  }
+  return "other";
 }
 
 static const char *baseNameFromPath(const char *path) {
@@ -1435,6 +1575,1067 @@ static void photoFrameControlCallback(lv_event_t *e) {
   }
 }
 
+static bool isAudioRunning() {
+  if (audioMp3 != nullptr && audioMp3->isRunning()) {
+    return true;
+  }
+  if (audioWav != nullptr && audioWav->isRunning()) {
+    return true;
+  }
+  return false;
+}
+
+static bool readFileExact(File &file, uint8_t *buf, size_t len) {
+  if (buf == nullptr || len == 0) {
+    return false;
+  }
+  return file.read(buf, len) == (int)len;
+}
+
+static uint16_t readLe16(const uint8_t *buf) {
+  return (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+}
+
+static uint32_t readLe32(const uint8_t *buf) {
+  return (uint32_t)buf[0]
+    | ((uint32_t)buf[1] << 8)
+    | ((uint32_t)buf[2] << 16)
+    | ((uint32_t)buf[3] << 24);
+}
+
+static void formatAudioTimeMMSS(uint32_t sec, char *out, size_t outSize) {
+  if (out == nullptr || outSize == 0) {
+    return;
+  }
+  uint32_t m = sec / 60;
+  uint32_t s = sec % 60;
+  snprintf(out, outSize, "%02u:%02u", (unsigned)m, (unsigned)s);
+}
+
+static int mp3BitrateKbpsFromHeader(const uint8_t h[4]) {
+  if (h == nullptr) {
+    return 0;
+  }
+  if (h[0] != 0xFF || (h[1] & 0xE0) != 0xE0) {
+    return 0;
+  }
+
+  const int versionBits = (h[1] >> 3) & 0x03;
+  const int layerBits = (h[1] >> 1) & 0x03;
+  const int bitrateIdx = (h[2] >> 4) & 0x0F;
+  const int sampleRateIdx = (h[2] >> 2) & 0x03;
+  if (versionBits == 1 || layerBits == 0 || bitrateIdx == 0 || bitrateIdx == 15 || sampleRateIdx == 3) {
+    return 0;
+  }
+
+  int layer = 0;
+  if (layerBits == 3) {
+    layer = 1;
+  } else if (layerBits == 2) {
+    layer = 2;
+  } else {
+    layer = 3;
+  }
+
+  static const int BITRATE_MPEG1_L1[16] = {0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0};
+  static const int BITRATE_MPEG1_L2[16] = {0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0};
+  static const int BITRATE_MPEG1_L3[16] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0};
+  static const int BITRATE_MPEG2_L1[16] = {0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0};
+  static const int BITRATE_MPEG2_L2L3[16] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0};
+
+  const bool isMpeg1 = versionBits == 3;
+  if (isMpeg1) {
+    if (layer == 1) return BITRATE_MPEG1_L1[bitrateIdx];
+    if (layer == 2) return BITRATE_MPEG1_L2[bitrateIdx];
+    return BITRATE_MPEG1_L3[bitrateIdx];
+  }
+
+  if (layer == 1) return BITRATE_MPEG2_L1[bitrateIdx];
+  return BITRATE_MPEG2_L2L3[bitrateIdx];
+}
+
+static uint32_t estimateMp3DurationSec(const char *path, uint32_t fileSize, bool *estimated) {
+  if (estimated != nullptr) {
+    *estimated = true;
+  }
+  if (path == nullptr || path[0] == '\0' || fileSize == 0) {
+    return 0;
+  }
+
+  File file = SD_MMC.open(path, FILE_READ);
+  if (!file) {
+    return (uint32_t)((fileSize * 8ULL + 64000ULL) / 128000ULL);
+  }
+
+  uint32_t payloadSize = fileSize;
+  uint8_t id3Head[10];
+  if (readFileExact(file, id3Head, sizeof(id3Head))) {
+    if (id3Head[0] == 'I' && id3Head[1] == 'D' && id3Head[2] == '3') {
+      uint32_t tagSize = ((uint32_t)(id3Head[6] & 0x7F) << 21)
+        | ((uint32_t)(id3Head[7] & 0x7F) << 14)
+        | ((uint32_t)(id3Head[8] & 0x7F) << 7)
+        | (uint32_t)(id3Head[9] & 0x7F);
+      uint32_t skip = 10 + tagSize;
+      if ((id3Head[5] & 0x10) != 0) {
+        skip += 10; // footer
+      }
+      if (skip < fileSize) {
+        payloadSize = fileSize - skip;
+      }
+      file.seek(skip);
+    } else {
+      file.seek(0);
+    }
+  } else {
+    file.seek(0);
+  }
+
+  int bitrateKbps = 0;
+  uint8_t scanBuf[768];
+  int carry = 0;
+  uint8_t header[4];
+  while (bitrateKbps <= 0 && file.available()) {
+    int n = file.read(scanBuf + carry, sizeof(scanBuf) - carry);
+    if (n <= 0) {
+      break;
+    }
+    n += carry;
+
+    for (int i = 0; i + 3 < n; ++i) {
+      header[0] = scanBuf[i];
+      header[1] = scanBuf[i + 1];
+      header[2] = scanBuf[i + 2];
+      header[3] = scanBuf[i + 3];
+      bitrateKbps = mp3BitrateKbpsFromHeader(header);
+      if (bitrateKbps > 0) {
+        break;
+      }
+    }
+
+    carry = n >= 3 ? 3 : n;
+    if (carry > 0) {
+      memmove(scanBuf, scanBuf + n - carry, carry);
+    }
+  }
+  file.close();
+
+  if (bitrateKbps <= 0) {
+    bitrateKbps = 128;
+  }
+  uint64_t bits = (uint64_t)payloadSize * 8ULL;
+  uint64_t denom = (uint64_t)bitrateKbps * 1000ULL;
+  return (uint32_t)((bits + denom / 2ULL) / denom);
+}
+
+static uint32_t wavDurationSec(const char *path, bool *estimated) {
+  if (estimated != nullptr) {
+    *estimated = false;
+  }
+  if (path == nullptr || path[0] == '\0') {
+    return 0;
+  }
+
+  File file = SD_MMC.open(path, FILE_READ);
+  if (!file) {
+    if (estimated != nullptr) {
+      *estimated = true;
+    }
+    return 0;
+  }
+
+  uint8_t riff[12];
+  if (!readFileExact(file, riff, sizeof(riff))
+      || memcmp(riff, "RIFF", 4) != 0
+      || memcmp(riff + 8, "WAVE", 4) != 0) {
+    file.close();
+    if (estimated != nullptr) {
+      *estimated = true;
+    }
+    return 0;
+  }
+
+  uint16_t channels = 0;
+  uint16_t bitsPerSample = 0;
+  uint32_t sampleRate = 0;
+  uint32_t dataSize = 0;
+
+  while (file.available()) {
+    uint8_t chunkHead[8];
+    if (!readFileExact(file, chunkHead, sizeof(chunkHead))) {
+      break;
+    }
+    uint32_t chunkSize = readLe32(chunkHead + 4);
+    if (memcmp(chunkHead, "fmt ", 4) == 0) {
+      uint8_t fmt[16];
+      if (chunkSize >= 16 && readFileExact(file, fmt, sizeof(fmt))) {
+        channels = readLe16(fmt + 2);
+        sampleRate = readLe32(fmt + 4);
+        bitsPerSample = readLe16(fmt + 14);
+        if (chunkSize > 16) {
+          file.seek(file.position() + (chunkSize - 16));
+        }
+      } else {
+        break;
+      }
+    } else if (memcmp(chunkHead, "data", 4) == 0) {
+      dataSize = chunkSize;
+      break;
+    } else {
+      file.seek(file.position() + chunkSize);
+    }
+
+    if ((chunkSize & 1U) != 0U && file.available()) {
+      file.seek(file.position() + 1);
+    }
+  }
+
+  file.close();
+  if (channels == 0 || bitsPerSample == 0 || sampleRate == 0 || dataSize == 0) {
+    if (estimated != nullptr) {
+      *estimated = true;
+    }
+    return 0;
+  }
+
+  uint32_t bytesPerSec = (sampleRate * channels * bitsPerSample) / 8U;
+  if (bytesPerSec == 0) {
+    if (estimated != nullptr) {
+      *estimated = true;
+    }
+    return 0;
+  }
+  return dataSize / bytesPerSec;
+}
+
+static void ensureAudioTrackDuration(int index) {
+  if (index < 0 || index >= sdAudioCount) {
+    return;
+  }
+
+  SdAudioFile &item = sdAudioFiles[index];
+  if (item.durationChecked) {
+    return;
+  }
+
+  item.durationChecked = true;
+  item.durationSec = 0;
+  item.durationEstimated = true;
+
+  const bool isWav = strstr(item.path, ".wav") != nullptr || strstr(item.path, ".WAV") != nullptr;
+  bool estimated = true;
+  uint32_t duration = 0;
+  if (isWav) {
+    duration = wavDurationSec(item.path, &estimated);
+  } else {
+    duration = estimateMp3DurationSec(item.path, item.size, &estimated);
+  }
+
+  item.durationSec = duration;
+  item.durationEstimated = estimated;
+}
+
+static uint32_t currentAudioElapsedMs() {
+  uint32_t elapsedMs = audioElapsedAccumMs;
+  if (isAudioRunning() && !audioPaused && audioPlaybackResumeMs != 0) {
+    elapsedMs += (uint32_t)(millis() - audioPlaybackResumeMs);
+  }
+  return elapsedMs;
+}
+
+static void refreshAudioTimeLabel(bool force) {
+  if (audioTimeLabel == nullptr) {
+    return;
+  }
+
+  if (!sdMounted || sdAudioCount <= 0 || sdAudioIndex < 0 || sdAudioIndex >= sdAudioCount) {
+    lv_label_set_text(audioTimeLabel, "--:-- / --:--");
+    audioShownElapsedSec = 0xFFFFFFFF;
+    audioShownDurationSec = 0xFFFFFFFF;
+    return;
+  }
+
+  ensureAudioTrackDuration(sdAudioIndex);
+  const SdAudioFile &item = sdAudioFiles[sdAudioIndex];
+
+  uint32_t elapsedSec = 0;
+  if (isAudioRunning()) {
+    elapsedSec = currentAudioElapsedMs() / 1000U;
+  }
+  uint32_t durationSec = item.durationSec;
+  if (durationSec > 0 && elapsedSec > durationSec) {
+    elapsedSec = durationSec;
+  }
+
+  if (!force && elapsedSec == audioShownElapsedSec && durationSec == audioShownDurationSec) {
+    return;
+  }
+
+  char elapsedText[12];
+  char durationText[12];
+  char line[40];
+  formatAudioTimeMMSS(elapsedSec, elapsedText, sizeof(elapsedText));
+  if (durationSec > 0) {
+    formatAudioTimeMMSS(durationSec, durationText, sizeof(durationText));
+    if (item.durationEstimated) {
+      snprintf(line, sizeof(line), "%s / ~%s", elapsedText, durationText);
+    } else {
+      snprintf(line, sizeof(line), "%s / %s", elapsedText, durationText);
+    }
+  } else {
+    snprintf(line, sizeof(line), "%s / --:--", elapsedText);
+  }
+  lv_label_set_text(audioTimeLabel, line);
+  audioShownElapsedSec = elapsedSec;
+  audioShownDurationSec = durationSec;
+}
+
+static void setAudioStatus(const char *text, lv_color_t color) {
+  if (audioStatusLabel == nullptr) {
+    return;
+  }
+  lv_label_set_text(audioStatusLabel, text == nullptr ? "" : text);
+  lv_obj_set_style_text_color(audioStatusLabel, color, LV_PART_MAIN);
+}
+
+static void setAudioButtonEnabled(lv_obj_t *btn, bool enabled) {
+  if (btn == nullptr) {
+    return;
+  }
+  if (enabled) {
+    lv_obj_clear_state(btn, LV_STATE_DISABLED);
+  } else {
+    lv_obj_add_state(btn, LV_STATE_DISABLED);
+  }
+}
+
+static void updateAudioControlButtons(bool hasTracks, bool canStepTrack) {
+  setAudioButtonEnabled(audioPlayBtn, hasTracks);
+  setAudioButtonEnabled(audioPrevBtn, canStepTrack);
+  setAudioButtonEnabled(audioNextBtn, canStepTrack);
+  if (audioPlayBtnLabel != nullptr) {
+    lv_label_set_text(audioPlayBtnLabel, (isAudioRunning() && !audioPaused) ? "Pause" : "Play");
+  }
+}
+
+static void showCurrentAudioTrack() {
+  if (audioTrackLabel == nullptr || audioIndexLabel == nullptr) {
+    return;
+  }
+
+  if (!sdMounted) {
+    lv_label_set_text(audioTrackLabel, "No SD card");
+    lv_label_set_text(audioIndexLabel, "0/0");
+    refreshAudioTimeLabel(true);
+    setAudioStatus("SD not mounted", lv_color_hex(0xEF5350));
+    updateAudioControlButtons(false, false);
+    return;
+  }
+
+  if (sdAudioCount <= 0) {
+    lv_label_set_text(audioTrackLabel, "No MP3/WAV files found");
+    lv_label_set_text(audioIndexLabel, "0/0");
+    refreshAudioTimeLabel(true);
+    setAudioStatus("Add music and reopen page", lv_color_hex(0xFFB74D));
+    updateAudioControlButtons(false, false);
+    return;
+  }
+
+  if (sdAudioIndex < 0) {
+    sdAudioIndex = 0;
+  }
+  if (sdAudioIndex >= sdAudioCount) {
+    sdAudioIndex = sdAudioCount - 1;
+  }
+
+  lv_label_set_text(audioTrackLabel, sdAudioFiles[sdAudioIndex].name);
+  lv_label_set_text_fmt(audioIndexLabel, "%d/%d", sdAudioIndex + 1, sdAudioCount);
+  refreshAudioTimeLabel(true);
+  updateAudioControlButtons(true, sdAudioCount > 1);
+  if (isAudioRunning()) {
+    if (audioPaused) {
+      setAudioStatus("Paused", lv_color_hex(0xFFB74D));
+    } else {
+      setAudioStatus("Playing from SD", lv_color_hex(0x81C784));
+    }
+  } else {
+    setAudioStatus("Ready", lv_color_hex(0x90CAF9));
+  }
+}
+
+static void addAudioCandidate(const char *path, uint32_t size) {
+  if (path == nullptr || path[0] == '\0') {
+    return;
+  }
+  if (sdAudioCount >= (int)(sizeof(sdAudioFiles) / sizeof(sdAudioFiles[0]))) {
+    return;
+  }
+
+  copyText(sdAudioFiles[sdAudioCount].path, sizeof(sdAudioFiles[sdAudioCount].path), path);
+  copyText(sdAudioFiles[sdAudioCount].name, sizeof(sdAudioFiles[sdAudioCount].name), baseNameFromPath(path));
+  sdAudioFiles[sdAudioCount].size = size;
+  sdAudioFiles[sdAudioCount].durationSec = 0;
+  sdAudioFiles[sdAudioCount].durationChecked = false;
+  sdAudioFiles[sdAudioCount].durationEstimated = true;
+  sdAudioCount++;
+}
+
+static void scanAudioDirectoryRecursive(const char *dirPath, int depth) {
+  if (dirPath == nullptr || depth > 4) {
+    return;
+  }
+  if (sdAudioCount >= (int)(sizeof(sdAudioFiles) / sizeof(sdAudioFiles[0]))) {
+    return;
+  }
+
+  File dir = SD_MMC.open(dirPath);
+  if (!dir || !dir.isDirectory()) {
+    return;
+  }
+
+  while (sdAudioCount < (int)(sizeof(sdAudioFiles) / sizeof(sdAudioFiles[0]))) {
+    File entry = dir.openNextFile();
+    if (!entry) {
+      break;
+    }
+
+    const char *entryPath = entry.path();
+    if (entryPath != nullptr && entryPath[0] != '\0') {
+      char childPath[192];
+      if (entryPath[0] == '/') {
+        copyText(childPath, sizeof(childPath), entryPath);
+      } else if (strcmp(dirPath, "/") == 0) {
+        snprintf(childPath, sizeof(childPath), "/%s", entryPath);
+      } else {
+        snprintf(childPath, sizeof(childPath), "%s/%s", dirPath, entryPath);
+      }
+
+      if (entry.isDirectory()) {
+        if (depth < 4) {
+          scanAudioDirectoryRecursive(childPath, depth + 1);
+        }
+      } else if (hasAudioExtension(childPath)) {
+        addAudioCandidate(childPath, (uint32_t)entry.size());
+      }
+    }
+    entry.close();
+  }
+  dir.close();
+}
+
+static void stopAudioPlayback(bool keepStatus) {
+  if (audioMp3 != nullptr) {
+    if (audioMp3->isRunning()) {
+      audioMp3->stop();
+    }
+    delete audioMp3;
+    audioMp3 = nullptr;
+  }
+  if (audioWav != nullptr) {
+    if (audioWav->isRunning()) {
+      audioWav->stop();
+    }
+    delete audioWav;
+    audioWav = nullptr;
+  }
+  if (audioFileSource != nullptr) {
+    delete audioFileSource;
+    audioFileSource = nullptr;
+  }
+  if (audioBufferedSource != nullptr) {
+    delete audioBufferedSource;
+    audioBufferedSource = nullptr;
+  }
+
+  if (audioOutputReady) {
+    digitalWrite(AUDIO_MUTE_PIN, LOW);
+  }
+  audioPaused = false;
+  audioElapsedAccumMs = 0;
+  audioPlaybackResumeMs = 0;
+  audioLastTimeLabelRefreshMs = 0;
+  audioShownElapsedSec = 0xFFFFFFFF;
+  audioShownDurationSec = 0xFFFFFFFF;
+
+  if (!keepStatus) {
+    setAudioStatus("Stopped", lv_color_hex(0xFFB74D));
+  }
+  updateAudioControlButtons(sdAudioCount > 0, sdAudioCount > 1);
+  refreshAudioTimeLabel(true);
+}
+
+static bool ensureAudioOutputReady() {
+  if (audioOutputReady && audioOutput != nullptr) {
+    return true;
+  }
+
+  if (audioOutput != nullptr) {
+    delete audioOutput;
+    audioOutput = nullptr;
+  }
+
+  audioOutput = new AudioOutputI2S();
+  if (audioOutput == nullptr) {
+    setAudioStatus("Audio output init failed", lv_color_hex(0xEF5350));
+    return false;
+  }
+
+  audioOutput->SetPinout(AUDIO_I2S_BCK_IO, AUDIO_I2S_WS_IO, AUDIO_I2S_DO_IO);
+  audioOutput->SetGain(0.18f);
+  pinMode(AUDIO_MUTE_PIN, OUTPUT);
+  digitalWrite(AUDIO_MUTE_PIN, LOW);
+  audioOutputReady = true;
+  return true;
+}
+
+static bool startAudioPlayback(int index) {
+  if (!sdMounted) {
+    setAudioStatus("SD not mounted", lv_color_hex(0xEF5350));
+    return false;
+  }
+  if (sdAudioCount <= 0) {
+    setAudioStatus("No playable audio", lv_color_hex(0xFFB74D));
+    return false;
+  }
+  if (index < 0 || index >= sdAudioCount) {
+    return false;
+  }
+  if (!ensureAudioOutputReady()) {
+    return false;
+  }
+
+  stopAudioPlayback(true);
+
+  audioFileSource = new AudioFileSourceFS(SD_MMC, sdAudioFiles[index].path);
+  if (audioFileSource == nullptr) {
+    setAudioStatus("Open audio file failed", lv_color_hex(0xEF5350));
+    return false;
+  }
+
+  audioBufferedSource = new AudioFileSourceBuffer(audioFileSource, 4096);
+  AudioFileSource *decodeSource = audioBufferedSource != nullptr
+    ? static_cast<AudioFileSource *>(audioBufferedSource)
+    : static_cast<AudioFileSource *>(audioFileSource);
+
+  const char *path = sdAudioFiles[index].path;
+  bool ok = false;
+  if (strstr(path, ".wav") != nullptr || strstr(path, ".WAV") != nullptr) {
+    audioWav = new AudioGeneratorWAV();
+    if (audioWav != nullptr) {
+      ok = audioWav->begin(decodeSource, audioOutput);
+    }
+  } else {
+    audioMp3 = new AudioGeneratorMP3();
+    if (audioMp3 != nullptr) {
+      ok = audioMp3->begin(decodeSource, audioOutput);
+    }
+  }
+
+  if (!ok) {
+    stopAudioPlayback(true);
+    setAudioStatus("Decoder start failed", lv_color_hex(0xEF5350));
+    return false;
+  }
+
+  sdAudioIndex = index;
+  ensureAudioTrackDuration(sdAudioIndex);
+  audioPaused = false;
+  audioElapsedAccumMs = 0;
+  audioPlaybackResumeMs = millis();
+  audioLastTimeLabelRefreshMs = 0;
+  audioShownElapsedSec = 0xFFFFFFFF;
+  audioShownDurationSec = 0xFFFFFFFF;
+  digitalWrite(AUDIO_MUTE_PIN, HIGH);
+  if (audioTrackLabel != nullptr) {
+    lv_label_set_text(audioTrackLabel, sdAudioFiles[sdAudioIndex].name);
+  }
+  if (audioIndexLabel != nullptr) {
+    lv_label_set_text_fmt(audioIndexLabel, "%d/%d", sdAudioIndex + 1, sdAudioCount);
+  }
+  updateAudioControlButtons(true, sdAudioCount > 1);
+  refreshAudioTimeLabel(true);
+  setAudioStatus("Playing from SD", lv_color_hex(0x81C784));
+  pushInboxMessage("event", "Audio playback", sdAudioFiles[sdAudioIndex].name);
+  return true;
+}
+
+static void processAudioPlayback() {
+  bool running = false;
+  bool loopOk = true;
+
+  if (audioMp3 != nullptr && audioMp3->isRunning()) {
+    running = true;
+    loopOk = audioMp3->loop();
+  } else if (audioWav != nullptr && audioWav->isRunning()) {
+    running = true;
+    loopOk = audioWav->loop();
+  }
+
+  if (!running) {
+    refreshAudioTimeLabel(false);
+    return;
+  }
+
+  if (audioPaused) {
+    refreshAudioTimeLabel(false);
+    return;
+  }
+
+  uint32_t now = millis();
+  if ((uint32_t)(now - audioLastTimeLabelRefreshMs) >= 250) {
+    audioLastTimeLabelRefreshMs = now;
+    refreshAudioTimeLabel(false);
+  }
+
+  if (loopOk) {
+    return;
+  }
+
+  stopAudioPlayback(true);
+  if (sdAudioCount > 1) {
+    int next = (sdAudioIndex + 1) % sdAudioCount;
+    startAudioPlayback(next);
+  } else {
+    updateAudioControlButtons(true, false);
+    setAudioStatus("Playback completed", lv_color_hex(0x90CAF9));
+  }
+}
+
+static void loadSdAudioList() {
+  stopAudioPlayback(true);
+  sdAudioCount = 0;
+  sdAudioIndex = 0;
+
+  if (!sdMounted) {
+    showCurrentAudioTrack();
+    return;
+  }
+
+  scanAudioDirectoryRecursive("/", 0);
+  Serial.printf("[Audio] scanned %d audio files (mp3/wav)\n", sdAudioCount);
+  showCurrentAudioTrack();
+}
+
+static void addSdBrowserFile(const char *path, uint32_t size) {
+  if (path == nullptr || path[0] == '\0') {
+    return;
+  }
+  if (sdBrowserFileCount >= (int)(sizeof(sdBrowserFiles) / sizeof(sdBrowserFiles[0]))) {
+    return;
+  }
+
+  SdBrowserFile &target = sdBrowserFiles[sdBrowserFileCount];
+  copyText(target.path, sizeof(target.path), path);
+  copyText(target.name, sizeof(target.name), baseNameFromPath(path));
+  copyText(target.type, sizeof(target.type), classifySdFileType(path));
+  target.size = size;
+  sdBrowserFileCount++;
+}
+
+static void scanSdBrowserFilesRecursive(const char *dirPath, int depth) {
+  if (dirPath == nullptr || depth > 5) {
+    return;
+  }
+  if (sdBrowserFileCount >= (int)(sizeof(sdBrowserFiles) / sizeof(sdBrowserFiles[0]))) {
+    return;
+  }
+
+  File dir = SD_MMC.open(dirPath);
+  if (!dir || !dir.isDirectory()) {
+    return;
+  }
+
+  while (sdBrowserFileCount < (int)(sizeof(sdBrowserFiles) / sizeof(sdBrowserFiles[0]))) {
+    File entry = dir.openNextFile();
+    if (!entry) {
+      break;
+    }
+
+    const char *entryPath = entry.path();
+    if (entryPath != nullptr && entryPath[0] != '\0') {
+      char childPath[192];
+      if (entryPath[0] == '/') {
+        copyText(childPath, sizeof(childPath), entryPath);
+      } else if (strcmp(dirPath, "/") == 0) {
+        snprintf(childPath, sizeof(childPath), "/%s", entryPath);
+      } else {
+        snprintf(childPath, sizeof(childPath), "%s/%s", dirPath, entryPath);
+      }
+
+      if (entry.isDirectory()) {
+        scanSdBrowserFilesRecursive(childPath, depth + 1);
+      } else {
+        addSdBrowserFile(childPath, (uint32_t)entry.size());
+      }
+    }
+
+    entry.close();
+  }
+
+  dir.close();
+}
+
+static void resetSdUploadSession(bool removeTempFile) {
+  if (sdUploadSession.file) {
+    sdUploadSession.file.close();
+  }
+  if (removeTempFile && sdUploadSession.tempPath[0] != '\0' && SD_MMC.exists(sdUploadSession.tempPath)) {
+    SD_MMC.remove(sdUploadSession.tempPath);
+  }
+
+  sdUploadSession.active = false;
+  sdUploadSession.waitingBinary = false;
+  sdUploadSession.overwrite = false;
+  sdUploadSession.uploadId[0] = '\0';
+  sdUploadSession.targetPath[0] = '\0';
+  sdUploadSession.tempPath[0] = '\0';
+  sdUploadSession.expectedSize = 0;
+  sdUploadSession.receivedSize = 0;
+  sdUploadSession.expectedSeq = 0;
+  sdUploadSession.pendingSeq = -1;
+  sdUploadSession.pendingLen = 0;
+}
+
+static bool ensureSdParentDirectories(const char *targetPath, char *reason, size_t reasonSize) {
+  if (targetPath == nullptr || targetPath[0] != '/') {
+    copyText(reason, reasonSize, "invalid path");
+    return false;
+  }
+
+  char pathCopy[192];
+  copyText(pathCopy, sizeof(pathCopy), targetPath);
+  char *lastSlash = strrchr(pathCopy, '/');
+  if (lastSlash == nullptr) {
+    copyText(reason, reasonSize, "invalid path");
+    return false;
+  }
+  if (lastSlash == pathCopy) {
+    return true; // file directly under root
+  }
+  *lastSlash = '\0';
+
+  char current[192] = "";
+  const char *segmentStart = pathCopy + 1; // skip leading slash
+
+  while (segmentStart != nullptr && segmentStart[0] != '\0') {
+    const char *slash = strchr(segmentStart, '/');
+    size_t segLen = (slash == nullptr) ? strlen(segmentStart) : (size_t)(slash - segmentStart);
+    if (segLen == 0) {
+      if (slash == nullptr) break;
+      segmentStart = slash + 1;
+      continue;
+    }
+    if (segLen >= 64) {
+      copyText(reason, reasonSize, "dir segment too long");
+      return false;
+    }
+
+    char segment[64];
+    memcpy(segment, segmentStart, segLen);
+    segment[segLen] = '\0';
+
+    if (current[0] == '\0') {
+      snprintf(current, sizeof(current), "/%s", segment);
+    } else {
+      size_t currLen = strlen(current);
+      if (currLen + 1 + segLen >= sizeof(current)) {
+        copyText(reason, reasonSize, "dir path too long");
+        return false;
+      }
+      snprintf(current + currLen, sizeof(current) - currLen, "/%s", segment);
+    }
+
+    if (!SD_MMC.exists(current) && !SD_MMC.mkdir(current)) {
+      char detail[96];
+      snprintf(detail, sizeof(detail), "mkdir failed: %s", current);
+      copyText(reason, reasonSize, detail);
+      return false;
+    }
+
+    if (slash == nullptr) {
+      break;
+    }
+    segmentStart = slash + 1;
+  }
+
+  return true;
+}
+
+static void sendSdUploadBeginAck(const char *uploadId, bool success, const char *reason) {
+  if (!isConnected) {
+    return;
+  }
+
+  StaticJsonDocument<384> doc;
+  doc["type"] = "sd_upload_begin_ack";
+  JsonObject data = doc.createNestedObject("data");
+  data["uploadId"] = uploadId == nullptr ? "" : uploadId;
+  data["deviceId"] = DEVICE_ID;
+  data["success"] = success;
+  data["received"] = sdUploadSession.receivedSize;
+  data["timestamp"] = millis();
+  if (reason != nullptr && reason[0] != '\0') {
+    data["reason"] = reason;
+  }
+
+  String output;
+  serializeJson(doc, output);
+  webSocket.sendTXT(output);
+}
+
+static void sendSdUploadChunkAck(const char *uploadId, int seq, bool success, const char *reason) {
+  if (!isConnected) {
+    return;
+  }
+
+  StaticJsonDocument<448> doc;
+  doc["type"] = "sd_upload_chunk_ack";
+  JsonObject data = doc.createNestedObject("data");
+  data["uploadId"] = uploadId == nullptr ? "" : uploadId;
+  data["deviceId"] = DEVICE_ID;
+  data["seq"] = seq;
+  data["success"] = success;
+  data["received"] = sdUploadSession.receivedSize;
+  data["timestamp"] = millis();
+  if (reason != nullptr && reason[0] != '\0') {
+    data["reason"] = reason;
+  }
+
+  String output;
+  serializeJson(doc, output);
+  webSocket.sendTXT(output);
+}
+
+static void sendSdUploadCommitAck(const char *uploadId, bool success, const char *finalPath, const char *reason) {
+  if (!isConnected) {
+    return;
+  }
+
+  StaticJsonDocument<448> doc;
+  doc["type"] = "sd_upload_commit_ack";
+  JsonObject data = doc.createNestedObject("data");
+  data["uploadId"] = uploadId == nullptr ? "" : uploadId;
+  data["deviceId"] = DEVICE_ID;
+  data["success"] = success;
+  data["received"] = sdUploadSession.receivedSize;
+  data["timestamp"] = millis();
+  if (finalPath != nullptr && finalPath[0] != '\0') {
+    data["path"] = finalPath;
+  }
+  if (reason != nullptr && reason[0] != '\0') {
+    data["reason"] = reason;
+  }
+
+  String output;
+  serializeJson(doc, output);
+  webSocket.sendTXT(output);
+}
+
+static void sendSdListResponse(const char *requestId, int offset, int limit) {
+  if (!isConnected) {
+    return;
+  }
+
+  detectAndScanSdCard();
+  sdBrowserFileCount = 0;
+  if (sdMounted) {
+    scanSdBrowserFilesRecursive("/", 0);
+  }
+
+  int imageCount = 0;
+  int audioCount = 0;
+  int videoCount = 0;
+  int otherCount = 0;
+  for (int i = 0; i < sdBrowserFileCount; ++i) {
+    const char *type = sdBrowserFiles[i].type;
+    if (strcmp(type, "image") == 0) {
+      imageCount++;
+    } else if (strcmp(type, "audio") == 0) {
+      audioCount++;
+    } else if (strcmp(type, "video") == 0) {
+      videoCount++;
+    } else {
+      otherCount++;
+    }
+  }
+
+  int pageLimit = limit;
+  if (pageLimit <= 0) {
+    pageLimit = SD_BROWSER_RESPONSE_MAX_FILES;
+  }
+  if (pageLimit > SD_BROWSER_RESPONSE_MAX_FILES) {
+    pageLimit = SD_BROWSER_RESPONSE_MAX_FILES;
+  }
+
+  int pageOffset = offset;
+  if (pageOffset < 0) {
+    pageOffset = 0;
+  }
+  if (pageOffset > sdBrowserFileCount) {
+    pageOffset = sdBrowserFileCount;
+  }
+
+  int responseFileCount = sdBrowserFileCount - pageOffset;
+  if (responseFileCount < 0) {
+    responseFileCount = 0;
+  }
+  if (responseFileCount > pageLimit) {
+    responseFileCount = pageLimit;
+  }
+  const bool truncated = (pageOffset + responseFileCount) < sdBrowserFileCount;
+
+  sdListResponseDoc.clear();
+  sdListResponseDoc["type"] = "sd_list_response";
+  JsonObject data = sdListResponseDoc.createNestedObject("data");
+  data["requestId"] = requestId == nullptr ? "" : requestId;
+  data["deviceId"] = DEVICE_ID;
+  data["sdMounted"] = sdMounted;
+  data["root"] = "/";
+  data["offset"] = pageOffset;
+  data["limit"] = pageLimit;
+  data["total"] = sdBrowserFileCount;
+  data["returned"] = responseFileCount;
+  data["truncated"] = truncated;
+  data["imageCount"] = imageCount;
+  data["audioCount"] = audioCount;
+  data["videoCount"] = videoCount;
+  data["otherCount"] = otherCount;
+  data["timestamp"] = millis();
+  if (!sdMounted) {
+    data["reason"] = sdMountReason;
+  }
+
+  JsonArray files = data.createNestedArray("files");
+  for (int i = 0; i < responseFileCount; ++i) {
+    const int fileIndex = pageOffset + i;
+    JsonObject item = files.createNestedObject();
+    item["name"] = sdBrowserFiles[fileIndex].name;
+    item["path"] = sdBrowserFiles[fileIndex].path;
+    item["type"] = sdBrowserFiles[fileIndex].type;
+    item["size"] = sdBrowserFiles[fileIndex].size;
+  }
+
+  String output;
+  output.reserve(7000);
+  const size_t bytes = serializeJson(sdListResponseDoc, output);
+  Serial.printf(
+    "[SD] list response: total=%d returned=%d bytes=%u\n",
+    sdBrowserFileCount,
+    responseFileCount,
+    (unsigned)bytes
+  );
+  webSocket.sendTXT(output);
+}
+
+static void sendSdDeleteResponse(const char *requestId, const char *targetPath, bool success, const char *reason) {
+  if (!isConnected) {
+    return;
+  }
+
+  StaticJsonDocument<768> doc;
+  doc["type"] = "sd_delete_response";
+  JsonObject data = doc.createNestedObject("data");
+  data["requestId"] = requestId == nullptr ? "" : requestId;
+  data["deviceId"] = DEVICE_ID;
+  data["path"] = targetPath == nullptr ? "" : targetPath;
+  data["success"] = success;
+  data["reason"] = reason == nullptr ? "" : reason;
+  data["timestamp"] = millis();
+
+  String output;
+  serializeJson(doc, output);
+  webSocket.sendTXT(output);
+}
+
+static void processPendingAudioControl() {
+  int action = pendingAudioControlAction;
+  if (action == AUDIO_CONTROL_NONE) {
+    return;
+  }
+  pendingAudioControlAction = AUDIO_CONTROL_NONE;
+
+  if (action == AUDIO_CONTROL_RESCAN) {
+    setAudioStatus("Rescanning SD...", lv_color_hex(0x90CAF9));
+    detectAndScanSdCard();
+    loadSdAudioList();
+    return;
+  }
+
+  if (sdAudioCount <= 0) {
+    showCurrentAudioTrack();
+    return;
+  }
+
+  if (action == AUDIO_CONTROL_PREV) {
+    int prev = (sdAudioIndex - 1 + sdAudioCount) % sdAudioCount;
+    if (isAudioRunning() && !audioPaused) {
+      startAudioPlayback(prev);
+    } else {
+      if (isAudioRunning()) {
+        stopAudioPlayback(true);
+      }
+      sdAudioIndex = prev;
+      showCurrentAudioTrack();
+    }
+    return;
+  }
+
+  if (action == AUDIO_CONTROL_NEXT) {
+    int next = (sdAudioIndex + 1) % sdAudioCount;
+    if (isAudioRunning() && !audioPaused) {
+      startAudioPlayback(next);
+    } else {
+      if (isAudioRunning()) {
+        stopAudioPlayback(true);
+      }
+      sdAudioIndex = next;
+      showCurrentAudioTrack();
+    }
+    return;
+  }
+
+  if (isAudioRunning()) {
+    uint32_t now = millis();
+    audioPaused = !audioPaused;
+    if (audioPaused) {
+      if (audioPlaybackResumeMs != 0) {
+        audioElapsedAccumMs += (uint32_t)(now - audioPlaybackResumeMs);
+        audioPlaybackResumeMs = 0;
+      }
+    } else {
+      audioPlaybackResumeMs = now;
+    }
+    if (audioOutputReady) {
+      digitalWrite(AUDIO_MUTE_PIN, audioPaused ? LOW : HIGH);
+    }
+    updateAudioControlButtons(true, sdAudioCount > 1);
+    refreshAudioTimeLabel(true);
+    showCurrentAudioTrack();
+  } else {
+    startAudioPlayback(sdAudioIndex);
+  }
+}
+
+static void audioControlCallback(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  if (shouldSuppressClick()) {
+    return;
+  }
+
+  uint32_t now = millis();
+  if ((uint32_t)(now - audioLastControlMs) < AUDIO_CONTROL_COOLDOWN_MS) {
+    return;
+  }
+  audioLastControlMs = now;
+
+  intptr_t action = (intptr_t)lv_event_get_user_data(e);
+  if (action < AUDIO_CONTROL_PREV || action > AUDIO_CONTROL_RESCAN) {
+    return;
+  }
+  pendingAudioControlAction = (int)action;
+}
+
 static void beginWebSocketClient() {
   setWsStatus("WS: connecting...");
   webSocket.begin(WS_SERVER_HOST, WS_SERVER_PORT, "/");
@@ -1724,6 +2925,12 @@ static void showPage(int pageIndex) {
     showCurrentPhotoFrame();
     lastPhotoAutoAdvanceMs = millis();
     requestPhotoFrameSettings(true);
+  }
+  if (currentPage == UI_PAGE_AUDIO_PLAYER) {
+    if (sdMounted && sdAudioCount <= 0) {
+      loadSdAudioList();
+    }
+    showCurrentAudioTrack();
   }
   updatePageIndicator();
 }
@@ -3435,6 +4642,120 @@ static void createUi() {
   lv_obj_set_style_text_color(photoFrameIndexLabel, lv_color_hex(0xBFBFBF), LV_PART_MAIN);
   lv_obj_align(photoFrameIndexLabel, LV_ALIGN_BOTTOM_MID, 0, -12);
 
+  // Page 10: Audio Player (SD)
+  pages[UI_PAGE_AUDIO_PLAYER] = createBasePage();
+
+  lv_obj_t *audioTitle = lv_label_create(pages[UI_PAGE_AUDIO_PLAYER]);
+  lv_label_set_text(audioTitle, "Music Player (SD)");
+  lv_obj_set_style_text_color(audioTitle, lv_color_hex(0x90CAF9), LV_PART_MAIN);
+  lv_obj_align(audioTitle, LV_ALIGN_TOP_MID, 0, 14);
+
+  lv_obj_t *audioCard = lv_obj_create(pages[UI_PAGE_AUDIO_PLAYER]);
+  lv_obj_set_size(audioCard, 300, 186);
+  lv_obj_align(audioCard, LV_ALIGN_TOP_MID, 0, 54);
+  lv_obj_set_style_radius(audioCard, 12, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(audioCard, lv_color_hex(0x111111), LV_PART_MAIN);
+  lv_obj_set_style_border_color(audioCard, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(audioCard, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(audioCard, 8, LV_PART_MAIN);
+  lv_obj_clear_flag(audioCard, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(audioCard, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  attachGestureHandlers(audioCard);
+
+  lv_obj_t *audioIcon = lv_label_create(audioCard);
+  lv_label_set_text(audioIcon, LV_SYMBOL_AUDIO);
+  lv_obj_set_style_text_font(audioIcon, &lv_font_montserrat_32, LV_PART_MAIN);
+  lv_obj_set_style_text_color(audioIcon, lv_color_hex(0xB39DDB), LV_PART_MAIN);
+  lv_obj_align(audioIcon, LV_ALIGN_TOP_MID, 0, 2);
+
+  audioTrackLabel = lv_label_create(audioCard);
+  lv_label_set_text(audioTrackLabel, "Scanning SD...");
+  lv_obj_set_width(audioTrackLabel, 260);
+  lv_label_set_long_mode(audioTrackLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);
+  lv_obj_set_style_text_font(audioTrackLabel, &lv_font_montserrat_16, LV_PART_MAIN);
+  lv_obj_set_style_text_align(audioTrackLabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_align(audioTrackLabel, LV_ALIGN_TOP_MID, 0, 56);
+
+  audioTimeLabel = lv_label_create(audioCard);
+  lv_label_set_text(audioTimeLabel, "00:00 / --:--");
+  lv_obj_set_style_text_font(audioTimeLabel, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(audioTimeLabel, lv_color_hex(0xC5CAE9), LV_PART_MAIN);
+  lv_obj_set_style_text_align(audioTimeLabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_align(audioTimeLabel, LV_ALIGN_TOP_MID, 0, 86);
+
+  audioIndexLabel = lv_label_create(audioCard);
+  lv_label_set_text(audioIndexLabel, "0/0");
+  lv_obj_set_style_text_color(audioIndexLabel, lv_color_hex(0xBDBDBD), LV_PART_MAIN);
+  lv_obj_align(audioIndexLabel, LV_ALIGN_BOTTOM_MID, 0, -10);
+
+  lv_obj_t *audioRescanBtn = lv_btn_create(audioCard);
+  lv_obj_set_size(audioRescanBtn, 86, 32);
+  lv_obj_align(audioRescanBtn, LV_ALIGN_BOTTOM_RIGHT, -6, -6);
+  lv_obj_set_style_radius(audioRescanBtn, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(audioRescanBtn, lv_color_hex(0x252525), LV_PART_MAIN);
+  lv_obj_add_flag(audioRescanBtn, LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_PRESS_LOCK);
+  attachGestureHandlers(audioRescanBtn);
+  lv_obj_add_event_cb(audioRescanBtn, audioControlCallback, LV_EVENT_CLICKED, (void *)3);
+  lv_obj_t *audioRescanLabel = lv_label_create(audioRescanBtn);
+  lv_label_set_text(audioRescanLabel, "Rescan");
+  lv_obj_center(audioRescanLabel);
+
+  audioStatusLabel = lv_label_create(pages[UI_PAGE_AUDIO_PLAYER]);
+  lv_label_set_text(audioStatusLabel, "Ready");
+  lv_obj_set_style_text_color(audioStatusLabel, lv_color_hex(0x90CAF9), LV_PART_MAIN);
+  lv_obj_align(audioStatusLabel, LV_ALIGN_TOP_MID, 0, 248);
+
+  lv_obj_t *audioNavBar = lv_obj_create(pages[UI_PAGE_AUDIO_PLAYER]);
+  lv_obj_set_size(audioNavBar, 304, 50);
+  lv_obj_align(audioNavBar, LV_ALIGN_TOP_MID, 0, 292);
+  lv_obj_set_style_radius(audioNavBar, 14, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(audioNavBar, lv_color_hex(0x151515), LV_PART_MAIN);
+  lv_obj_set_style_border_color(audioNavBar, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(audioNavBar, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(audioNavBar, 5, LV_PART_MAIN);
+  lv_obj_clear_flag(audioNavBar, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(audioNavBar, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  attachGestureHandlers(audioNavBar);
+
+  audioPrevBtn = lv_btn_create(audioNavBar);
+  lv_obj_set_size(audioPrevBtn, 94, 38);
+  lv_obj_align(audioPrevBtn, LV_ALIGN_LEFT_MID, 6, 0);
+  lv_obj_set_style_radius(audioPrevBtn, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(audioPrevBtn, lv_color_hex(0x252525), LV_PART_MAIN);
+  lv_obj_add_flag(audioPrevBtn, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  attachGestureHandlers(audioPrevBtn);
+  lv_obj_add_event_cb(audioPrevBtn, audioControlCallback, LV_EVENT_CLICKED, (void *)0);
+  lv_obj_t *audioPrevLabel = lv_label_create(audioPrevBtn);
+  lv_label_set_text(audioPrevLabel, "Prev");
+  lv_obj_center(audioPrevLabel);
+
+  audioPlayBtn = lv_btn_create(audioNavBar);
+  lv_obj_set_size(audioPlayBtn, 94, 38);
+  lv_obj_align(audioPlayBtn, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_style_radius(audioPlayBtn, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(audioPlayBtn, lv_color_hex(0x2E7D32), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(audioPlayBtn, lv_color_hex(0x1B5E20), LV_PART_MAIN | LV_STATE_PRESSED);
+  lv_obj_add_flag(audioPlayBtn, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  attachGestureHandlers(audioPlayBtn);
+  lv_obj_add_event_cb(audioPlayBtn, audioControlCallback, LV_EVENT_CLICKED, (void *)1);
+  audioPlayBtnLabel = lv_label_create(audioPlayBtn);
+  lv_label_set_text(audioPlayBtnLabel, "Play");
+  lv_obj_center(audioPlayBtnLabel);
+
+  audioNextBtn = lv_btn_create(audioNavBar);
+  lv_obj_set_size(audioNextBtn, 94, 38);
+  lv_obj_align(audioNextBtn, LV_ALIGN_RIGHT_MID, -6, 0);
+  lv_obj_set_style_radius(audioNextBtn, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(audioNextBtn, lv_color_hex(0x252525), LV_PART_MAIN);
+  lv_obj_add_flag(audioNextBtn, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  attachGestureHandlers(audioNextBtn);
+  lv_obj_add_event_cb(audioNextBtn, audioControlCallback, LV_EVENT_CLICKED, (void *)2);
+  lv_obj_t *audioNextLabel = lv_label_create(audioNextBtn);
+  lv_label_set_text(audioNextLabel, "Next");
+  lv_obj_center(audioNextLabel);
+
+  updateAudioControlButtons(false, false);
+
   // Global page indicator
   pageIndicatorLabel = lv_label_create(lv_scr_act());
   lv_obj_set_style_text_color(pageIndicatorLabel, lv_color_hex(0x8F8F8F), LV_PART_MAIN);
@@ -3558,6 +4879,7 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
     case WStype_DISCONNECTED:
       Serial.println("[WebSocket] disconnected");
       isConnected = false;
+      resetSdUploadSession(true);
       setWsStatus("WS: disconnected");
       pushInboxMessage("alert", "WebSocket", "Connection lost");
       setAppLauncherStatus("WS disconnected", lv_color_hex(0xEF5350), true, 2800);
@@ -3580,6 +4902,48 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
       requestPhotoFrameSettings(true);
       sendPhotoFrameState("ws_connected", true);
       break;
+
+    case WStype_BIN: {
+      if (!sdUploadSession.active || !sdUploadSession.waitingBinary) {
+        Serial.printf("[SD upload] unexpected binary frame len=%u\n", (unsigned)length);
+        break;
+      }
+
+      const char *uploadId = sdUploadSession.uploadId;
+      const int seq = sdUploadSession.pendingSeq;
+      bool success = true;
+      const char *reason = "";
+
+      if ((int)length != sdUploadSession.pendingLen) {
+        success = false;
+        reason = "binary length mismatch";
+      } else if (sdUploadSession.receivedSize + (uint32_t)length > sdUploadSession.expectedSize) {
+        success = false;
+        reason = "size overflow";
+      } else {
+        size_t written = sdUploadSession.file.write(payload, length);
+        if (written != length) {
+          success = false;
+          reason = "sd write failed";
+        } else {
+          sdUploadSession.receivedSize += (uint32_t)written;
+          sdUploadSession.expectedSeq++;
+          sdUploadSession.waitingBinary = false;
+          sdUploadSession.pendingLen = 0;
+          sdUploadSession.pendingSeq = -1;
+          if ((sdUploadSession.expectedSeq % 8) == 0) {
+            sdUploadSession.file.flush();
+          }
+        }
+      }
+
+      sendSdUploadChunkAck(uploadId, seq, success, reason);
+      if (!success) {
+        Serial.printf("[SD upload] chunk failed: %s\n", reason);
+        resetSdUploadSession(true);
+      }
+      break;
+    }
 
     case WStype_TEXT: {
       Serial.printf("[WebSocket] message: %s\n", payload);
@@ -3734,6 +5098,199 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
       } else if (strcmp(messageType, "photo_control") == 0) {
         JsonObjectConst data = doc["data"].as<JsonObjectConst>();
         handlePhotoControlCommand(data);
+      } else if (strcmp(messageType, "sd_list_request") == 0) {
+        JsonObjectConst data = doc["data"].as<JsonObjectConst>();
+        const char *requestId = data["requestId"] | "";
+        int offset = data["offset"] | 0;
+        int limit = data["limit"] | SD_BROWSER_RESPONSE_MAX_FILES;
+        Serial.printf("[SD] list request: requestId=%s offset=%d limit=%d\n", requestId, offset, limit);
+        sendSdListResponse(requestId, offset, limit);
+      } else if (strcmp(messageType, "sd_delete_request") == 0) {
+        JsonObjectConst data = doc["data"].as<JsonObjectConst>();
+        const char *requestId = data["requestId"] | "";
+        const char *targetPath = data["path"] | "";
+        if (targetPath == nullptr || targetPath[0] != '/') {
+          sendSdDeleteResponse(requestId, targetPath, false, "invalid path");
+        } else {
+          detectAndScanSdCard();
+          if (!sdMounted) {
+            sendSdDeleteResponse(requestId, targetPath, false, "sd not mounted");
+          } else if (!SD_MMC.exists(targetPath)) {
+            sendSdDeleteResponse(requestId, targetPath, false, "file not found");
+          } else if (!SD_MMC.remove(targetPath)) {
+            sendSdDeleteResponse(requestId, targetPath, false, "delete failed");
+          } else {
+            loadSdPhotoList();
+            showCurrentPhotoFrame();
+            loadSdAudioList();
+            sendSdDeleteResponse(requestId, targetPath, true, "");
+          }
+        }
+      } else if (strcmp(messageType, "sd_upload_begin") == 0) {
+        JsonObjectConst data = doc["data"].as<JsonObjectConst>();
+        const char *uploadId = data["uploadId"] | "";
+        const char *targetPath = data["path"] | "";
+        uint32_t expectedSize = data["size"] | 0;
+        int chunkSize = data["chunkSize"] | 2048;
+        bool overwrite = data["overwrite"] | false;
+
+        if (uploadId[0] == '\0' || targetPath[0] != '/') {
+          sendSdUploadBeginAck(uploadId, false, "invalid uploadId/path");
+          break;
+        }
+        if (sdUploadSession.active) {
+          sendSdUploadBeginAck(uploadId, false, "upload busy");
+          break;
+        }
+
+        detectAndScanSdCard();
+        if (!sdMounted) {
+          sendSdUploadBeginAck(uploadId, false, "sd not mounted");
+          break;
+        }
+        if (chunkSize <= 0 || chunkSize > 4096) {
+          sendSdUploadBeginAck(uploadId, false, "invalid chunk size");
+          break;
+        }
+        if (expectedSize == 0 || expectedSize > 50UL * 1024UL * 1024UL) {
+          sendSdUploadBeginAck(uploadId, false, "invalid file size");
+          break;
+        }
+
+        char reason[96];
+        if (!ensureSdParentDirectories(targetPath, reason, sizeof(reason))) {
+          sendSdUploadBeginAck(uploadId, false, reason);
+          break;
+        }
+
+        char tempPath[208];
+        if (snprintf(tempPath, sizeof(tempPath), "%s.uploadtmp", targetPath) >= (int)sizeof(tempPath)) {
+          sendSdUploadBeginAck(uploadId, false, "temp path too long");
+          break;
+        }
+        if (SD_MMC.exists(tempPath)) {
+          SD_MMC.remove(tempPath);
+        }
+
+        if (SD_MMC.exists(targetPath)) {
+          if (!overwrite) {
+            sendSdUploadBeginAck(uploadId, false, "target exists");
+            break;
+          }
+          if (!SD_MMC.remove(targetPath)) {
+            sendSdUploadBeginAck(uploadId, false, "remove target failed");
+            break;
+          }
+        }
+
+        sdUploadSession.file = SD_MMC.open(tempPath, FILE_WRITE);
+        if (!sdUploadSession.file) {
+          sendSdUploadBeginAck(uploadId, false, "open temp failed");
+          break;
+        }
+
+        sdUploadSession.active = true;
+        sdUploadSession.waitingBinary = false;
+        sdUploadSession.overwrite = overwrite;
+        copyText(sdUploadSession.uploadId, sizeof(sdUploadSession.uploadId), uploadId);
+        copyText(sdUploadSession.targetPath, sizeof(sdUploadSession.targetPath), targetPath);
+        copyText(sdUploadSession.tempPath, sizeof(sdUploadSession.tempPath), tempPath);
+        sdUploadSession.expectedSize = expectedSize;
+        sdUploadSession.receivedSize = 0;
+        sdUploadSession.expectedSeq = 0;
+        sdUploadSession.pendingSeq = -1;
+        sdUploadSession.pendingLen = 0;
+
+        Serial.printf(
+          "[SD upload] begin id=%s target=%s size=%u chunk=%d\n",
+          sdUploadSession.uploadId,
+          sdUploadSession.targetPath,
+          (unsigned)sdUploadSession.expectedSize,
+          chunkSize
+        );
+        sendSdUploadBeginAck(uploadId, true, "");
+      } else if (strcmp(messageType, "sd_upload_chunk_meta") == 0) {
+        JsonObjectConst data = doc["data"].as<JsonObjectConst>();
+        const char *uploadId = data["uploadId"] | "";
+        int seq = data["seq"] | -1;
+        int len = data["len"] | 0;
+
+        if (!sdUploadSession.active || strcmp(uploadId, sdUploadSession.uploadId) != 0) {
+          sendSdUploadChunkAck(uploadId, seq, false, "upload not active");
+          break;
+        }
+        if (sdUploadSession.waitingBinary) {
+          sendSdUploadChunkAck(uploadId, seq, false, "binary pending");
+          resetSdUploadSession(true);
+          break;
+        }
+        if (seq != sdUploadSession.expectedSeq) {
+          sendSdUploadChunkAck(uploadId, seq, false, "seq mismatch");
+          resetSdUploadSession(true);
+          break;
+        }
+        if (len <= 0 || len > 4096) {
+          sendSdUploadChunkAck(uploadId, seq, false, "invalid chunk len");
+          resetSdUploadSession(true);
+          break;
+        }
+        if (sdUploadSession.receivedSize + (uint32_t)len > sdUploadSession.expectedSize) {
+          sendSdUploadChunkAck(uploadId, seq, false, "chunk exceeds size");
+          resetSdUploadSession(true);
+          break;
+        }
+
+        sdUploadSession.waitingBinary = true;
+        sdUploadSession.pendingSeq = seq;
+        sdUploadSession.pendingLen = len;
+      } else if (strcmp(messageType, "sd_upload_commit") == 0) {
+        JsonObjectConst data = doc["data"].as<JsonObjectConst>();
+        const char *uploadId = data["uploadId"] | "";
+        uint32_t expectedSize = data["expectedSize"] | sdUploadSession.expectedSize;
+
+        if (!sdUploadSession.active || strcmp(uploadId, sdUploadSession.uploadId) != 0) {
+          sendSdUploadCommitAck(uploadId, false, "", "upload not active");
+          break;
+        }
+        if (sdUploadSession.waitingBinary) {
+          sendSdUploadCommitAck(uploadId, false, "", "chunk pending");
+          resetSdUploadSession(true);
+          break;
+        }
+        if (expectedSize != sdUploadSession.expectedSize || sdUploadSession.receivedSize != sdUploadSession.expectedSize) {
+          sendSdUploadCommitAck(uploadId, false, "", "size mismatch");
+          resetSdUploadSession(true);
+          break;
+        }
+
+        sdUploadSession.file.flush();
+        sdUploadSession.file.close();
+
+        bool renamed = SD_MMC.rename(sdUploadSession.tempPath, sdUploadSession.targetPath);
+        if (!renamed) {
+          sendSdUploadCommitAck(uploadId, false, "", "rename failed");
+          resetSdUploadSession(true);
+          break;
+        }
+
+        sendSdUploadCommitAck(uploadId, true, sdUploadSession.targetPath, "");
+        Serial.printf(
+          "[SD upload] commit ok id=%s path=%s size=%u\n",
+          sdUploadSession.uploadId,
+          sdUploadSession.targetPath,
+          (unsigned)sdUploadSession.receivedSize
+        );
+        resetSdUploadSession(false);
+        loadSdPhotoList();
+        showCurrentPhotoFrame();
+        loadSdAudioList();
+      } else if (strcmp(messageType, "sd_upload_abort") == 0) {
+        JsonObjectConst data = doc["data"].as<JsonObjectConst>();
+        const char *uploadId = data["uploadId"] | "";
+        if (sdUploadSession.active && strcmp(uploadId, sdUploadSession.uploadId) == 0) {
+          Serial.printf("[SD upload] abort id=%s\n", uploadId);
+          resetSdUploadSession(true);
+        }
       } else {
         Serial.printf("[WebSocket] unhandled type: %s\n", messageType);
         char body[96];
@@ -3763,6 +5320,7 @@ void setup() {
 
   scr_lvgl_init();
   createUi();
+  resetSdUploadSession(false);
   detectAndScanSdCard();
   if (sdMounted) {
     char body[128];
@@ -3783,6 +5341,7 @@ void setup() {
   }
   loadSdPhotoList();
   showCurrentPhotoFrame();
+  loadSdAudioList();
 
   Serial.printf("Connecting WiFi: %s\n", WIFI_SSID);
   setWifiStatus("WiFi: connecting...");
@@ -3850,5 +5409,7 @@ void loop() {
   }
 
   lv_timer_handler();
-  delay(5);
+  processPendingAudioControl();
+  processAudioPlayback();
+  delay((isAudioRunning() && !audioPaused) ? 1 : 5);
 }
