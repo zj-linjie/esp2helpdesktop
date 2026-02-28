@@ -1,18 +1,48 @@
-import { app, BrowserWindow, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, shell, dialog } from 'electron'
+import type { OpenDialogOptions } from 'electron'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { DeviceWebSocketServer, type PhotoFrameSettings } from './websocket.js'
 import { AISimulator } from './ai-simulator.js'
 import fs from 'fs/promises'
+import { existsSync } from 'fs'
 import crypto from 'crypto'
 import WebSocket from 'ws'
 import dotenv from 'dotenv'
 
-// 加载环境变量
-dotenv.config({ path: path.join(process.cwd(), '.env') })
-
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
+
+const loadEnvFiles = () => {
+  const candidates = [
+    path.resolve(process.cwd(), '.env'),
+    path.resolve(process.cwd(), '../.env'),
+    path.resolve(__dirname, '../../.env'),
+    path.resolve(__dirname, '../../../.env'),
+  ]
+
+  const loaded: string[] = []
+  const visited = new Set<string>()
+  for (const filePath of candidates) {
+    if (visited.has(filePath)) continue
+    visited.add(filePath)
+    if (!existsSync(filePath)) continue
+
+    const result = dotenv.config({ path: filePath, override: false })
+    if (!result.error) {
+      loaded.push(filePath)
+    }
+  }
+
+  if (loaded.length === 0) {
+    console.warn('[Env] 未找到 .env 文件（已尝试 electron-app 与仓库根目录）')
+  } else {
+    console.log('[Env] 已加载 .env:', loaded.join(' | '))
+  }
+}
+
+// 加载环境变量（支持 electron-app/.env 与仓库根目录 .env）
+loadEnvFiles()
 
 let wsServer: DeviceWebSocketServer
 let aiSimulator: AISimulator | null = null
@@ -35,8 +65,122 @@ const DEFAULT_PHOTO_FRAME_SETTINGS: PhotoFrameSettings = {
   maxFileSize: 2,
   autoCompress: true,
   maxPhotoCount: 20,
+  homeWallpaperPath: '',
+  clockWallpaperPath: '',
 }
 let cachedPhotoFrameSettings: PhotoFrameSettings = { ...DEFAULT_PHOTO_FRAME_SETTINGS }
+
+type SdFileType = 'image' | 'audio' | 'video' | 'other'
+
+interface SdFileItem {
+  name: string
+  path: string
+  relativePath: string
+  extension: string
+  type: SdFileType
+  size: number
+  modifiedAt: number
+}
+
+const SD_FILE_TYPES: SdFileType[] = ['image', 'audio', 'video', 'other']
+const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.sjpg'])
+const AUDIO_EXTENSIONS = new Set(['.mp3', '.wav', '.aac', '.m4a', '.flac', '.ogg'])
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.mkv', '.avi', '.webm', '.mjpeg', '.mjpg'])
+
+const classifySdFileType = (ext: string): SdFileType => {
+  const lower = ext.toLowerCase()
+  if (IMAGE_EXTENSIONS.has(lower)) return 'image'
+  if (AUDIO_EXTENSIONS.has(lower)) return 'audio'
+  if (VIDEO_EXTENSIONS.has(lower)) return 'video'
+  return 'other'
+}
+
+const SD_SAFE_FILENAME_MAX_LEN = 63
+
+const toDeviceSafeFileName = (rawFileName: string): { fileName: string; renamed: boolean } => {
+  const original = rawFileName.trim()
+  if (!original) {
+    return { fileName: 'file.bin', renamed: true }
+  }
+
+  const normalized = original.normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+  const extRaw = path.posix.extname(normalized).toLowerCase()
+  const ext = extRaw.startsWith('.') ? extRaw.replace(/[^.a-z0-9]/g, '') : ''
+  const baseRaw = normalized.slice(0, normalized.length - extRaw.length)
+  let base = baseRaw
+    .replace(/[^A-Za-z0-9._-]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^[_\-.]+|[_\-.]+$/g, '')
+
+  if (!base) {
+    base = 'file'
+  }
+
+  const needsRename = `${base}${ext}` !== original
+  if (needsRename) {
+    const shortHash = crypto.createHash('sha1').update(original).digest('hex').slice(0, 6)
+    base = `${base}_${shortHash}`
+  }
+
+  const maxBaseLen = Math.max(1, SD_SAFE_FILENAME_MAX_LEN - ext.length)
+  if (base.length > maxBaseLen) {
+    base = base.slice(0, maxBaseLen)
+  }
+
+  const finalName = `${base}${ext}`
+  return {
+    fileName: finalName,
+    renamed: finalName !== original,
+  }
+}
+
+const normalizeSdDevicePath = (rawPath: unknown, fallback: string = '/'): string => {
+  if (typeof rawPath !== 'string') {
+    return fallback
+  }
+
+  const trimmed = rawPath.trim()
+  if (!trimmed.startsWith('/')) {
+    return fallback
+  }
+
+  const collapsed = trimmed.replace(/\/{2,}/g, '/')
+  if (collapsed.length > 1 && collapsed.endsWith('/')) {
+    return collapsed.slice(0, -1)
+  }
+  return collapsed || '/'
+}
+
+const getDefaultSdRootPath = (): string => {
+  return normalizeSdDevicePath(cachedPhotoFrameSettings.folderPath, '/')
+}
+
+const isPathInsideDeviceRoot = (rootPath: string, targetPath: string): boolean => {
+  const normalizedRoot = normalizeSdDevicePath(rootPath, '/')
+  const normalizedTarget = normalizeSdDevicePath(targetPath, '')
+  if (!normalizedTarget) {
+    return false
+  }
+  if (normalizedRoot === '/') {
+    return true
+  }
+  return normalizedTarget === normalizedRoot || normalizedTarget.startsWith(`${normalizedRoot}/`)
+}
+
+const toRelativePath = (rootPath: string, targetPath: string): string => {
+  const normalizedRoot = normalizeSdDevicePath(rootPath, '/')
+  const normalizedTarget = normalizeSdDevicePath(targetPath, '')
+  if (!normalizedTarget) {
+    return ''
+  }
+  if (normalizedRoot === '/') {
+    return normalizedTarget.replace(/^\/+/, '')
+  }
+  if (normalizedTarget === normalizedRoot) {
+    return path.posix.basename(normalizedTarget)
+  }
+  return normalizedTarget.slice(normalizedRoot.length + 1)
+}
 
 const normalizeLauncherApps = (apps: unknown): LauncherAppConfig[] => {
   if (!Array.isArray(apps)) return []
@@ -69,6 +213,23 @@ const normalizeLauncherApps = (apps: unknown): LauncherAppConfig[] => {
 const getAppLauncherSettingsPath = () => path.join(app.getPath('userData'), APP_LAUNCHER_SETTINGS_FILE)
 const getPhotoFrameSettingsPath = () => path.join(app.getPath('userData'), PHOTO_FRAME_SETTINGS_FILE)
 
+const parseJsonWithRecovery = <T>(raw: string): { value: T | null; recovered: boolean } => {
+  try {
+    return { value: JSON.parse(raw) as T, recovered: false }
+  } catch {
+    // Try trimming trailing broken chars (common for partially-written JSON)
+    for (let end = raw.lastIndexOf('}'); end > 0; end = raw.lastIndexOf('}', end - 1)) {
+      const candidate = raw.slice(0, end + 1)
+      try {
+        return { value: JSON.parse(candidate) as T, recovered: true }
+      } catch {
+        // continue
+      }
+    }
+  }
+  return { value: null, recovered: false }
+}
+
 const loadCustomLauncherApps = async (): Promise<LauncherAppConfig[]> => {
   try {
     const filePath = getAppLauncherSettingsPath()
@@ -99,6 +260,17 @@ const normalizePhotoFrameSettings = (settings: unknown): PhotoFrameSettings => {
   }
 
   const source = settings as Record<string, unknown>
+  const normalizeWallpaperPath = (value: unknown): string => {
+    const normalized = normalizeSdDevicePath(value, '')
+    if (!normalized) {
+      return ''
+    }
+    const lower = normalized.toLowerCase()
+    if (!lower.endsWith('.mjpeg') && !lower.endsWith('.mjpg')) {
+      return ''
+    }
+    return normalized
+  }
   const slideshowIntervalRaw = Number(source.slideshowInterval)
   const maxFileSizeRaw = Number(source.maxFileSize)
   const maxPhotoCountRaw = Number(source.maxPhotoCount)
@@ -123,6 +295,8 @@ const normalizePhotoFrameSettings = (settings: unknown): PhotoFrameSettings => {
     maxPhotoCount: Number.isFinite(maxPhotoCountRaw)
       ? Math.max(1, Math.min(100, Math.round(maxPhotoCountRaw)))
       : DEFAULT_PHOTO_FRAME_SETTINGS.maxPhotoCount,
+    homeWallpaperPath: normalizeWallpaperPath(source.homeWallpaperPath ?? source.home_wallpaper_path),
+    clockWallpaperPath: normalizeWallpaperPath(source.clockWallpaperPath ?? source.clock_wallpaper_path),
   }
 }
 
@@ -130,13 +304,25 @@ const loadPhotoFrameSettings = async (): Promise<PhotoFrameSettings> => {
   try {
     const filePath = getPhotoFrameSettingsPath()
     const raw = await fs.readFile(filePath, 'utf-8')
-    const parsed = JSON.parse(raw) as { settings?: unknown }
+    const parsedResult = parseJsonWithRecovery<{ settings?: unknown }>(raw)
+    if (!parsedResult.value) {
+      console.warn('[PhotoFrame] 配置文件损坏，回退默认设置')
+      return { ...DEFAULT_PHOTO_FRAME_SETTINGS }
+    }
+    const parsed = parsedResult.value
     const settings = normalizePhotoFrameSettings(parsed?.settings ?? parsed)
+
+    if (parsedResult.recovered) {
+      await savePhotoFrameSettings(settings)
+      console.log('[PhotoFrame] 已自动修复配置文件')
+    }
+
     console.log(
       `[PhotoFrame] 已加载设置 interval=${settings.slideshowInterval}s autoPlay=${settings.autoPlay} theme=${settings.theme}`
     )
     return settings
-  } catch {
+  } catch (error) {
+    console.warn('[PhotoFrame] 读取设置失败，回退默认:', error)
     return { ...DEFAULT_PHOTO_FRAME_SETTINGS }
   }
 }
@@ -465,6 +651,433 @@ function setupIpcHandlers() {
     } catch (error) {
       console.error('[PhotoFrame] 读取设置失败:', error)
       return { success: false, error: String(error), settings: cachedPhotoFrameSettings }
+    }
+  })
+
+  ipcMain.handle('sd-manager-list-files', async (_event, payload: { rootPath?: unknown; deviceId?: unknown } | undefined) => {
+    const rootPath = normalizeSdDevicePath(payload?.rootPath, getDefaultSdRootPath())
+    const deviceId = typeof payload?.deviceId === 'string' ? payload.deviceId.trim() : undefined
+
+    try {
+      const pageLimit = 24
+      const maxPages = 10
+      const sourceFiles: Array<Record<string, unknown>> = []
+      let page = 0
+      let requestOffset = 0
+      let truncated = true
+      let totalFromDevice = 0
+      let activeDeviceId: string | undefined = undefined
+
+      while (truncated && page < maxPages) {
+        const result = await wsServer.requestSdFileList(deviceId, 12000, requestOffset, pageLimit)
+        if (!result?.success) {
+          return {
+            success: false,
+            rootPath,
+            files: [] as SdFileItem[],
+            exists: false,
+            error: result?.reason || '读取设备 SD 列表失败',
+          }
+        }
+
+        if (result.sdMounted === false) {
+          return {
+            success: false,
+            rootPath,
+            files: [] as SdFileItem[],
+            exists: false,
+            error: `设备 SD 未挂载: ${result.reason || 'unknown'}`,
+          }
+        }
+
+        if (typeof result.deviceId === 'string' && result.deviceId.trim().length > 0) {
+          activeDeviceId = result.deviceId
+        }
+
+        const batchFiles = Array.isArray(result.files) ? (result.files as Array<Record<string, unknown>>) : []
+        sourceFiles.push(...batchFiles)
+
+        const returnedRaw = Number(result.returned)
+        const returned = Number.isFinite(returnedRaw) && returnedRaw >= 0
+          ? Math.floor(returnedRaw)
+          : batchFiles.length
+        if (returned <= 0 && batchFiles.length === 0) {
+          break
+        }
+
+        requestOffset += returned > 0 ? returned : batchFiles.length
+        const totalRaw = Number(result.total)
+        if (Number.isFinite(totalRaw) && totalRaw >= 0) {
+          totalFromDevice = Math.max(totalFromDevice, Math.floor(totalRaw))
+        }
+
+        truncated = Boolean(result.truncated)
+          || (totalFromDevice > 0 && requestOffset < totalFromDevice)
+        page += 1
+      }
+
+      const normalizedFiles: SdFileItem[] = []
+      const seenPaths = new Set<string>()
+      for (const item of sourceFiles) {
+        if (!item || typeof item !== 'object') {
+          continue
+        }
+
+        const rawPath = normalizeSdDevicePath(item.path, '')
+        if (!rawPath || !isPathInsideDeviceRoot(rootPath, rawPath)) {
+          continue
+        }
+        if (seenPaths.has(rawPath)) {
+          continue
+        }
+        seenPaths.add(rawPath)
+
+        const name = typeof item.name === 'string'
+          ? String(item.name).trim()
+          : path.posix.basename(rawPath)
+        const extension = path.posix.extname(name).toLowerCase()
+        const rawType = typeof item.type === 'string'
+          ? String(item.type).toLowerCase()
+          : ''
+        const type = SD_FILE_TYPES.includes(rawType as SdFileType)
+          ? rawType as SdFileType
+          : classifySdFileType(extension)
+        const sizeRaw = Number(item.size)
+        const modifiedAtRaw = Number(item.modifiedAt)
+
+        normalizedFiles.push({
+          name: name || path.posix.basename(rawPath),
+          path: rawPath,
+          relativePath: toRelativePath(rootPath, rawPath),
+          extension,
+          type,
+          size: Number.isFinite(sizeRaw) && sizeRaw >= 0 ? Math.round(sizeRaw) : 0,
+          modifiedAt: Number.isFinite(modifiedAtRaw) && modifiedAtRaw > 0 ? modifiedAtRaw : 0,
+        })
+      }
+
+      normalizedFiles.sort((a, b) => a.relativePath.localeCompare(b.relativePath, 'zh-Hans-CN'))
+      const counts = normalizedFiles.reduce(
+        (acc, file) => {
+          acc[file.type] += 1
+          return acc
+        },
+        { image: 0, audio: 0, video: 0, other: 0 }
+      )
+
+      return {
+        success: true,
+        rootPath,
+        files: normalizedFiles,
+        exists: true,
+        truncated: totalFromDevice > 0 ? totalFromDevice > normalizedFiles.length : truncated,
+        counts,
+        deviceId: activeDeviceId || deviceId,
+      }
+    } catch (error) {
+      console.error('[SD Manager] 列设备文件失败:', error)
+      return {
+        success: false,
+        rootPath,
+        error: String(error),
+        files: [] as SdFileItem[],
+        exists: false,
+      }
+    }
+  })
+
+  ipcMain.handle('sd-manager-upload-files', async (event, payload: { rootPath?: unknown; sourcePaths?: unknown; deviceId?: unknown } | undefined) => {
+    const rootPath = normalizeSdDevicePath(payload?.rootPath, getDefaultSdRootPath())
+    const deviceId = typeof payload?.deviceId === 'string' ? payload.deviceId.trim() : undefined
+    const emitUploadProgress = (data: Record<string, unknown>) => {
+      try {
+        event.sender.send('sd-upload-progress', {
+          ...data,
+          timestamp: Date.now(),
+        })
+      } catch {
+        // ignore renderer progress delivery errors
+      }
+    }
+
+    let sourcePaths: string[] = []
+    if (Array.isArray(payload?.sourcePaths)) {
+      sourcePaths = payload.sourcePaths
+        .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+        .map((item) => path.resolve(item.trim()))
+    }
+
+    if (sourcePaths.length === 0) {
+      const pickerOptions: OpenDialogOptions = {
+        title: '选择上传到 ESP32 SD 的文件',
+        properties: ['openFile', 'multiSelections'],
+      }
+      const picker = mainWindow
+        ? await dialog.showOpenDialog(mainWindow, pickerOptions)
+        : await dialog.showOpenDialog(pickerOptions)
+      if (picker.canceled || picker.filePaths.length === 0) {
+        emitUploadProgress({ status: 'canceled' })
+        return {
+          success: true,
+          canceled: true,
+          rootPath,
+          uploaded: [] as string[],
+          uploadedCount: 0,
+          skippedCount: 0,
+        }
+      }
+      sourcePaths = picker.filePaths.map((filePath) => path.resolve(filePath))
+    }
+
+    const uploaded: string[] = []
+    const skipped: Array<{ path: string; reason: string }> = []
+    const renamed: Array<{ sourceName: string; targetName: string; targetPath: string }> = []
+    const uploadCandidates: Array<{
+      sourcePath: string
+      sourceName: string
+      targetPath: string
+      size: number
+    }> = []
+
+    for (const sourcePath of sourcePaths.slice(0, 30)) {
+      const sourceName = path.basename(sourcePath)
+      const safeNameResult = toDeviceSafeFileName(sourceName)
+      const targetPath = normalizeSdDevicePath(path.posix.join(rootPath, safeNameResult.fileName), '/')
+
+      if (safeNameResult.renamed) {
+        console.warn(`[SD Upload] 文件名兼容性重命名: "${sourceName}" -> "${safeNameResult.fileName}"`)
+        renamed.push({
+          sourceName,
+          targetName: safeNameResult.fileName,
+          targetPath,
+        })
+      }
+
+      try {
+        const stat = await fs.stat(sourcePath)
+        if (!stat.isFile()) {
+          skipped.push({
+            path: sourcePath,
+            reason: 'source is not file',
+          })
+          continue
+        }
+        uploadCandidates.push({
+          sourcePath,
+          sourceName,
+          targetPath,
+          size: stat.size,
+        })
+      } catch (error) {
+        skipped.push({
+          path: sourcePath,
+          reason: `source stat failed: ${String(error)}`,
+        })
+      }
+    }
+
+    const totalFiles = uploadCandidates.length
+    const totalBytes = uploadCandidates.reduce((sum, item) => sum + item.size, 0)
+    let completedBytes = 0
+
+    emitUploadProgress({
+      status: 'start',
+      totalFiles,
+      totalBytes,
+      overallBytesSent: 0,
+      overallPercent: 0,
+    })
+
+    for (let i = 0; i < uploadCandidates.length; i++) {
+      const candidate = uploadCandidates[i]
+      try {
+        const uploadResult = await wsServer.uploadFileToSd({
+          sourcePath: candidate.sourcePath,
+          targetPath: candidate.targetPath,
+          targetDeviceId: deviceId,
+          chunkSize: 4096,
+          overwrite: true,
+          timeoutMs: 12000,
+          onProgress: (progress) => {
+            const fileTotal = progress.totalBytes > 0 ? progress.totalBytes : candidate.size
+            const fileBytes = Math.max(0, Math.min(progress.bytesSent, fileTotal))
+            const overallBytes = Math.max(0, Math.min(totalBytes, completedBytes + fileBytes))
+            emitUploadProgress({
+              status: 'progress',
+              fileIndex: i + 1,
+              fileCount: totalFiles,
+              fileName: candidate.sourceName,
+              targetPath: candidate.targetPath,
+              fileBytesSent: fileBytes,
+              fileTotalBytes: fileTotal,
+              filePercent: fileTotal > 0 ? Math.round((fileBytes / fileTotal) * 100) : 0,
+              overallBytesSent: overallBytes,
+              overallTotalBytes: totalBytes,
+              overallPercent: totalBytes > 0 ? Math.round((overallBytes / totalBytes) * 100) : 0,
+            })
+          },
+        })
+
+        if (uploadResult?.success) {
+          uploaded.push(candidate.targetPath)
+          completedBytes += candidate.size
+          emitUploadProgress({
+            status: 'file_complete',
+            fileIndex: i + 1,
+            fileCount: totalFiles,
+            fileName: candidate.sourceName,
+            targetPath: candidate.targetPath,
+            fileBytesSent: candidate.size,
+            fileTotalBytes: candidate.size,
+            filePercent: 100,
+            overallBytesSent: completedBytes,
+            overallTotalBytes: totalBytes,
+            overallPercent: totalBytes > 0 ? Math.round((completedBytes / totalBytes) * 100) : 100,
+          })
+        } else {
+          console.error(`[SD Upload] 上传失败: ${candidate.sourceName} -> ${candidate.targetPath} | ${uploadResult?.reason || 'upload failed'}`)
+          skipped.push({
+            path: candidate.sourcePath,
+            reason: uploadResult?.reason || 'upload failed',
+          })
+          emitUploadProgress({
+            status: 'file_error',
+            fileIndex: i + 1,
+            fileCount: totalFiles,
+            fileName: candidate.sourceName,
+            targetPath: candidate.targetPath,
+            reason: uploadResult?.reason || 'upload failed',
+            overallBytesSent: completedBytes,
+            overallTotalBytes: totalBytes,
+            overallPercent: totalBytes > 0 ? Math.round((completedBytes / totalBytes) * 100) : 0,
+          })
+        }
+      } catch (error) {
+        console.error(`[SD Upload] 上传异常: ${candidate.sourceName} -> ${candidate.targetPath}`, error)
+        skipped.push({
+          path: candidate.sourcePath,
+          reason: String(error),
+        })
+        emitUploadProgress({
+          status: 'file_error',
+          fileIndex: i + 1,
+          fileCount: totalFiles,
+          fileName: candidate.sourceName,
+          targetPath: candidate.targetPath,
+          reason: String(error),
+          overallBytesSent: completedBytes,
+          overallTotalBytes: totalBytes,
+          overallPercent: totalBytes > 0 ? Math.round((completedBytes / totalBytes) * 100) : 0,
+        })
+      }
+    }
+
+    emitUploadProgress({
+      status: 'done',
+      totalFiles,
+      totalBytes,
+      uploadedCount: uploaded.length,
+      skippedCount: skipped.length,
+      overallBytesSent: completedBytes,
+      overallPercent: totalBytes > 0 ? Math.round((completedBytes / totalBytes) * 100) : 100,
+    })
+
+    return {
+      success: uploaded.length > 0 && skipped.length === 0,
+      rootPath,
+      uploaded,
+      skipped,
+      renamed,
+      renamedCount: renamed.length,
+      uploadedCount: uploaded.length,
+      skippedCount: skipped.length,
+      deviceId,
+      error: skipped.length > 0 && uploaded.length === 0 ? skipped[0].reason : undefined,
+    }
+  })
+
+  ipcMain.handle('sd-manager-delete-file', async (_event, payload: { rootPath?: unknown; filePath?: unknown; deviceId?: unknown } | undefined) => {
+    const rootPath = normalizeSdDevicePath(payload?.rootPath, getDefaultSdRootPath())
+    const filePath = normalizeSdDevicePath(payload?.filePath, '')
+    const deviceId = typeof payload?.deviceId === 'string' ? payload.deviceId.trim() : undefined
+
+    if (!filePath) {
+      return { success: false, rootPath, error: 'filePath 为空' }
+    }
+    if (!isPathInsideDeviceRoot(rootPath, filePath)) {
+      return { success: false, rootPath, error: '仅允许删除当前 SD 目录下的文件' }
+    }
+
+    try {
+      const result = await wsServer.requestSdDelete(filePath, deviceId)
+      if (!result?.success) {
+        return {
+          success: false,
+          rootPath,
+          error: result?.reason || '设备删除失败',
+        }
+      }
+      return {
+        success: true,
+        rootPath,
+        deleted: typeof result.path === 'string' ? result.path : filePath,
+        deviceId: result.deviceId,
+      }
+    } catch (error) {
+      console.error('[SD Manager] 删除设备文件失败:', error)
+      return { success: false, rootPath, error: String(error) }
+    }
+  })
+
+  ipcMain.handle('sd-manager-preview-file', async (_event, payload: { rootPath?: unknown; filePath?: unknown; deviceId?: unknown } | undefined) => {
+    const rootPath = normalizeSdDevicePath(payload?.rootPath, getDefaultSdRootPath())
+    const filePath = normalizeSdDevicePath(payload?.filePath, '')
+    const deviceId = typeof payload?.deviceId === 'string' ? payload.deviceId.trim() : undefined
+
+    if (!filePath) {
+      return { success: false, rootPath, error: 'filePath 为空' }
+    }
+    if (!isPathInsideDeviceRoot(rootPath, filePath)) {
+      return { success: false, rootPath, error: '仅允许预览当前 SD 目录下的文件' }
+    }
+
+    const ext = path.posix.extname(filePath).toLowerCase()
+    if (ext !== '.mjpeg' && ext !== '.mjpg') {
+      return { success: false, rootPath, error: '仅支持 MJPEG 文件预览' }
+    }
+
+    try {
+      const result = await wsServer.requestSdPreview(filePath, deviceId, 10000)
+      if (!result?.success) {
+        return {
+          success: false,
+          rootPath,
+          error: result?.reason || '设备预览失败',
+        }
+      }
+
+      const mime = typeof result.mime === 'string' && result.mime.trim().length > 0
+        ? result.mime.trim()
+        : 'image/jpeg'
+      const binary = Buffer.isBuffer(result.buffer)
+        ? result.buffer
+        : Buffer.from(result.buffer ?? [])
+      if (binary.length <= 0) {
+        return { success: false, rootPath, error: '设备未返回预览数据' }
+      }
+
+      return {
+        success: true,
+        rootPath,
+        filePath,
+        mime,
+        bytes: binary.length,
+        previewDataUrl: `data:${mime};base64,${binary.toString('base64')}`,
+        deviceId: result.deviceId || deviceId,
+      }
+    } catch (error) {
+      console.error('[SD Manager] 预览设备文件失败:', error)
+      return { success: false, rootPath, error: String(error) }
     }
   })
 

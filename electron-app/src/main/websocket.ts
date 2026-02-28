@@ -1,9 +1,10 @@
-import { WebSocketServer, WebSocket } from 'ws'
+import { WebSocketServer, WebSocket, type RawData } from 'ws'
 import { SystemMonitor } from './system.js'
 import { exec, execFile } from 'child_process'
 import { promisify } from 'util'
 import { access, open as openFile, stat as statFile } from 'fs/promises'
 import { constants as fsConstants } from 'fs'
+import crypto from 'crypto'
 
 const execAsync = promisify(exec)
 const execFileAsync = promisify(execFile)
@@ -28,6 +29,13 @@ interface PendingRequest<T> {
   timeout: NodeJS.Timeout
 }
 
+interface PendingSdPreviewBinary {
+  requestId: string
+  expectedLen: number
+  path: string
+  mime: string
+}
+
 type PhotoControlAction = 'prev' | 'next' | 'reload' | 'play' | 'pause' | 'set_interval'
 
 export interface PhotoFrameSettings {
@@ -38,6 +46,8 @@ export interface PhotoFrameSettings {
   maxFileSize: number
   autoCompress: boolean
   maxPhotoCount: number
+  homeWallpaperPath: string
+  clockWallpaperPath: string
 }
 
 const DEFAULT_PHOTO_FRAME_SETTINGS: PhotoFrameSettings = {
@@ -48,6 +58,8 @@ const DEFAULT_PHOTO_FRAME_SETTINGS: PhotoFrameSettings = {
   maxFileSize: 2,
   autoCompress: true,
   maxPhotoCount: 20,
+  homeWallpaperPath: '',
+  clockWallpaperPath: '',
 }
 
 type VoiceCommandAction = 'navigate' | 'launch_app' | 'unknown'
@@ -57,6 +69,19 @@ interface ParsedVoiceCommand {
   page?: string
   appName?: string
   normalized: string
+}
+
+interface VoiceCommandExecutionResult {
+  success: boolean
+  action: VoiceCommandAction
+  page?: string
+  appName?: string
+  appPath?: string
+  message: string
+  reason?: string
+  command: string
+  normalized: string
+  timestamp: number
 }
 
 const VOICE_OPEN_KEYWORDS = ['open', 'launch', 'start', 'run', '打开', '启动', '运行']
@@ -182,9 +207,323 @@ const parseVoiceCommand = (rawText: string): ParsedVoiceCommand => {
   return { action: 'unknown', normalized }
 }
 
+interface VoiceStreamChunkMeta {
+  seq: number
+  len: number
+  level: number
+  timestamp: number
+}
+
+interface VoiceStreamState {
+  deviceId: string
+  streamId: string
+  sampleRate: number
+  startedAt: number
+  expectedSeq: number
+  pendingMeta: VoiceStreamChunkMeta | null
+  chunksReceived: number
+  bytesReceived: number
+  lastLevel: number
+  lastFinalText: string
+  asr: AliyunSpeechTranscriber | null
+}
+
+interface VoiceRecognitionPacket {
+  text: string
+  isFinal: boolean
+  name: string
+}
+
+const aliyunPercentEncode = (value: string): string =>
+  encodeURIComponent(value)
+    .replace(/\+/g, '%20')
+    .replace(/\*/g, '%2A')
+    .replace(/%7E/g, '~')
+
+const aliyunSignParams = (params: Record<string, string>, secret: string): string => {
+  const keys = Object.keys(params).sort()
+  const query = keys.map((key) => `${aliyunPercentEncode(key)}=${aliyunPercentEncode(params[key])}`).join('&')
+  const stringToSign = `GET&%2F&${aliyunPercentEncode(query)}`
+  return crypto.createHmac('sha1', `${secret}&`).update(stringToSign).digest('base64')
+}
+
+const fetchAliyunToken = async (): Promise<string | null> => {
+  const staticToken = process.env.ALIYUN_NLS_TOKEN?.trim() || ''
+  if (staticToken) {
+    return staticToken
+  }
+
+  const accessKeyId = process.env.ALIYUN_ACCESS_KEY_ID?.trim() || ''
+  const accessKeySecret = process.env.ALIYUN_ACCESS_KEY_SECRET?.trim() || ''
+  if (!accessKeyId || !accessKeySecret) {
+    return null
+  }
+
+  const tokenEndpoint = process.env.ALIYUN_NLS_TOKEN_URL?.trim() || 'https://nls-meta.cn-shanghai.aliyuncs.com/'
+  const params: Record<string, string> = {
+    AccessKeyId: accessKeyId,
+    Action: 'CreateToken',
+    Format: 'JSON',
+    RegionId: 'cn-shanghai',
+    SignatureMethod: 'HMAC-SHA1',
+    SignatureNonce: `${Date.now()}${Math.random().toString(16).slice(2)}`,
+    SignatureVersion: '1.0',
+    Timestamp: new Date().toISOString(),
+    Version: '2019-02-28',
+  }
+  params.Signature = aliyunSignParams(params, accessKeySecret)
+
+  const query = Object.keys(params)
+    .map((key) => `${aliyunPercentEncode(key)}=${aliyunPercentEncode(params[key])}`)
+    .join('&')
+  const response = await fetch(`${tokenEndpoint}?${query}`)
+  if (!response.ok) {
+    throw new Error(`fetch token failed: HTTP ${response.status}`)
+  }
+  const json = (await response.json()) as {
+    Token?: { Id?: string }
+    Message?: string
+    Code?: string
+  }
+  const token = typeof json?.Token?.Id === 'string' ? json.Token.Id : ''
+  if (!token) {
+    const reason = typeof json?.Message === 'string' ? json.Message : (typeof json?.Code === 'string' ? json.Code : 'token missing')
+    throw new Error(`fetch token failed: ${reason}`)
+  }
+  return token
+}
+
+class AliyunSpeechTranscriber {
+  private socket: WebSocket | null = null
+  private taskId = ''
+  private ready = false
+  private stopped = false
+  private queue: Buffer[] = []
+  private readonly queueLimit = 240
+  private readonly appKey: string
+  private readonly wsEndpoint: string
+  private readonly sampleRate: number
+  private readonly onResult: (packet: VoiceRecognitionPacket) => void
+  private readonly onError: (reason: string) => void
+  private readonly onClosed: () => void
+
+  constructor(options: {
+    sampleRate: number
+    onResult: (packet: VoiceRecognitionPacket) => void
+    onError: (reason: string) => void
+    onClosed: () => void
+  }) {
+    this.sampleRate = options.sampleRate
+    this.onResult = options.onResult
+    this.onError = options.onError
+    this.onClosed = options.onClosed
+    this.appKey = process.env.ALIYUN_APP_KEY?.trim() || ''
+    this.wsEndpoint = process.env.ALIYUN_NLS_WS_URL?.trim() || 'wss://nls-gateway.cn-shanghai.aliyuncs.com/ws/v1'
+  }
+
+  public async start(): Promise<void> {
+    if (this.stopped) {
+      throw new Error('asr session already stopped')
+    }
+    if (!this.appKey) {
+      throw new Error('ALIYUN_APP_KEY missing')
+    }
+
+    const token = await fetchAliyunToken()
+    if (!token) {
+      throw new Error('aliyun token unavailable')
+    }
+
+    this.taskId = crypto.randomUUID().replace(/-/g, '')
+    const wsUrl = `${this.wsEndpoint}?token=${encodeURIComponent(token)}&appkey=${encodeURIComponent(this.appKey)}`
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false
+      const settleOk = () => {
+        if (settled) return
+        settled = true
+        clearTimeout(startTimeout)
+        resolve()
+      }
+      const settleErr = (reason: string) => {
+        if (settled) return
+        settled = true
+        clearTimeout(startTimeout)
+        reject(new Error(reason))
+      }
+      const startTimeout = setTimeout(() => {
+        settleErr('asr start timeout')
+      }, 8000)
+
+      const ws = new WebSocket(wsUrl)
+      this.socket = ws
+
+      ws.on('open', () => {
+        const startMessage = {
+          header: {
+            appkey: this.appKey,
+            namespace: 'SpeechTranscriber',
+            name: 'StartTranscription',
+            task_id: this.taskId,
+            message_id: crypto.randomUUID().replace(/-/g, ''),
+          },
+          payload: {
+            format: 'pcm',
+            sample_rate: this.sampleRate,
+            enable_intermediate_result: true,
+            enable_punctuation_prediction: true,
+            enable_inverse_text_normalization: true,
+          },
+        }
+        ws.send(JSON.stringify(startMessage))
+      })
+
+      ws.on('message', (rawData: RawData) => {
+        let payload = ''
+        try {
+          payload = AliyunSpeechTranscriber.rawDataToText(rawData)
+          const message = JSON.parse(payload) as Record<string, any>
+          const name = typeof message?.header?.name === 'string' ? message.header.name : ''
+
+          if (name === 'TranscriptionStarted') {
+            this.ready = true
+            this.flushQueue()
+            settleOk()
+            return
+          }
+
+          if (name === 'TaskFailed') {
+            const reason =
+              message?.payload?.message ||
+              message?.payload?.status_text ||
+              message?.header?.status_text ||
+              'asr task failed'
+            this.onError(String(reason))
+            return
+          }
+
+          const resultText =
+            message?.payload?.result ||
+            message?.payload?.output?.text ||
+            message?.payload?.text ||
+            ''
+          const isFinal =
+            name === 'SentenceEnd' ||
+            name === 'TranscriptionCompleted' ||
+            message?.payload?.is_final === true ||
+            message?.payload?.final === true ||
+            message?.payload?.sentence_end === true
+
+          if (typeof resultText === 'string' && resultText.trim().length > 0) {
+            this.onResult({
+              text: resultText.trim(),
+              isFinal,
+              name,
+            })
+          }
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error)
+          this.onError(`asr parse failed: ${reason}`)
+        }
+      })
+
+      ws.on('close', () => {
+        this.ready = false
+        this.socket = null
+        if (!settled) {
+          settleErr('asr socket closed before ready')
+        }
+        this.onClosed()
+      })
+
+      ws.on('error', (error: Error) => {
+        const reason = error?.message || 'asr websocket error'
+        this.onError(reason)
+        if (!settled) {
+          settleErr(reason)
+        }
+      })
+    })
+  }
+
+  public pushAudio(chunk: Buffer): boolean {
+    if (this.stopped) {
+      return false
+    }
+    if (this.ready && this.socket?.readyState === WebSocket.OPEN) {
+      this.socket.send(chunk)
+      return true
+    }
+    if (this.queue.length >= this.queueLimit) {
+      this.queue.shift()
+    }
+    this.queue.push(Buffer.from(chunk))
+    return true
+  }
+
+  public stop(): void {
+    if (this.stopped) {
+      return
+    }
+    this.stopped = true
+    const ws = this.socket
+    if (ws && ws.readyState === WebSocket.OPEN && this.taskId) {
+      const stopMessage = {
+        header: {
+          appkey: this.appKey,
+          namespace: 'SpeechTranscriber',
+          name: 'StopTranscription',
+          task_id: this.taskId,
+          message_id: crypto.randomUUID().replace(/-/g, ''),
+        },
+        payload: {},
+      }
+      try {
+        ws.send(JSON.stringify(stopMessage))
+      } catch {
+        // ignore send error on shutdown
+      }
+    }
+    try {
+      ws?.close()
+    } catch {
+      // ignore close errors
+    }
+    this.ready = false
+    this.queue.length = 0
+    this.socket = null
+  }
+
+  private flushQueue() {
+    if (!this.ready || !this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      return
+    }
+    while (this.queue.length > 0 && this.socket.readyState === WebSocket.OPEN) {
+      const chunk = this.queue.shift()
+      if (chunk) {
+        this.socket.send(chunk)
+      }
+    }
+  }
+
+  private static rawDataToText(rawData: RawData): string {
+    if (typeof rawData === 'string') {
+      return rawData
+    }
+    if (Buffer.isBuffer(rawData)) {
+      return rawData.toString('utf8')
+    }
+    if (Array.isArray(rawData)) {
+      return Buffer.concat(rawData).toString('utf8')
+    }
+    return Buffer.from(rawData as ArrayBufferLike).toString('utf8')
+  }
+}
+
 export class DeviceWebSocketServer {
   private wss: WebSocketServer
   private clients: Map<WebSocket, ClientInfo> = new Map()
+  private voiceStreams: Map<WebSocket, VoiceStreamState> = new Map()
   private systemMonitor: SystemMonitor
   private systemBroadcastInterval: NodeJS.Timeout | null = null
   private heartbeatMonitorInterval: NodeJS.Timeout | null = null
@@ -195,6 +534,9 @@ export class DeviceWebSocketServer {
   private pendingSdUploadBeginRequests: Map<string, PendingRequest<any>> = new Map()
   private pendingSdUploadChunkRequests: Map<string, PendingRequest<any>> = new Map()
   private pendingSdUploadCommitRequests: Map<string, PendingRequest<any>> = new Map()
+  private pendingSdPreviewRequests: Map<string, PendingRequest<any>> = new Map()
+  private pendingSdPreviewRequestSockets: Map<string, WebSocket> = new Map()
+  private pendingSdPreviewBinaryBySocket: Map<WebSocket, PendingSdPreviewBinary> = new Map()
 
   constructor(port: number = 8765) {
     this.wss = new WebSocketServer({ port })
@@ -217,9 +559,14 @@ export class DeviceWebSocketServer {
       }
       this.clients.set(ws, clientInfo)
 
-      ws.on('message', (data: Buffer) => {
+      ws.on('message', (rawData: RawData, isBinary: boolean) => {
+        if (isBinary) {
+          this.handleBinaryMessage(ws, this.rawDataToBuffer(rawData))
+          return
+        }
+
         try {
-          const message = JSON.parse(data.toString())
+          const message = JSON.parse(this.rawDataToBuffer(rawData).toString('utf8'))
           this.handleMessage(ws, message)
         } catch (error) {
           console.error('解析消息失败:', error)
@@ -227,6 +574,27 @@ export class DeviceWebSocketServer {
       })
 
       ws.on('close', () => {
+        this.stopVoiceStreamSession(ws, 'socket closed', false)
+        const relatedPreviewRequestIds: string[] = []
+        this.pendingSdPreviewRequestSockets.forEach((socket, requestId) => {
+          if (socket === ws) {
+            relatedPreviewRequestIds.push(requestId)
+          }
+        })
+        for (const requestId of relatedPreviewRequestIds) {
+          this.pendingSdPreviewRequestSockets.delete(requestId)
+          const pending = this.pendingSdPreviewRequests.get(requestId)
+          if (pending) {
+            clearTimeout(pending.timeout)
+            this.pendingSdPreviewRequests.delete(requestId)
+            pending.resolve({
+              success: false,
+              requestId,
+              reason: 'device disconnected',
+            })
+          }
+        }
+        this.pendingSdPreviewBinaryBySocket.delete(ws)
         const client = this.clients.get(ws)
         if (client) {
           if (client.type === 'esp32_device' && client.deviceId) {
@@ -278,6 +646,21 @@ export class DeviceWebSocketServer {
       return
     }
 
+    const normalizeWallpaperPath = (value: unknown): string => {
+      if (typeof value !== 'string') {
+        return ''
+      }
+      const trimmed = value.trim()
+      if (!trimmed.startsWith('/')) {
+        return ''
+      }
+      const lower = trimmed.toLowerCase()
+      if (!lower.endsWith('.mjpeg') && !lower.endsWith('.mjpg')) {
+        return ''
+      }
+      return trimmed
+    }
+
     const slideshowIntervalRaw = Number(settings.slideshowInterval)
     const maxFileSizeRaw = Number(settings.maxFileSize)
     const maxPhotoCountRaw = Number(settings.maxPhotoCount)
@@ -300,10 +683,12 @@ export class DeviceWebSocketServer {
       maxPhotoCount: Number.isFinite(maxPhotoCountRaw)
         ? Math.max(1, Math.min(100, Math.round(maxPhotoCountRaw)))
         : DEFAULT_PHOTO_FRAME_SETTINGS.maxPhotoCount,
+      homeWallpaperPath: normalizeWallpaperPath(settings.homeWallpaperPath),
+      clockWallpaperPath: normalizeWallpaperPath(settings.clockWallpaperPath),
     }
 
     console.log(
-      `[相册设置] 已更新: interval=${this.photoFrameSettings.slideshowInterval}s autoPlay=${this.photoFrameSettings.autoPlay} theme=${this.photoFrameSettings.theme}`
+      `[相册设置] 已更新: interval=${this.photoFrameSettings.slideshowInterval}s autoPlay=${this.photoFrameSettings.autoPlay} theme=${this.photoFrameSettings.theme} home=${this.photoFrameSettings.homeWallpaperPath || 'auto'} clock=${this.photoFrameSettings.clockWallpaperPath || 'auto'}`
     )
   }
 
@@ -416,6 +801,62 @@ export class DeviceWebSocketServer {
       this.pendingSdDeleteRequests.set(requestId, { resolve, reject, timeout })
       this.sendMessage(targetClient.ws, {
         type: 'sd_delete_request',
+        data: {
+          requestId,
+          deviceId: targetClient.deviceId,
+          path: trimmedPath,
+          timestamp: Date.now(),
+        },
+      })
+    })
+  }
+
+  public async requestSdPreview(filePath: string, targetDeviceId?: string, timeoutMs: number = 9000): Promise<any> {
+    const targetClient = this.findEsp32Client(targetDeviceId)
+    if (!targetClient || !targetClient.ws || targetClient.ws.readyState !== WebSocket.OPEN) {
+      return {
+        success: false,
+        reason: targetDeviceId ? `device not online: ${targetDeviceId}` : 'no online esp32 device',
+      }
+    }
+    if (this.voiceStreams.has(targetClient.ws)) {
+      return {
+        success: false,
+        reason: 'preview unavailable while voice streaming is active',
+      }
+    }
+
+    const trimmedPath = typeof filePath === 'string' ? filePath.trim() : ''
+    const lowerPath = trimmedPath.toLowerCase()
+    if (!trimmedPath.startsWith('/') || (!lowerPath.endsWith('.mjpeg') && !lowerPath.endsWith('.mjpg'))) {
+      return {
+        success: false,
+        reason: 'invalid mjpeg path',
+      }
+    }
+
+    const requestId = `sd-preview-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
+    return await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingSdPreviewRequests.delete(requestId)
+        this.pendingSdPreviewRequestSockets.delete(requestId)
+        const previewState = this.pendingSdPreviewBinaryBySocket.get(targetClient.ws)
+        if (previewState && previewState.requestId === requestId) {
+          this.pendingSdPreviewBinaryBySocket.delete(targetClient.ws)
+        }
+        resolve({
+          success: false,
+          reason: `sd preview timeout (${timeoutMs}ms)`,
+          requestId,
+          path: trimmedPath,
+          deviceId: targetClient.deviceId,
+        })
+      }, timeoutMs)
+
+      this.pendingSdPreviewRequests.set(requestId, { resolve, reject, timeout })
+      this.pendingSdPreviewRequestSockets.set(requestId, targetClient.ws)
+      this.sendMessage(targetClient.ws, {
+        type: 'sd_preview_request',
         data: {
           requestId,
           deviceId: targetClient.deviceId,
@@ -704,9 +1145,12 @@ export class DeviceWebSocketServer {
     const client = this.clients.get(ws)
     if (!client) return
 
-    console.log('收到消息:', message.type, message.data || '')
+    const messageType = typeof message?.type === 'string' ? message.type : 'unknown'
+    if (messageType !== 'heartbeat' && messageType !== 'photo_state') {
+      console.log('收到消息:', messageType, message.data || '')
+    }
 
-    switch (message.type) {
+    switch (messageType) {
       case 'handshake':
         this.handleHandshake(ws, client, message)
         break
@@ -747,6 +1191,22 @@ export class DeviceWebSocketServer {
         this.handleVoiceCommand(ws, client, message)
         break
 
+      case 'voice_command_from_panel':
+        this.handleVoiceCommandFromControlPanel(ws, client, message)
+        break
+
+      case 'voice_stream_start':
+        this.handleVoiceStreamStart(ws, client, message)
+        break
+
+      case 'voice_stream_chunk_meta':
+        this.handleVoiceStreamChunkMeta(ws, client, message)
+        break
+
+      case 'voice_stream_stop':
+        this.handleVoiceStreamStop(ws, client, message)
+        break
+
       case 'photo_settings_request':
         this.handlePhotoSettingsRequest(ws, client)
         break
@@ -779,8 +1239,435 @@ export class DeviceWebSocketServer {
         this.handleSdUploadCommitAck(client, message)
         break
 
+      case 'sd_preview_response':
+        this.handleSdPreviewResponse(client, message)
+        break
+
       default:
         console.log('未知消息类型:', message.type)
+    }
+  }
+
+  private rawDataToBuffer(rawData: RawData): Buffer {
+    if (Buffer.isBuffer(rawData)) {
+      return rawData
+    }
+    if (Array.isArray(rawData)) {
+      return Buffer.concat(rawData)
+    }
+    if (rawData instanceof ArrayBuffer) {
+      return Buffer.from(rawData)
+    }
+    return Buffer.from(rawData as ArrayBufferLike)
+  }
+
+  private sendVoiceStreamAck(
+    ws: WebSocket,
+    payload: {
+      streamId: string
+      success: boolean
+      status: 'accepted' | 'ready' | 'stopped' | 'error'
+      reason?: string
+      seq?: number
+      expectedLen?: number
+      actualLen?: number
+      chunksReceived?: number
+      bytesReceived?: number
+      text?: string
+      isFinal?: boolean
+    }
+  ) {
+    this.sendMessage(ws, {
+      type: 'voice_stream_ack',
+      data: {
+        streamId: payload.streamId,
+        success: payload.success,
+        status: payload.status,
+        reason: payload.reason || '',
+        seq: payload.seq,
+        expectedLen: payload.expectedLen,
+        actualLen: payload.actualLen,
+        chunksReceived: payload.chunksReceived,
+        bytesReceived: payload.bytesReceived,
+        text: payload.text,
+        isFinal: payload.isFinal,
+        timestamp: Date.now(),
+      },
+    })
+  }
+
+  private handleBinaryMessage(ws: WebSocket, data: Buffer) {
+    const pendingPreview = this.pendingSdPreviewBinaryBySocket.get(ws)
+    if (pendingPreview) {
+      this.pendingSdPreviewBinaryBySocket.delete(ws)
+      this.pendingSdPreviewRequestSockets.delete(pendingPreview.requestId)
+      const pending = this.pendingSdPreviewRequests.get(pendingPreview.requestId)
+      if (!pending) {
+        return
+      }
+      clearTimeout(pending.timeout)
+      this.pendingSdPreviewRequests.delete(pendingPreview.requestId)
+
+      if (data.length !== pendingPreview.expectedLen) {
+        pending.resolve({
+          success: false,
+          requestId: pendingPreview.requestId,
+          path: pendingPreview.path,
+          reason: `preview binary length mismatch expected=${pendingPreview.expectedLen} actual=${data.length}`,
+        })
+        return
+      }
+
+      pending.resolve({
+        success: true,
+        requestId: pendingPreview.requestId,
+        path: pendingPreview.path,
+        mime: pendingPreview.mime,
+        bytes: data.length,
+        buffer: data,
+      })
+      return
+    }
+
+    const state = this.voiceStreams.get(ws)
+    if (!state || !state.pendingMeta) {
+      return
+    }
+
+    const pendingMeta = state.pendingMeta
+    state.pendingMeta = null
+
+    if (data.length !== pendingMeta.len) {
+      this.sendMessage(ws, {
+        type: 'voice_stream_chunk_ack',
+        data: {
+          streamId: state.streamId,
+          seq: pendingMeta.seq,
+          success: false,
+          reason: 'binary length mismatch',
+          expectedLen: pendingMeta.len,
+          actualLen: data.length,
+          timestamp: Date.now(),
+        },
+      })
+      this.stopVoiceStreamSession(ws, 'binary length mismatch', true)
+      return
+    }
+
+    if (!state.asr || !state.asr.pushAudio(data)) {
+      this.sendMessage(ws, {
+        type: 'voice_stream_chunk_ack',
+        data: {
+          streamId: state.streamId,
+          seq: pendingMeta.seq,
+          success: false,
+          reason: 'asr stream unavailable',
+          timestamp: Date.now(),
+        },
+      })
+      this.stopVoiceStreamSession(ws, 'asr unavailable', true)
+      return
+    }
+
+    state.expectedSeq = pendingMeta.seq + 1
+    state.lastLevel = pendingMeta.level
+    state.bytesReceived += data.length
+    state.chunksReceived += 1
+
+    this.sendMessage(ws, {
+      type: 'voice_stream_chunk_ack',
+      data: {
+        streamId: state.streamId,
+        seq: pendingMeta.seq,
+        success: true,
+        len: data.length,
+        level: pendingMeta.level,
+        chunksReceived: state.chunksReceived,
+        bytesReceived: state.bytesReceived,
+        timestamp: Date.now(),
+      },
+    })
+  }
+
+  private handleVoiceStreamStart(ws: WebSocket, client: ClientInfo, message: any) {
+    if (client.type !== 'esp32_device') {
+      return
+    }
+
+    const data = message?.data ?? {}
+    const streamId = typeof data.streamId === 'string' ? data.streamId.trim() : ''
+    const sampleRateRaw = Number(data.sampleRate)
+    const sampleRate = Number.isFinite(sampleRateRaw) ? Math.max(8000, Math.min(48000, Math.floor(sampleRateRaw))) : 16000
+
+    if (!streamId) {
+      this.sendVoiceStreamAck(ws, {
+        streamId: '',
+        success: false,
+        status: 'error',
+        reason: 'streamId missing',
+      })
+      return
+    }
+
+    if (this.voiceStreams.has(ws)) {
+      this.stopVoiceStreamSession(ws, 'replaced by new stream', false)
+    }
+
+    const state: VoiceStreamState = {
+      deviceId: client.deviceId || 'esp32-device',
+      streamId,
+      sampleRate,
+      startedAt: Date.now(),
+      expectedSeq: 0,
+      pendingMeta: null,
+      chunksReceived: 0,
+      bytesReceived: 0,
+      lastLevel: 0,
+      lastFinalText: '',
+      asr: null,
+    }
+    this.voiceStreams.set(ws, state)
+    this.sendVoiceStreamAck(ws, {
+      streamId,
+      success: true,
+      status: 'accepted',
+    })
+
+    const asr = new AliyunSpeechTranscriber({
+      sampleRate,
+      onResult: (packet) => {
+        void this.handleVoiceStreamAsrPacket(ws, streamId, packet)
+      },
+      onError: (reason) => {
+        const current = this.voiceStreams.get(ws)
+        if (!current || current.streamId !== streamId) {
+          return
+        }
+        this.sendVoiceStreamAck(ws, {
+          streamId,
+          success: false,
+          status: 'error',
+          reason,
+          chunksReceived: current.chunksReceived,
+          bytesReceived: current.bytesReceived,
+        })
+        this.stopVoiceStreamSession(ws, `asr error: ${reason}`, false)
+      },
+      onClosed: () => {
+        const current = this.voiceStreams.get(ws)
+        if (!current || current.streamId !== streamId) {
+          return
+        }
+        this.stopVoiceStreamSession(ws, 'asr closed', true)
+      },
+    })
+    state.asr = asr
+
+    void asr.start()
+      .then(() => {
+        const current = this.voiceStreams.get(ws)
+        if (!current || current.streamId !== streamId) {
+          return
+        }
+        this.sendVoiceStreamAck(ws, {
+          streamId,
+          success: true,
+          status: 'ready',
+        })
+      })
+      .catch((error) => {
+        const reason = error instanceof Error ? error.message : String(error)
+        const current = this.voiceStreams.get(ws)
+        if (!current || current.streamId !== streamId) {
+          return
+        }
+        this.sendVoiceStreamAck(ws, {
+          streamId,
+          success: false,
+          status: 'error',
+          reason,
+        })
+        this.stopVoiceStreamSession(ws, `asr start failed: ${reason}`, false)
+      })
+  }
+
+  private handleVoiceStreamChunkMeta(ws: WebSocket, client: ClientInfo, message: any) {
+    if (client.type !== 'esp32_device') {
+      return
+    }
+
+    const state = this.voiceStreams.get(ws)
+    const data = message?.data ?? {}
+    const streamId = typeof data.streamId === 'string' ? data.streamId.trim() : ''
+    const seqRaw = Number(data.seq)
+    const lenRaw = Number(data.len)
+    const levelRaw = Number(data.level)
+    const seq = Number.isFinite(seqRaw) ? Math.floor(seqRaw) : -1
+    const len = Number.isFinite(lenRaw) ? Math.floor(lenRaw) : -1
+    const level = Number.isFinite(levelRaw) ? Math.max(0, Math.min(100, Math.floor(levelRaw))) : 0
+
+    if (!state || !streamId || streamId !== state.streamId) {
+      this.sendMessage(ws, {
+        type: 'voice_stream_chunk_ack',
+        data: {
+          streamId,
+          seq,
+          success: false,
+          reason: 'voice stream not active',
+          timestamp: Date.now(),
+        },
+      })
+      return
+    }
+
+    if (state.pendingMeta) {
+      this.sendMessage(ws, {
+        type: 'voice_stream_chunk_ack',
+        data: {
+          streamId: state.streamId,
+          seq,
+          success: false,
+          reason: 'binary pending',
+          timestamp: Date.now(),
+        },
+      })
+      this.stopVoiceStreamSession(ws, 'binary pending', true)
+      return
+    }
+
+    if (seq !== state.expectedSeq) {
+      this.sendMessage(ws, {
+        type: 'voice_stream_chunk_ack',
+        data: {
+          streamId: state.streamId,
+          seq,
+          success: false,
+          reason: `seq mismatch expected=${state.expectedSeq}`,
+          timestamp: Date.now(),
+        },
+      })
+      this.stopVoiceStreamSession(ws, 'seq mismatch', true)
+      return
+    }
+
+    if (len <= 0 || len > 8192) {
+      this.sendMessage(ws, {
+        type: 'voice_stream_chunk_ack',
+        data: {
+          streamId: state.streamId,
+          seq,
+          success: false,
+          reason: 'invalid chunk length',
+          timestamp: Date.now(),
+        },
+      })
+      this.stopVoiceStreamSession(ws, 'invalid chunk length', true)
+      return
+    }
+
+    state.pendingMeta = {
+      seq,
+      len,
+      level,
+      timestamp: Date.now(),
+    }
+  }
+
+  private handleVoiceStreamStop(ws: WebSocket, client: ClientInfo, message: any) {
+    if (client.type !== 'esp32_device') {
+      return
+    }
+
+    const state = this.voiceStreams.get(ws)
+    if (!state) {
+      this.sendVoiceStreamAck(ws, {
+        streamId: '',
+        success: false,
+        status: 'error',
+        reason: 'voice stream not active',
+      })
+      return
+    }
+
+    const streamId = typeof message?.data?.streamId === 'string' ? message.data.streamId.trim() : ''
+    if (streamId && streamId !== state.streamId) {
+      this.sendVoiceStreamAck(ws, {
+        streamId,
+        success: false,
+        status: 'error',
+        reason: 'streamId mismatch',
+      })
+      return
+    }
+
+    const reason = typeof message?.data?.reason === 'string' ? message.data.reason : 'device stop'
+    this.stopVoiceStreamSession(ws, reason, true)
+  }
+
+  private async handleVoiceStreamAsrPacket(ws: WebSocket, streamId: string, packet: VoiceRecognitionPacket) {
+    const state = this.voiceStreams.get(ws)
+    if (!state || state.streamId !== streamId) {
+      return
+    }
+    const recognizedText = packet.text.trim()
+    if (!recognizedText) {
+      return
+    }
+
+    this.sendVoiceStreamAck(ws, {
+      streamId,
+      success: true,
+      status: 'ready',
+      text: recognizedText,
+      isFinal: packet.isFinal,
+      chunksReceived: state.chunksReceived,
+      bytesReceived: state.bytesReceived,
+    })
+
+    if (!packet.isFinal) {
+      return
+    }
+
+    if (recognizedText === state.lastFinalText) {
+      return
+    }
+    state.lastFinalText = recognizedText
+
+    const result = await this.executeVoiceCommand(recognizedText)
+    this.sendMessage(ws, {
+      type: 'voice_command_result',
+      data: {
+        ...result,
+        source: 'esp32_mic',
+      },
+    })
+    this.broadcastVoiceCommandEvent(state.deviceId, result)
+  }
+
+  private stopVoiceStreamSession(ws: WebSocket, reason: string, notifyClient: boolean) {
+    const state = this.voiceStreams.get(ws)
+    if (!state) {
+      return
+    }
+
+    this.voiceStreams.delete(ws)
+    state.pendingMeta = null
+    state.asr?.stop()
+    state.asr = null
+
+    console.log(
+      `[VoiceStream] stop device=${state.deviceId} streamId=${state.streamId} chunks=${state.chunksReceived} bytes=${state.bytesReceived} reason=${reason}`
+    )
+
+    if (notifyClient) {
+      this.sendVoiceStreamAck(ws, {
+        streamId: state.streamId,
+        success: true,
+        status: 'stopped',
+        reason,
+        chunksReceived: state.chunksReceived,
+        bytesReceived: state.bytesReceived,
+      })
     }
   }
 
@@ -1001,6 +1888,75 @@ export class DeviceWebSocketServer {
       ...data,
       success: Boolean(data.success),
       deviceId: client.deviceId,
+    })
+  }
+
+  private handleSdPreviewResponse(client: ClientInfo, message: any) {
+    if (client.type !== 'esp32_device') return
+
+    const data = message?.data ?? {}
+    const requestId = typeof data.requestId === 'string' ? data.requestId : ''
+    if (!requestId) return
+
+    const pending = this.pendingSdPreviewRequests.get(requestId)
+    if (!pending) return
+
+    const success = Boolean(data.success)
+    if (!success) {
+      clearTimeout(pending.timeout)
+      this.pendingSdPreviewRequests.delete(requestId)
+      this.pendingSdPreviewRequestSockets.delete(requestId)
+      pending.resolve({
+        ...data,
+        success: false,
+        deviceId: client.deviceId,
+      })
+      return
+    }
+
+    const expectedLenRaw = Number(data.len ?? data.bytes)
+    const expectedLen = Number.isFinite(expectedLenRaw) ? Math.max(0, Math.floor(expectedLenRaw)) : 0
+    const path = typeof data.path === 'string' ? data.path : ''
+    const mime = typeof data.mime === 'string' && data.mime.trim().length > 0
+      ? data.mime.trim()
+      : 'image/jpeg'
+
+    if (expectedLen <= 0) {
+      clearTimeout(pending.timeout)
+      this.pendingSdPreviewRequests.delete(requestId)
+      this.pendingSdPreviewRequestSockets.delete(requestId)
+      pending.resolve({
+        success: false,
+        requestId,
+        path,
+        reason: 'invalid preview length',
+        deviceId: client.deviceId,
+      })
+      return
+    }
+
+    const existing = this.pendingSdPreviewBinaryBySocket.get(client.ws)
+    if (existing && existing.requestId !== requestId) {
+      const stale = this.pendingSdPreviewRequests.get(existing.requestId)
+      if (stale) {
+        clearTimeout(stale.timeout)
+        this.pendingSdPreviewRequests.delete(existing.requestId)
+        this.pendingSdPreviewRequestSockets.delete(existing.requestId)
+        stale.resolve({
+          success: false,
+          requestId: existing.requestId,
+          path: existing.path,
+          reason: 'preview superseded by newer request',
+          deviceId: client.deviceId,
+        })
+      }
+    }
+
+    this.pendingSdPreviewBinaryBySocket.set(client.ws, {
+      requestId,
+      expectedLen,
+      path,
+      mime,
     })
   }
 
@@ -1244,110 +2200,159 @@ export class DeviceWebSocketServer {
     return `/Applications/${appName}.app`
   }
 
-  private async handleVoiceCommand(ws: WebSocket, client: ClientInfo, message: any) {
-    if (client.type !== 'esp32_device') return
-
-    const rawText = typeof message?.data?.text === 'string' ? message.data.text.trim() : ''
+  private async executeVoiceCommand(rawText: string): Promise<VoiceCommandExecutionResult> {
     const parsed = parseVoiceCommand(rawText)
-
-    const reply = (data: Record<string, unknown>) => {
-      this.sendMessage(ws, {
-        type: 'voice_command_result',
-        data: {
-          command: rawText,
-          normalized: parsed.normalized,
-          timestamp: Date.now(),
-          ...data,
-        },
-      })
+    const base: VoiceCommandExecutionResult = {
+      success: false,
+      action: parsed.action,
+      message: 'Unsupported voice command',
+      reason: rawText,
+      command: rawText,
+      normalized: parsed.normalized,
+      timestamp: Date.now(),
     }
 
     if (!rawText) {
-      reply({
-        success: false,
+      return {
+        ...base,
         action: 'unknown',
         message: 'empty voice command',
         reason: 'text missing',
-      })
-      return
+      }
     }
 
     if (parsed.action === 'navigate' && parsed.page) {
       const pageTitle = parsed.page.charAt(0).toUpperCase() + parsed.page.slice(1)
-      reply({
+      return {
+        ...base,
         success: true,
         action: 'navigate',
         page: parsed.page,
         message: `Navigate to ${pageTitle}`,
-      })
-      this.broadcastToControlPanels({
-        type: 'voice_command_event',
-        data: {
-          deviceId: client.deviceId,
-          command: rawText,
-          action: 'navigate',
-          page: parsed.page,
-          success: true,
-          timestamp: Date.now(),
-        },
-      })
-      return
+        reason: undefined,
+      }
     }
 
     if (parsed.action === 'launch_app' && parsed.appName) {
       const appPath = this.resolveVoiceAppPath(parsed.appName)
       if (!appPath) {
-        reply({
-          success: false,
+        return {
+          ...base,
           action: 'launch_app',
           appName: parsed.appName,
           message: 'failed to resolve app path',
           reason: 'invalid app name',
-        })
-        return
+        }
       }
 
       const launchResult = await this.launchAppPath(appPath)
       if (!launchResult.success) {
-        reply({
-          success: false,
+        return {
+          ...base,
           action: 'launch_app',
           appName: launchResult.appName,
           appPath,
           message: 'Failed to launch app',
           reason: launchResult.reason,
-        })
-        return
+        }
       }
 
-      reply({
+      return {
+        ...base,
         success: true,
         action: 'launch_app',
         appName: launchResult.appName,
         appPath,
         message: `App launched: ${launchResult.appName}`,
-      })
-      this.broadcastToControlPanels({
-        type: 'voice_command_event',
+        reason: undefined,
+      }
+    }
+
+    return base
+  }
+
+  private broadcastVoiceCommandEvent(deviceId: string | undefined, result: VoiceCommandExecutionResult) {
+    if (!deviceId || !result.success) {
+      return
+    }
+
+    const payload: Record<string, unknown> = {
+      deviceId,
+      command: result.command,
+      action: result.action,
+      success: true,
+      timestamp: Date.now(),
+    }
+
+    if (result.action === 'navigate' && result.page) {
+      payload.page = result.page
+    } else if (result.action === 'launch_app') {
+      payload.appName = result.appName
+      payload.appPath = result.appPath
+    }
+
+    this.broadcastToControlPanels({
+      type: 'voice_command_event',
+      data: payload,
+    })
+  }
+
+  private async handleVoiceCommand(ws: WebSocket, client: ClientInfo, message: any) {
+    if (client.type !== 'esp32_device') return
+
+    const rawText = typeof message?.data?.text === 'string' ? message.data.text.trim() : ''
+    const result = await this.executeVoiceCommand(rawText)
+    this.sendMessage(ws, {
+      type: 'voice_command_result',
+      data: result,
+    })
+    this.broadcastVoiceCommandEvent(client.deviceId, result)
+  }
+
+  private async handleVoiceCommandFromControlPanel(ws: WebSocket, client: ClientInfo, message: any) {
+    if (client.type !== 'control_panel') return
+
+    const data = message?.data ?? {}
+    const rawText = typeof data.text === 'string' ? data.text.trim() : ''
+    const requestId = typeof data.requestId === 'string' ? data.requestId : ''
+    const targetDeviceId = typeof data.targetDeviceId === 'string' ? data.targetDeviceId.trim() : ''
+    const targetClient = this.findEsp32Client(targetDeviceId || undefined)
+
+    if (!targetClient || !targetClient.ws || targetClient.ws.readyState !== WebSocket.OPEN) {
+      this.sendMessage(ws, {
+        type: 'voice_command_dispatch_ack',
         data: {
-          deviceId: client.deviceId,
+          requestId,
+          success: false,
+          reason: targetDeviceId ? `device not online: ${targetDeviceId}` : 'no online esp32 device',
           command: rawText,
-          action: 'launch_app',
-          appName: launchResult.appName,
-          appPath,
-          success: true,
           timestamp: Date.now(),
         },
       })
       return
     }
 
-    reply({
-      success: false,
-      action: 'unknown',
-      message: 'Unsupported voice command',
-      reason: rawText,
+    const result = await this.executeVoiceCommand(rawText)
+    const resultForDevice: VoiceCommandExecutionResult & { source: string } = {
+      ...result,
+      source: 'control_panel',
+    }
+
+    this.sendMessage(targetClient.ws, {
+      type: 'voice_command_result',
+      data: resultForDevice,
     })
+
+    this.sendMessage(ws, {
+      type: 'voice_command_dispatch_ack',
+      data: {
+        requestId,
+        deviceId: targetClient.deviceId,
+        ...result,
+      },
+    })
+
+    this.broadcastVoiceCommandEvent(targetClient.deviceId, result)
   }
 
   private async handleLaunchApp(ws: WebSocket, client: ClientInfo, message: any) {
@@ -1524,6 +2529,11 @@ export class DeviceWebSocketServer {
   }
 
   public close() {
+    this.voiceStreams.forEach((_state, ws) => {
+      this.stopVoiceStreamSession(ws, 'server shutdown', false)
+    })
+    this.voiceStreams.clear()
+
     this.pendingSdListRequests.forEach((pending) => clearTimeout(pending.timeout))
     this.pendingSdListRequests.clear()
     this.pendingSdDeleteRequests.forEach((pending) => clearTimeout(pending.timeout))
@@ -1534,6 +2544,10 @@ export class DeviceWebSocketServer {
     this.pendingSdUploadChunkRequests.clear()
     this.pendingSdUploadCommitRequests.forEach((pending) => clearTimeout(pending.timeout))
     this.pendingSdUploadCommitRequests.clear()
+    this.pendingSdPreviewRequests.forEach((pending) => clearTimeout(pending.timeout))
+    this.pendingSdPreviewRequests.clear()
+    this.pendingSdPreviewRequestSockets.clear()
+    this.pendingSdPreviewBinaryBySocket.clear()
 
     if (this.systemBroadcastInterval) {
       clearInterval(this.systemBroadcastInterval)

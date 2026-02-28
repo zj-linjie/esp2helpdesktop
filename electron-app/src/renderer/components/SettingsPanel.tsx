@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   Box,
   Typography,
@@ -20,12 +20,21 @@ import {
   FormControl,
   InputLabel,
   Chip,
+  LinearProgress,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  CircularProgress,
+  Tooltip,
 } from '@mui/material';
-import { Delete, Add, Save, Visibility, VisibilityOff, FolderOpen, Palette, Apps, Refresh } from '@mui/icons-material';
+import { Delete, Add, Save, Visibility, VisibilityOff, FolderOpen, Palette, Apps, Refresh, UploadFile, Image as ImageIcon, MusicNote, Movie, InsertDriveFile } from '@mui/icons-material';
 import { settingsService, CityConfig } from '../services/settingsService';
 import { weatherConfig } from '../config/weatherConfig';
 import { photoThemes } from '../config/photoThemes';
 import { appLauncherService, MacApp } from '../services/appLauncherService';
+import { sdCardService, SdFileItem, SdUploadProgressEvent } from '../services/sdCardService';
+
+const SD_MANAGER_ROOT = '/';
 
 const SettingsPanel: React.FC = () => {
   const [cities, setCities] = useState<CityConfig[]>([]);
@@ -41,6 +50,8 @@ const SettingsPanel: React.FC = () => {
   const [photoTheme, setPhotoTheme] = useState('dark-gallery');
   const [maxFileSize, setMaxFileSize] = useState(2);
   const [autoCompress, setAutoCompress] = useState(true);
+  const [homeWallpaperPath, setHomeWallpaperPath] = useState('');
+  const [clockWallpaperPath, setClockWallpaperPath] = useState('');
   const [photoSaveSuccess, setPhotoSaveSuccess] = useState(false);
 
   // App Launcher settings
@@ -49,6 +60,22 @@ const SettingsPanel: React.FC = () => {
   const [isScanning, setIsScanning] = useState(false);
   const [appSaveSuccess, setAppSaveSuccess] = useState(false);
   const [appSearchQuery, setAppSearchQuery] = useState('');
+
+  // SD manager state
+  const [sdFiles, setSdFiles] = useState<SdFileItem[]>([]);
+  const [sdRootResolved, setSdRootResolved] = useState('');
+  const [sdLoading, setSdLoading] = useState(false);
+  const [sdUploading, setSdUploading] = useState(false);
+  const [sdTruncated, setSdTruncated] = useState(false);
+  const [sdMessage, setSdMessage] = useState('');
+  const [sdMessageSeverity, setSdMessageSeverity] = useState<'success' | 'info' | 'error'>('info');
+  const [sdTypeFilter, setSdTypeFilter] = useState<'all' | SdFileItem['type']>('all');
+  const [sdUploadProgress, setSdUploadProgress] = useState<SdUploadProgressEvent | null>(null);
+  const [sdPreviewOpen, setSdPreviewOpen] = useState(false);
+  const [sdPreviewLoading, setSdPreviewLoading] = useState(false);
+  const [sdPreviewPath, setSdPreviewPath] = useState('');
+  const [sdPreviewDataUrl, setSdPreviewDataUrl] = useState('');
+  const [sdPreviewError, setSdPreviewError] = useState('');
 
   // Load cities and API key
   useEffect(() => {
@@ -62,6 +89,13 @@ const SettingsPanel: React.FC = () => {
     });
   }, []);
 
+  useEffect(() => {
+    const unsubscribe = sdCardService.onUploadProgress((progress) => {
+      setSdUploadProgress(progress);
+    });
+    return unsubscribe;
+  }, []);
+
   const loadCities = () => {
     const settings = settingsService.getWeatherSettings();
     setCities(settings.cities);
@@ -70,6 +104,208 @@ const SettingsPanel: React.FC = () => {
   const loadApiKey = () => {
     const settings = settingsService.getWeatherSettings();
     setApiKey(settings.apiKey || weatherConfig.apiKey);
+  };
+
+  const refreshSdFiles = async (targetRoot?: string) => {
+    const rootPathInput = (targetRoot ?? sdRootResolved ?? SD_MANAGER_ROOT).trim();
+    const rootPath = rootPathInput.startsWith('/') ? rootPathInput : SD_MANAGER_ROOT;
+
+    setSdLoading(true);
+    setSdMessage('');
+    const result = await sdCardService.listFiles(rootPath);
+    setSdLoading(false);
+
+    if (!result.success) {
+      setSdMessage(result.error || '读取 SD 文件失败');
+      setSdMessageSeverity('error');
+      return;
+    }
+
+    setSdFiles(result.files || []);
+    setSdRootResolved(result.rootPath || rootPath);
+    setSdTruncated(Boolean(result.truncated));
+    if (result.exists === false) {
+      setSdMessage('设备 SD 不可用或目录不存在');
+      setSdMessageSeverity('info');
+    } else {
+      setSdMessage(`已读取 ${result.files?.length || 0} 个文件`);
+      setSdMessageSeverity('success');
+    }
+  };
+
+  const handleUploadToSd = async () => {
+    const rootPath = (sdRootResolved || SD_MANAGER_ROOT).trim();
+
+    setSdUploading(true);
+    setSdUploadProgress({
+      status: 'start',
+      overallPercent: 0,
+      overallBytesSent: 0,
+      overallTotalBytes: 0,
+      timestamp: Date.now(),
+    });
+
+    try {
+      const result = await sdCardService.uploadFiles(rootPath);
+
+      if (!result.success) {
+        if ((result.uploadedCount || 0) > 0) {
+          const renamedPart = (result.renamedCount || 0) > 0
+            ? `，重命名 ${result.renamedCount || 0}`
+            : '';
+          setSdMessage(`部分上传完成：成功 ${result.uploadedCount || 0}，失败 ${result.skippedCount || 0}${renamedPart}`);
+          setSdMessageSeverity('info');
+          await refreshSdFiles(rootPath);
+          return;
+        }
+        setSdMessage(result.error || '上传失败');
+        setSdMessageSeverity('error');
+        return;
+      }
+      if (result.canceled) {
+        setSdMessage('已取消上传');
+        setSdMessageSeverity('info');
+        return;
+      }
+
+      if ((result.renamedCount || 0) > 0) {
+        setSdMessage(`上传完成：${result.uploadedCount || 0} 个文件（${result.renamedCount || 0} 个已重命名为设备兼容文件名）`);
+        setSdMessageSeverity('info');
+      } else {
+        setSdMessage(`上传完成：${result.uploadedCount || 0} 个文件`);
+        setSdMessageSeverity('success');
+      }
+      await refreshSdFiles(rootPath);
+    } finally {
+      setSdUploading(false);
+      setTimeout(() => {
+        setSdUploadProgress(null);
+      }, 900);
+    }
+  };
+
+  const handleDeleteSdFile = async (filePath: string) => {
+    const rootPath = (sdRootResolved || SD_MANAGER_ROOT).trim();
+    const result = await sdCardService.deleteFile(rootPath, filePath);
+    if (!result.success) {
+      setSdMessage(result.error || '删除失败');
+      setSdMessageSeverity('error');
+      return;
+    }
+    setSdMessage('文件已删除');
+    setSdMessageSeverity('success');
+    await refreshSdFiles(rootPath);
+  };
+
+  const handlePreviewSdMjpeg = async (filePath: string) => {
+    const rootPath = (sdRootResolved || SD_MANAGER_ROOT).trim();
+    setSdPreviewOpen(true);
+    setSdPreviewLoading(true);
+    setSdPreviewPath(filePath);
+    setSdPreviewDataUrl('');
+    setSdPreviewError('');
+
+    const result = await sdCardService.previewFile(rootPath, filePath);
+    setSdPreviewLoading(false);
+
+    if (!result.success || !result.previewDataUrl) {
+      const reason = result.error || '设备未返回预览数据';
+      setSdPreviewError(reason);
+      setSdMessage(`预览失败: ${reason}`);
+      setSdMessageSeverity('error');
+      return;
+    }
+
+    setSdPreviewDataUrl(result.previewDataUrl);
+    setSdMessage('已加载 MJPEG 首帧预览');
+    setSdMessageSeverity('success');
+  };
+
+  const formatFileSize = (bytes: number) => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  };
+
+  const formatModifiedAt = (timestamp: number) => {
+    if (!Number.isFinite(timestamp) || timestamp <= 0) return '--';
+    const date = new Date(timestamp);
+    return `${date.toLocaleDateString()} ${date.toLocaleTimeString()}`;
+  };
+
+  const getUploadProgressPercent = () => {
+    if (!sdUploadProgress) return 0;
+    const value = Number(sdUploadProgress.overallPercent ?? 0);
+    if (!Number.isFinite(value)) return 0;
+    return Math.max(0, Math.min(100, value));
+  };
+
+  const getUploadProgressText = () => {
+    if (!sdUploadProgress) return '';
+    const fileName = sdUploadProgress.fileName || '当前文件';
+    const fileIndex = sdUploadProgress.fileIndex || 0;
+    const fileCount = sdUploadProgress.fileCount || sdUploadProgress.totalFiles || 0;
+    const bytesSent = Number(sdUploadProgress.overallBytesSent || 0);
+    const totalBytes = Number(sdUploadProgress.overallTotalBytes || sdUploadProgress.totalBytes || 0);
+
+    if (sdUploadProgress.status === 'canceled') {
+      return '上传已取消';
+    }
+    if (sdUploadProgress.status === 'done') {
+      return `上传完成：成功 ${sdUploadProgress.uploadedCount || 0}，失败 ${sdUploadProgress.skippedCount || 0}`;
+    }
+    if (sdUploadProgress.status === 'file_error') {
+      return `${fileName} 上传失败：${sdUploadProgress.reason || 'unknown error'}`;
+    }
+    if (fileCount > 0 && totalBytes > 0) {
+      return `上传中 ${fileIndex}/${fileCount} · ${fileName} · ${formatFileSize(bytesSent)} / ${formatFileSize(totalBytes)}`;
+    }
+    if (fileCount > 0) {
+      return `上传中 ${fileIndex}/${fileCount} · ${fileName}`;
+    }
+    return '上传中...';
+  };
+
+  const isMjpegFile = (file: SdFileItem) => {
+    const ext = file.extension.toLowerCase();
+    return ext === '.mjpeg' || ext === '.mjpg';
+  };
+
+  const groupedSdFiles = useMemo(() => {
+    const groups = {
+      image: [] as SdFileItem[],
+      audio: [] as SdFileItem[],
+      video: [] as SdFileItem[],
+      other: [] as SdFileItem[],
+    };
+    for (const file of sdFiles) {
+      groups[file.type].push(file);
+    }
+    return groups;
+  }, [sdFiles]);
+
+  const visibleSdFileCount = sdTypeFilter === 'all' ? sdFiles.length : groupedSdFiles[sdTypeFilter].length;
+  const mjpegWallpaperFiles = useMemo(
+    () => sdFiles
+      .filter((file) => isMjpegFile(file))
+      .sort((a, b) => a.relativePath.localeCompare(b.relativePath, 'zh-Hans-CN')),
+    [sdFiles]
+  );
+  const mjpegWallpaperPathSet = useMemo(
+    () => new Set(mjpegWallpaperFiles.map((file) => file.path)),
+    [mjpegWallpaperFiles]
+  );
+
+  const toggleSdTypeFilter = (type: SdFileItem['type']) => {
+    setSdTypeFilter((current) => (current === type ? 'all' : type));
+  };
+
+  const getSdTypeLabel = (type: SdFileItem['type'] | 'all') => {
+    if (type === 'image') return '图片';
+    if (type === 'audio') return '音频';
+    if (type === 'video') return '视频';
+    if (type === 'other') return '其他';
+    return '全部';
   };
 
   const loadPhotoSettings = async () => {
@@ -81,6 +317,9 @@ const SettingsPanel: React.FC = () => {
     setPhotoTheme(settings.theme);
     setMaxFileSize(settings.maxFileSize);
     setAutoCompress(settings.autoCompress);
+    setHomeWallpaperPath(settings.homeWallpaperPath || '');
+    setClockWallpaperPath(settings.clockWallpaperPath || '');
+    await refreshSdFiles(SD_MANAGER_ROOT);
   };
 
   const loadApps = async () => {
@@ -158,6 +397,11 @@ const SettingsPanel: React.FC = () => {
     settingsService.updatePhotoTheme(photoTheme);
     settingsService.updateMaxFileSize(maxFileSize);
     settingsService.updateAutoCompress(autoCompress);
+    settingsService.updateHomeWallpaperPath(homeWallpaperPath.trim());
+    settingsService.updateClockWallpaperPath(clockWallpaperPath.trim());
+    refreshSdFiles(sdRootResolved || SD_MANAGER_ROOT).catch((error) => {
+      console.error('刷新 SD 文件失败:', error);
+    });
     setPhotoSaveSuccess(true);
     setTimeout(() => setPhotoSaveSuccess(false), 3000);
   };
@@ -729,7 +973,105 @@ const SettingsPanel: React.FC = () => {
               variant="caption"
               sx={{ color: 'rgba(255, 255, 255, 0.5)', display: 'block', mt: 0.5 }}
             >
-              目前使用模拟数据，硬件到货后支持从 TF/SD 卡加载照片
+              路径会下发到设备作为相册目录配置（例如 /photos）
+            </Typography>
+          </Box>
+
+          {/* Dynamic Wallpaper Selection */}
+          <Box sx={{ mb: 3 }}>
+            <Typography variant="subtitle2" sx={{ mb: 1, color: 'rgba(255, 255, 255, 0.9)' }}>
+              主页动态壁纸（MJPEG）
+            </Typography>
+            <Box sx={{ display: 'flex', gap: 1 }}>
+              <FormControl fullWidth size="small">
+                <Select
+                  value={mjpegWallpaperPathSet.has(homeWallpaperPath) ? homeWallpaperPath : ''}
+                  onChange={(e) => setHomeWallpaperPath(String(e.target.value))}
+                  sx={{
+                    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+                    '& .MuiOutlinedInput-notchedOutline': {
+                      borderColor: 'rgba(255, 255, 255, 0.2)',
+                    },
+                    '&:hover .MuiOutlinedInput-notchedOutline': {
+                      borderColor: 'rgba(255, 255, 255, 0.3)',
+                    },
+                  }}
+                >
+                  <MenuItem value="">自动选择（默认）</MenuItem>
+                  {mjpegWallpaperFiles.map((file) => (
+                    <MenuItem key={`home-${file.path}`} value={file.path}>
+                      {file.relativePath}
+                    </MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+              <Button
+                variant="outlined"
+                onClick={() => handlePreviewSdMjpeg(homeWallpaperPath)}
+                disabled={!homeWallpaperPath}
+                sx={{
+                  minWidth: 88,
+                  color: '#90caf9',
+                  borderColor: 'rgba(144, 202, 249, 0.6)',
+                }}
+              >
+                预览
+              </Button>
+            </Box>
+            {homeWallpaperPath.length > 0 && !mjpegWallpaperPathSet.has(homeWallpaperPath) && (
+              <Typography variant="caption" sx={{ display: 'block', mt: 0.5, color: '#ffb74d' }}>
+                当前路径不在已读取列表中：{homeWallpaperPath}
+              </Typography>
+            )}
+          </Box>
+
+          <Box sx={{ mb: 3 }}>
+            <Typography variant="subtitle2" sx={{ mb: 1, color: 'rgba(255, 255, 255, 0.9)' }}>
+              时钟动态壁纸（MJPEG）
+            </Typography>
+            <Box sx={{ display: 'flex', gap: 1 }}>
+              <FormControl fullWidth size="small">
+                <Select
+                  value={mjpegWallpaperPathSet.has(clockWallpaperPath) ? clockWallpaperPath : ''}
+                  onChange={(e) => setClockWallpaperPath(String(e.target.value))}
+                  sx={{
+                    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+                    '& .MuiOutlinedInput-notchedOutline': {
+                      borderColor: 'rgba(255, 255, 255, 0.2)',
+                    },
+                    '&:hover .MuiOutlinedInput-notchedOutline': {
+                      borderColor: 'rgba(255, 255, 255, 0.3)',
+                    },
+                  }}
+                >
+                  <MenuItem value="">自动选择（默认）</MenuItem>
+                  {mjpegWallpaperFiles.map((file) => (
+                    <MenuItem key={`clock-${file.path}`} value={file.path}>
+                      {file.relativePath}
+                    </MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+              <Button
+                variant="outlined"
+                onClick={() => handlePreviewSdMjpeg(clockWallpaperPath)}
+                disabled={!clockWallpaperPath}
+                sx={{
+                  minWidth: 88,
+                  color: '#90caf9',
+                  borderColor: 'rgba(144, 202, 249, 0.6)',
+                }}
+              >
+                预览
+              </Button>
+            </Box>
+            {clockWallpaperPath.length > 0 && !mjpegWallpaperPathSet.has(clockWallpaperPath) && (
+              <Typography variant="caption" sx={{ display: 'block', mt: 0.5, color: '#ffb74d' }}>
+                当前路径不在已读取列表中：{clockWallpaperPath}
+              </Typography>
+            )}
+            <Typography variant="caption" sx={{ color: 'rgba(255, 255, 255, 0.55)', display: 'block', mt: 0.6 }}>
+              留空时设备自动按默认优先级选择壁纸。
             </Typography>
           </Box>
 
@@ -931,6 +1273,272 @@ const SettingsPanel: React.FC = () => {
           </Button>
         </CardContent>
       </Card>
+
+      {/* SD Card Manager Card */}
+      <Card
+        sx={{
+          backgroundColor: '#1e1e1e',
+          borderRadius: 2,
+          mt: 3,
+        }}
+      >
+        <CardContent>
+          <Typography variant="h6" sx={{ mb: 2, fontWeight: 600 }}>
+            SD 内容管理
+          </Typography>
+
+          <Typography
+            variant="body2"
+            sx={{ mb: 2, color: 'rgba(255, 255, 255, 0.7)' }}
+          >
+            通过 WebSocket 读取 ESP32 设备内部 SD 卡文件，按类型分组展示并支持删除。
+          </Typography>
+
+          {sdMessage && (
+            <Alert severity={sdMessageSeverity} sx={{ mb: 2 }}>
+              {sdMessage}
+            </Alert>
+          )}
+
+          <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+            <Button
+              variant="outlined"
+              startIcon={<Refresh />}
+              onClick={() => refreshSdFiles()}
+              disabled={sdLoading}
+              sx={{
+                color: '#90caf9',
+                borderColor: 'rgba(144, 202, 249, 0.5)',
+                '&:hover': {
+                  borderColor: '#90caf9',
+                  backgroundColor: 'rgba(144, 202, 249, 0.08)',
+                },
+              }}
+            >
+              {sdLoading ? '刷新中...' : '刷新列表'}
+            </Button>
+            <Button
+              variant="contained"
+              startIcon={<UploadFile />}
+              onClick={handleUploadToSd}
+              disabled={sdUploading || sdLoading}
+              sx={{
+                backgroundColor: '#1565c0',
+                '&:hover': {
+                  backgroundColor: '#0d47a1',
+                },
+              }}
+            >
+              {sdUploading ? '上传中...' : '上传文件'}
+            </Button>
+          </Box>
+
+          {(sdUploading || sdUploadProgress !== null) && (
+            <Box
+              sx={{
+                mb: 1.5,
+                p: 1,
+                borderRadius: 1,
+                backgroundColor: 'rgba(255, 255, 255, 0.04)',
+              }}
+            >
+              <Typography variant="caption" sx={{ color: 'rgba(255, 255, 255, 0.75)' }}>
+                {getUploadProgressText()}
+              </Typography>
+              <LinearProgress
+                variant="determinate"
+                value={getUploadProgressPercent()}
+                sx={{
+                  mt: 0.6,
+                  height: 8,
+                  borderRadius: 999,
+                  backgroundColor: 'rgba(255, 255, 255, 0.1)',
+                  '& .MuiLinearProgress-bar': {
+                    backgroundColor: '#42a5f5',
+                  },
+                }}
+              />
+              <Typography variant="caption" sx={{ color: 'rgba(255, 255, 255, 0.55)' }}>
+                总进度 {getUploadProgressPercent()}%
+              </Typography>
+            </Box>
+          )}
+
+          <Typography variant="caption" sx={{ color: 'rgba(255, 255, 255, 0.55)' }}>
+            目录: {sdRootResolved || SD_MANAGER_ROOT}
+          </Typography>
+
+          <Divider sx={{ my: 2, borderColor: 'rgba(255, 255, 255, 0.1)' }} />
+
+          <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', mb: 2 }}>
+            <Chip
+              icon={<ImageIcon />}
+              label={`图片 ${groupedSdFiles.image.length}`}
+              size="small"
+              clickable
+              onClick={() => toggleSdTypeFilter('image')}
+              variant={sdTypeFilter === 'image' ? 'filled' : 'outlined'}
+              color={sdTypeFilter === 'image' ? 'primary' : 'default'}
+            />
+            <Chip
+              icon={<MusicNote />}
+              label={`音频 ${groupedSdFiles.audio.length}`}
+              size="small"
+              clickable
+              onClick={() => toggleSdTypeFilter('audio')}
+              variant={sdTypeFilter === 'audio' ? 'filled' : 'outlined'}
+              color={sdTypeFilter === 'audio' ? 'primary' : 'default'}
+            />
+            <Chip
+              icon={<Movie />}
+              label={`视频 ${groupedSdFiles.video.length}`}
+              size="small"
+              clickable
+              onClick={() => toggleSdTypeFilter('video')}
+              variant={sdTypeFilter === 'video' ? 'filled' : 'outlined'}
+              color={sdTypeFilter === 'video' ? 'primary' : 'default'}
+            />
+            <Chip
+              icon={<InsertDriveFile />}
+              label={`其他 ${groupedSdFiles.other.length}`}
+              size="small"
+              clickable
+              onClick={() => toggleSdTypeFilter('other')}
+              variant={sdTypeFilter === 'other' ? 'filled' : 'outlined'}
+              color={sdTypeFilter === 'other' ? 'primary' : 'default'}
+            />
+          </Box>
+
+          <Typography variant="caption" sx={{ color: 'rgba(255, 255, 255, 0.55)', display: 'block', mb: 1 }}>
+            当前筛选: {getSdTypeLabel(sdTypeFilter)}（再次点击同类标签可恢复全部）
+          </Typography>
+
+          {sdTruncated && (
+            <Alert severity="info" sx={{ mb: 2 }}>
+              文件较多，仅显示前 {sdFiles.length} 项。
+            </Alert>
+          )}
+
+          {sdFiles.length === 0 ? (
+            <Typography variant="body2" sx={{ color: 'rgba(255, 255, 255, 0.6)' }}>
+              当前目录暂无文件。
+            </Typography>
+          ) : visibleSdFileCount === 0 ? (
+            <Typography variant="body2" sx={{ color: 'rgba(255, 255, 255, 0.6)' }}>
+              当前筛选下暂无文件。
+            </Typography>
+          ) : (
+            <>
+              {(['image', 'audio', 'video', 'other'] as const)
+                .filter((type) => sdTypeFilter === 'all' || sdTypeFilter === type)
+                .map((type) => {
+                const files = groupedSdFiles[type];
+                if (files.length === 0) return null;
+
+                const sectionTitle = type === 'image'
+                  ? '图片'
+                  : type === 'audio'
+                    ? '音频'
+                    : type === 'video'
+                      ? '视频'
+                      : '其他';
+
+                return (
+                  <Box key={type} sx={{ mb: 1.5 }}>
+                    <Typography variant="subtitle2" sx={{ color: 'rgba(255, 255, 255, 0.85)', mb: 0.5 }}>
+                      {sectionTitle} ({files.length})
+                    </Typography>
+                    <List dense sx={{ py: 0 }}>
+                      {files.map((file) => (
+                        <ListItem
+                          key={file.path}
+                          sx={{
+                            px: 0,
+                            py: 0.4,
+                            borderBottom: '1px solid rgba(255, 255, 255, 0.05)',
+                          }}
+                          secondaryAction={
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                              {isMjpegFile(file) && (
+                                <Tooltip title="预览 MJPEG 首帧">
+                                  <IconButton
+                                    size="small"
+                                    onClick={() => handlePreviewSdMjpeg(file.path)}
+                                    sx={{ color: 'rgba(144, 202, 249, 0.95)' }}
+                                  >
+                                    <Visibility fontSize="small" />
+                                  </IconButton>
+                                </Tooltip>
+                              )}
+                              <IconButton
+                                edge="end"
+                                size="small"
+                                onClick={() => handleDeleteSdFile(file.path)}
+                                sx={{ color: 'rgba(255, 99, 71, 0.9)' }}
+                              >
+                                <Delete fontSize="small" />
+                              </IconButton>
+                            </Box>
+                          }
+                        >
+                          <ListItemText
+                            primary={file.name}
+                            secondary={`${file.relativePath} • ${formatFileSize(file.size)} • ${formatModifiedAt(file.modifiedAt)}`}
+                            primaryTypographyProps={{
+                              sx: { color: 'rgba(255, 255, 255, 0.9)', fontSize: '0.92rem' },
+                            }}
+                            secondaryTypographyProps={{
+                              sx: { color: 'rgba(255, 255, 255, 0.5)', fontSize: '0.74rem' },
+                            }}
+                          />
+                        </ListItem>
+                      ))}
+                    </List>
+                  </Box>
+                );
+              })}
+            </>
+          )}
+        </CardContent>
+      </Card>
+
+      <Dialog
+        open={sdPreviewOpen}
+        onClose={() => setSdPreviewOpen(false)}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>MJPEG 预览（首帧）</DialogTitle>
+        <DialogContent dividers>
+          <Typography variant="caption" sx={{ color: 'rgba(255, 255, 255, 0.65)', display: 'block', mb: 1 }}>
+            {sdPreviewPath || '--'}
+          </Typography>
+          {sdPreviewLoading ? (
+            <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: 220 }}>
+              <CircularProgress />
+            </Box>
+          ) : sdPreviewError ? (
+            <Alert severity="error">{sdPreviewError}</Alert>
+          ) : sdPreviewDataUrl ? (
+            <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', backgroundColor: '#111', borderRadius: 1, p: 1 }}>
+              <img
+                src={sdPreviewDataUrl}
+                alt="mjpeg-preview"
+                style={{
+                  maxWidth: '100%',
+                  maxHeight: '360px',
+                  objectFit: 'contain',
+                  borderRadius: '6px',
+                }}
+              />
+            </Box>
+          ) : (
+            <Typography variant="body2" sx={{ color: 'rgba(255, 255, 255, 0.7)' }}>
+              暂无预览数据
+            </Typography>
+          )}
+        </DialogContent>
+      </Dialog>
     </Box>
   );
 };

@@ -22,6 +22,8 @@ export interface PhotoSettings {
   maxFileSize: number; // MB
   autoCompress: boolean; // 自动压缩
   maxPhotoCount: number; // 最大照片数量
+  homeWallpaperPath: string; // 主页动态壁纸（mjpeg）
+  clockWallpaperPath: string; // 时钟动态壁纸（mjpeg）
 }
 
 export interface AppSettings {
@@ -233,6 +235,8 @@ class SettingsService {
       maxFileSize: 2, // 2MB
       autoCompress: true, // 自动压缩
       maxPhotoCount: 20, // 最多20张照片
+      homeWallpaperPath: '',
+      clockWallpaperPath: '',
     };
   }
 
@@ -287,6 +291,24 @@ class SettingsService {
   updateAutoCompress(autoCompress: boolean): void {
     const settings = this.getPhotoSettings();
     settings.autoCompress = autoCompress;
+    this.savePhotoSettings(settings);
+  }
+
+  /**
+   * 更新主页动态壁纸
+   */
+  updateHomeWallpaperPath(homeWallpaperPath: string): void {
+    const settings = this.getPhotoSettings();
+    settings.homeWallpaperPath = homeWallpaperPath;
+    this.savePhotoSettings(settings);
+  }
+
+  /**
+   * 更新时钟动态壁纸
+   */
+  updateClockWallpaperPath(clockWallpaperPath: string): void {
+    const settings = this.getPhotoSettings();
+    settings.clockWallpaperPath = clockWallpaperPath;
     this.savePhotoSettings(settings);
   }
 }

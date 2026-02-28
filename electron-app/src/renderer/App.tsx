@@ -105,9 +105,12 @@ function App() {
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          console.log('[Control Panel] 收到消息:', data.type);
+          const type = data?.type as string;
+          if (type !== 'system_stats' && type !== 'device_heartbeat' && type !== 'photo_state') {
+            console.log('[Control Panel] 收到消息:', type);
+          }
 
-          switch (data.type) {
+          switch (type) {
             case 'handshake_ack':
               addMessage('success', `握手成功 - 服务器版本: ${data.data.serverVersion}`);
               break;
@@ -138,9 +141,17 @@ function App() {
               handleConnectedDevices(data.data);
               break;
 
+            case 'photo_state':
+            case 'voice_command_event':
+            case 'photo_control_ack':
+            case 'sd_list_response':
+            case 'sd_delete_response':
+              // 控制面板可接收这些消息，但目前无需在主面板展示
+              break;
+
             default:
-              console.log('[Control Panel] 未知消息类型:', data.type);
-              addMessage('info', `收到消息: ${data.type}`);
+              console.log('[Control Panel] 未处理消息类型:', type);
+              addMessage('info', `收到消息: ${type}`);
           }
         } catch (error) {
           console.error('Error parsing message:', error);

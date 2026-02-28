@@ -7,6 +7,8 @@
 #include <Preferences.h>
 #include <SD_MMC.h>
 #include <esp_heap_caps.h>
+#include <esp_system.h>
+#include <driver/i2s.h>
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
@@ -41,8 +43,9 @@ enum UiPage {
   UI_PAGE_APP_LAUNCHER = 7,
   UI_PAGE_PHOTO_FRAME = 8,
   UI_PAGE_AUDIO_PLAYER = 9,
-  UI_PAGE_VOICE = 10,
-  UI_PAGE_COUNT = 11
+  UI_PAGE_VIDEO_PLAYER = 10,
+  UI_PAGE_VOICE = 11,
+  UI_PAGE_COUNT = 12
 };
 
 struct TouchGestureState {
@@ -100,6 +103,7 @@ static const HomeShortcutConfig HOME_SHORTCUTS[] = {
   {"Clock", LV_SYMBOL_REFRESH, HOME_ICON_CLOCK, UI_PAGE_CLOCK, 0x1E88E5},
   {"Apps", LV_SYMBOL_BARS, HOME_ICON_APPS, UI_PAGE_APP_LAUNCHER, 0x5E35B1},
   {"Music", LV_SYMBOL_AUDIO, HOME_ICON_SYMBOL, UI_PAGE_AUDIO_PLAYER, 0x43A047},
+  {"Video", LV_SYMBOL_PLAY, HOME_ICON_SYMBOL, UI_PAGE_VIDEO_PLAYER, 0xFB8C00},
   {"Voice", LV_SYMBOL_CALL, HOME_ICON_SYMBOL, UI_PAGE_VOICE, 0x00897B},
   {"Inbox", LV_SYMBOL_LIST, HOME_ICON_SYMBOL, UI_PAGE_INBOX, 0x546E7A},
 };
@@ -190,8 +194,44 @@ static lv_obj_t *audioPlayBtn = nullptr;
 static lv_obj_t *audioPlayBtnLabel = nullptr;
 static lv_obj_t *audioNextBtn = nullptr;
 
+static lv_obj_t *homeWallpaperImage = nullptr;
+static lv_obj_t *clockWallpaperImage = nullptr;
+static lv_obj_t *homeWallpaperShade = nullptr;
+static lv_obj_t *clockWallpaperShade = nullptr;
+
+static lv_obj_t *videoStatusLabel = nullptr;
+static lv_obj_t *videoTrackLabel = nullptr;
+static lv_obj_t *videoHintLabel = nullptr;
+static lv_obj_t *videoIndexLabel = nullptr;
+static lv_obj_t *videoViewport = nullptr;
+static lv_obj_t *videoImage = nullptr;
+static lv_obj_t *videoPrevBtn = nullptr;
+static lv_obj_t *videoPlayBtn = nullptr;
+static lv_obj_t *videoPlayBtnLabel = nullptr;
+static lv_obj_t *videoNextBtn = nullptr;
+
 static lv_obj_t *voiceStatusLabel = nullptr;
 static lv_obj_t *voiceResultLabel = nullptr;
+static lv_obj_t *voiceMicToggleBtn = nullptr;
+static lv_obj_t *voiceMicToggleLabel = nullptr;
+
+static constexpr i2s_port_t VOICE_I2S_PORT = I2S_NUM_1;
+static constexpr uint32_t VOICE_SAMPLE_RATE = 16000;
+static constexpr size_t VOICE_SAMPLES_PER_CHUNK = 640; // 40ms @ 16kHz
+static constexpr size_t VOICE_PCM_BYTES_PER_CHUNK = VOICE_SAMPLES_PER_CHUNK * sizeof(int16_t);
+static bool voiceMicInitialized = false;
+static bool voiceMicStreaming = false;
+static bool voiceStreamStartAcked = false;
+static char voiceActiveStreamId[40] = "";
+static uint32_t voiceChunkSeq = 0;
+static uint32_t voiceChunksSent = 0;
+static uint32_t voiceBytesSent = 0;
+static uint32_t voiceLastChunkMs = 0;
+static uint32_t voiceLastStartSentMs = 0;
+static uint8_t voiceLastLevelPercent = 0;
+static int32_t voiceRawChunk[VOICE_SAMPLES_PER_CHUNK * 2];
+static int32_t voiceMonoRaw[VOICE_SAMPLES_PER_CHUNK];
+static int16_t voicePcmChunk[VOICE_SAMPLES_PER_CHUNK];
 
 struct VoicePresetCommand {
   const char *label;
@@ -291,6 +331,67 @@ enum AudioControlAction {
 
 static volatile int pendingAudioControlAction = AUDIO_CONTROL_NONE;
 
+struct SdVideoFile {
+  char path[192];
+  char name[64];
+  uint32_t size;
+};
+
+static SdVideoFile sdVideoFiles[64];
+static int sdVideoCount = 0;
+static int sdVideoIndex = 0;
+static File videoFile;
+static bool videoPlaying = false;
+static bool videoPaused = false;
+static uint8_t *videoFrameData = nullptr;
+static size_t videoFrameDataSize = 0;
+static uint8_t *videoDecodedData = nullptr;
+static size_t videoDecodedCapacity = 0;
+static lv_img_dsc_t videoDecodedDsc;
+static uint32_t videoFrameIntervalMs = 100; // 10 FPS default
+static uint32_t videoLastFrameMs = 0;
+static uint32_t videoLastControlMs = 0;
+static constexpr uint32_t VIDEO_CONTROL_COOLDOWN_MS = 220;
+static constexpr size_t VIDEO_FRAME_MAX_BYTES = 512 * 1024;
+static constexpr uint8_t VIDEO_SCAN_MAX_DEPTH = 4;
+
+enum VideoControlAction {
+  VIDEO_CONTROL_NONE = -1,
+  VIDEO_CONTROL_PREV = 0,
+  VIDEO_CONTROL_TOGGLE = 1,
+  VIDEO_CONTROL_NEXT = 2,
+  VIDEO_CONTROL_RESCAN = 3,
+};
+
+static volatile int pendingVideoControlAction = VIDEO_CONTROL_NONE;
+
+struct DynamicWallpaperPlayer {
+  char path[192];
+  File file;
+  lv_obj_t *imageObj;
+  bool enabled;
+  bool opened;
+  uint16_t baseIntervalMs;
+  uint16_t intervalMs;
+  uint32_t lastFrameMs;
+  uint8_t slowScore;
+  uint8_t fastScore;
+  uint8_t failCount;
+};
+
+static DynamicWallpaperPlayer homeWallpaper = {
+  "", File(), nullptr, false, false, 140, 140, 0, 0, 0, 0
+};
+static DynamicWallpaperPlayer clockWallpaper = {
+  "", File(), nullptr, false, false, 160, 160, 0, 0, 0, 0
+};
+
+static uint8_t *wallpaperFrameData = nullptr;
+static size_t wallpaperFrameDataSize = 0;
+static uint32_t dynamicWallpaperPauseUntilMs = 0;
+static constexpr uint32_t DYNAMIC_WALLPAPER_TOUCH_PAUSE_MS = 1200;
+static constexpr uint16_t DYNAMIC_WALLPAPER_MIN_INTERVAL_MS = 333; // ~3 FPS
+
 struct PhotoFrameRemoteSettings {
   uint16_t slideshowIntervalSec = 5;
   bool autoPlay = true;
@@ -298,6 +399,8 @@ struct PhotoFrameRemoteSettings {
   float maxFileSizeMb = 2.0f;
   bool autoCompress = true;
   uint16_t maxPhotoCount = 20;
+  char homeWallpaperPath[192] = "";
+  char clockWallpaperPath[192] = "";
   bool valid = false;
 };
 
@@ -431,6 +534,7 @@ static void attachGestureHandlers(lv_obj_t *obj);
 static void refreshInboxView();
 static void loadSdPhotoList();
 static void showCurrentPhotoFrame();
+static bool ensurePhotoDecoderReady();
 static void requestPhotoFrameSettings(bool force = false);
 static void processPhotoFrameAutoPlay();
 static void sendPhotoFrameState(const char *reason, bool force = false);
@@ -442,20 +546,43 @@ static void processPendingAudioControl();
 static bool startAudioPlayback(int index);
 static void stopAudioPlayback(bool keepStatus = false);
 static void refreshAudioTimeLabel(bool force = false);
+static bool isAudioRunning();
+static void loadSdVideoList();
+static void showCurrentVideoTrack();
+static void processVideoPlayback();
+static void processPendingVideoControl();
+static bool startVideoPlayback(int index);
+static void stopVideoPlayback(bool keepStatus = false);
+static bool readNextMjpegFrame(File &file, uint8_t *dst, size_t dstMaxLen, size_t *outLen, char *reason, size_t reasonSize);
+static bool decodeVideoJpegToTrueColor(const uint8_t *jpegData, size_t jpegSize, lv_img_header_t *header, char *reason, size_t reasonSize);
+static void processDynamicWallpapers();
+static void refreshDynamicWallpaperSources();
+static void prepareDynamicWallpaperForPage(int pageIndex, bool forceFrame = false);
+static void pauseDynamicWallpapersForMs(uint32_t durationMs);
 static void sendSdListResponse(const char *requestId, int offset, int limit);
 static void sendSdDeleteResponse(const char *requestId, const char *targetPath, bool success, const char *reason);
+static void sendSdPreviewResponse(const char *requestId, const char *targetPath, bool success, uint32_t len, const char *reason);
 static void resetSdUploadSession(bool removeTempFile);
 static bool ensureSdParentDirectories(const char *targetPath, char *reason, size_t reasonSize);
 static void sendSdUploadBeginAck(const char *uploadId, bool success, const char *reason);
 static void sendSdUploadChunkAck(const char *uploadId, int seq, bool success, const char *reason);
 static void sendSdUploadCommitAck(const char *uploadId, bool success, const char *finalPath, const char *reason);
 static void sendVoiceCommand(const char *text);
+static bool ensureVoiceMicReady(char *reason, size_t reasonSize);
+static void releaseVoiceMic();
+static void setVoiceMicStreaming(bool enabled, const char *reason, bool notifyServer = true);
+static void sendVoiceStreamStart();
+static void sendVoiceStreamStop(const char *reason);
+static void sendVoiceStreamChunkMeta(size_t byteLen, uint8_t levelPercent);
+static void processVoiceMicStreaming();
 static int parseUiPageFromVoiceName(const char *name);
 static bool shouldSuppressClick();
 static void suppressClicksForMs(uint32_t durationMs);
 static void suppressClicksAfterHome();
 static void homeShortcutEventCallback(lv_event_t *e);
 static void voiceCommandButtonCallback(lv_event_t *e);
+static void voiceMicToggleCallback(lv_event_t *e);
+static void videoControlCallback(lv_event_t *e);
 static void renderHomeShortcutIcon(uint8_t slotIdx, const HomeShortcutConfig &item);
 static void refreshHomeShortcutSlots();
 static void shiftHomeCarousel(int delta);
@@ -831,6 +958,10 @@ static void detectAndScanSdCard() {
   if (!mounted) {
     copyText(sdMountReason, sizeof(sdMountReason), "mount failed");
     Serial.println("[SD] mount failed");
+    refreshDynamicWallpaperSources();
+    if (pages[UI_PAGE_HOME] != nullptr) {
+      prepareDynamicWallpaperForPage(currentPage, true);
+    }
     return;
   }
 
@@ -839,6 +970,10 @@ static void detectAndScanSdCard() {
     SD_MMC.end();
     copyText(sdMountReason, sizeof(sdMountReason), "no card");
     Serial.println("[SD] no card");
+    refreshDynamicWallpaperSources();
+    if (pages[UI_PAGE_HOME] != nullptr) {
+      prepareDynamicWallpaperForPage(currentPage, true);
+    }
     return;
   }
 
@@ -863,6 +998,10 @@ static void detectAndScanSdCard() {
     (unsigned long)sdRootFileCount,
     sdRootPreview
   );
+  refreshDynamicWallpaperSources();
+  if (pages[UI_PAGE_HOME] != nullptr) {
+    prepareDynamicWallpaperForPage(currentPage, true);
+  }
 }
 
 static bool equalsIgnoreCase(const char *a, const char *b) {
@@ -927,6 +1066,209 @@ static bool hasVideoExtension(const char *path) {
          equalsIgnoreCase(dot, ".avi") ||
          equalsIgnoreCase(dot, ".mjpeg") ||
          equalsIgnoreCase(dot, ".mjpg");
+}
+
+static bool hasMjpegPlaybackExtension(const char *path) {
+  if (path == nullptr) {
+    return false;
+  }
+
+  const char *dot = strrchr(path, '.');
+  if (dot == nullptr) {
+    return false;
+  }
+
+  return equalsIgnoreCase(dot, ".mjpeg") || equalsIgnoreCase(dot, ".mjpg");
+}
+
+static bool pickFirstExistingPath(const char *const *candidates, size_t count, char *outPath, size_t outSize) {
+  if (outPath == nullptr || outSize == 0) {
+    return false;
+  }
+  outPath[0] = '\0';
+
+  if (!sdMounted || candidates == nullptr || count == 0) {
+    return false;
+  }
+
+  for (size_t i = 0; i < count; ++i) {
+    const char *candidate = candidates[i];
+    if (candidate == nullptr || candidate[0] == '\0') {
+      continue;
+    }
+    if (SD_MMC.exists(candidate)) {
+      copyText(outPath, outSize, candidate);
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool findFirstMjpegInDirectory(const char *dirPath, int depth, char *outPath, size_t outSize) {
+  if (outPath == nullptr || outSize == 0) {
+    return false;
+  }
+  outPath[0] = '\0';
+  if (!sdMounted || dirPath == nullptr || depth > 3) {
+    return false;
+  }
+
+  File dir = SD_MMC.open(dirPath);
+  if (!dir || !dir.isDirectory()) {
+    return false;
+  }
+
+  bool found = false;
+  while (!found) {
+    File entry = dir.openNextFile();
+    if (!entry) {
+      break;
+    }
+
+    const char *entryPath = entry.path();
+    if (entryPath != nullptr && entryPath[0] != '\0') {
+      char childPath[192];
+      if (entryPath[0] == '/') {
+        copyText(childPath, sizeof(childPath), entryPath);
+      } else if (strcmp(dirPath, "/") == 0) {
+        snprintf(childPath, sizeof(childPath), "/%s", entryPath);
+      } else {
+        snprintf(childPath, sizeof(childPath), "%s/%s", dirPath, entryPath);
+      }
+
+      if (entry.isDirectory()) {
+        if (depth < 3 && findFirstMjpegInDirectory(childPath, depth + 1, outPath, outSize)) {
+          found = true;
+        }
+      } else if (hasMjpegPlaybackExtension(childPath)) {
+        copyText(outPath, outSize, childPath);
+        found = true;
+      }
+    }
+    entry.close();
+  }
+
+  dir.close();
+  return found;
+}
+
+static void closeDynamicWallpaper(DynamicWallpaperPlayer &player) {
+  if (player.file) {
+    player.file.close();
+  }
+  player.opened = false;
+}
+
+static bool ensureWallpaperFrameBuffer() {
+  if (wallpaperFrameData != nullptr) {
+    return true;
+  }
+
+  wallpaperFrameData = (uint8_t *)heap_caps_malloc(VIDEO_FRAME_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (wallpaperFrameData == nullptr) {
+    wallpaperFrameData = (uint8_t *)malloc(VIDEO_FRAME_MAX_BYTES);
+  }
+  if (wallpaperFrameData == nullptr) {
+    return false;
+  }
+  wallpaperFrameDataSize = 0;
+  return true;
+}
+
+static bool openDynamicWallpaper(DynamicWallpaperPlayer &player) {
+  if (!player.enabled || player.path[0] == '\0' || !sdMounted) {
+    return false;
+  }
+  if (player.opened && player.file) {
+    return true;
+  }
+
+  closeDynamicWallpaper(player);
+  player.file = SD_MMC.open(player.path, FILE_READ);
+  if (!player.file) {
+    player.opened = false;
+    player.failCount = 0;
+    return false;
+  }
+
+  player.opened = true;
+  player.lastFrameMs = 0;
+  player.slowScore = 0;
+  player.fastScore = 0;
+  player.failCount = 0;
+  player.intervalMs = player.baseIntervalMs;
+  return true;
+}
+
+static bool renderNextDynamicWallpaperFrame(DynamicWallpaperPlayer &player, bool allowLoop, char *reason, size_t reasonSize) {
+  if (reason != nullptr && reasonSize > 0) {
+    reason[0] = '\0';
+  }
+
+  if (!player.enabled || player.imageObj == nullptr) {
+    copyText(reason, reasonSize, "wallpaper disabled");
+    return false;
+  }
+  if (!openDynamicWallpaper(player)) {
+    copyText(reason, reasonSize, "open wallpaper failed");
+    return false;
+  }
+  if (!ensurePhotoDecoderReady()) {
+    copyText(reason, reasonSize, "jpeg decoder not ready");
+    return false;
+  }
+  if (!ensureWallpaperFrameBuffer()) {
+    copyText(reason, reasonSize, "frame buffer OOM");
+    return false;
+  }
+
+  size_t frameSize = 0;
+  char frameReason[48];
+  if (!readNextMjpegFrame(player.file, wallpaperFrameData, VIDEO_FRAME_MAX_BYTES, &frameSize, frameReason, sizeof(frameReason))) {
+    if (allowLoop) {
+      player.file.seek(0);
+      if (!readNextMjpegFrame(player.file, wallpaperFrameData, VIDEO_FRAME_MAX_BYTES, &frameSize, frameReason, sizeof(frameReason))) {
+        copyText(reason, reasonSize, frameReason);
+        return false;
+      }
+    } else {
+      copyText(reason, reasonSize, frameReason);
+      return false;
+    }
+  }
+
+  lv_img_header_t frameHeader;
+  if (!decodeVideoJpegToTrueColor(wallpaperFrameData, frameSize, &frameHeader, frameReason, sizeof(frameReason))) {
+    copyText(reason, reasonSize, frameReason);
+    return false;
+  }
+
+  wallpaperFrameDataSize = frameSize;
+  lv_img_set_src(player.imageObj, nullptr);
+  lv_img_set_src(player.imageObj, (const void *)&videoDecodedDsc);
+
+  int32_t viewportW = 360;
+  int32_t viewportH = 360;
+  int32_t zoomW = (viewportW * 256) / frameHeader.w;
+  int32_t zoomH = (viewportH * 256) / frameHeader.h;
+  int32_t zoom = (zoomW > zoomH) ? zoomW : zoomH; // cover
+  if (zoom > 512) zoom = 512;
+  if (zoom < 16) zoom = 16;
+
+  lv_obj_set_size(player.imageObj, frameHeader.w, frameHeader.h);
+  lv_img_set_pivot(player.imageObj, frameHeader.w / 2, frameHeader.h / 2);
+  lv_img_set_zoom(player.imageObj, (uint16_t)zoom);
+  lv_obj_center(player.imageObj);
+  return true;
+}
+
+static void resetDynamicWallpaperPlayer(DynamicWallpaperPlayer &player) {
+  closeDynamicWallpaper(player);
+  player.lastFrameMs = 0;
+  player.slowScore = 0;
+  player.fastScore = 0;
+  player.failCount = 0;
+  player.intervalMs = player.baseIntervalMs;
 }
 
 static const char *classifySdFileType(const char *path) {
@@ -1615,6 +1957,833 @@ static void photoFrameControlCallback(lv_event_t *e) {
       showCurrentPhotoFrame();
       lastPhotoAutoAdvanceMs = millis();
     }
+  }
+}
+
+static void setVideoStatus(const char *text, lv_color_t color) {
+  if (videoStatusLabel == nullptr) {
+    return;
+  }
+  lv_label_set_text(videoStatusLabel, text == nullptr ? "" : text);
+  lv_obj_set_style_text_color(videoStatusLabel, color, LV_PART_MAIN);
+}
+
+static void setVideoButtonEnabled(lv_obj_t *btn, bool enabled) {
+  if (btn == nullptr) {
+    return;
+  }
+  if (enabled) {
+    lv_obj_clear_state(btn, LV_STATE_DISABLED);
+  } else {
+    lv_obj_add_state(btn, LV_STATE_DISABLED);
+  }
+}
+
+static void updateVideoControlButtons(bool hasTracks) {
+  bool canStepTrack = hasTracks && sdVideoCount > 1;
+  setVideoButtonEnabled(videoPlayBtn, hasTracks);
+  setVideoButtonEnabled(videoPrevBtn, canStepTrack);
+  setVideoButtonEnabled(videoNextBtn, canStepTrack);
+  if (videoPlayBtnLabel != nullptr) {
+    lv_label_set_text(videoPlayBtnLabel, (videoPlaying && !videoPaused) ? "Pause" : "Play");
+  }
+}
+
+static void addVideoCandidate(const char *path, uint32_t size) {
+  if (path == nullptr || path[0] == '\0') {
+    return;
+  }
+  if (sdVideoCount >= (int)(sizeof(sdVideoFiles) / sizeof(sdVideoFiles[0]))) {
+    return;
+  }
+  if (!hasMjpegPlaybackExtension(path)) {
+    return;
+  }
+
+  SdVideoFile &target = sdVideoFiles[sdVideoCount];
+  copyText(target.path, sizeof(target.path), path);
+  copyText(target.name, sizeof(target.name), baseNameFromPath(path));
+  target.size = size;
+  sdVideoCount++;
+}
+
+static void scanVideoDirectoryRecursive(const char *dirPath, int depth) {
+  if (dirPath == nullptr || depth > VIDEO_SCAN_MAX_DEPTH) {
+    return;
+  }
+  if (sdVideoCount >= (int)(sizeof(sdVideoFiles) / sizeof(sdVideoFiles[0]))) {
+    return;
+  }
+
+  File dir = SD_MMC.open(dirPath);
+  if (!dir || !dir.isDirectory()) {
+    return;
+  }
+
+  while (sdVideoCount < (int)(sizeof(sdVideoFiles) / sizeof(sdVideoFiles[0]))) {
+    File entry = dir.openNextFile();
+    if (!entry) {
+      break;
+    }
+
+    const char *entryPath = entry.path();
+    if (entryPath != nullptr && entryPath[0] != '\0') {
+      char childPath[192];
+      if (entryPath[0] == '/') {
+        copyText(childPath, sizeof(childPath), entryPath);
+      } else if (strcmp(dirPath, "/") == 0) {
+        snprintf(childPath, sizeof(childPath), "/%s", entryPath);
+      } else {
+        snprintf(childPath, sizeof(childPath), "%s/%s", dirPath, entryPath);
+      }
+
+      if (entry.isDirectory()) {
+        scanVideoDirectoryRecursive(childPath, depth + 1);
+      } else {
+        addVideoCandidate(childPath, (uint32_t)entry.size());
+      }
+    }
+    entry.close();
+  }
+  dir.close();
+}
+
+static bool ensureVideoFrameBuffer() {
+  if (videoFrameData != nullptr) {
+    return true;
+  }
+
+  videoFrameData = (uint8_t *)heap_caps_malloc(VIDEO_FRAME_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (videoFrameData == nullptr) {
+    videoFrameData = (uint8_t *)malloc(VIDEO_FRAME_MAX_BYTES);
+  }
+  if (videoFrameData == nullptr) {
+    return false;
+  }
+  videoFrameDataSize = 0;
+  return true;
+}
+
+static bool readNextMjpegFrame(File &file, uint8_t *dst, size_t dstMaxLen, size_t *outLen, char *reason, size_t reasonSize) {
+  if (outLen != nullptr) {
+    *outLen = 0;
+  }
+  if (reason != nullptr && reasonSize > 0) {
+    reason[0] = '\0';
+  }
+
+  if (!file || dst == nullptr || dstMaxLen < 4 || outLen == nullptr) {
+    copyText(reason, reasonSize, "invalid frame buffer");
+    return false;
+  }
+
+  bool inFrame = false;
+  uint8_t prev = 0;
+  size_t len = 0;
+
+  while (file.available()) {
+    int c = file.read();
+    if (c < 0) {
+      break;
+    }
+    uint8_t b = (uint8_t)c;
+
+    if (!inFrame) {
+      if (prev == 0xFF && b == 0xD8) {
+        inFrame = true;
+        len = 0;
+        dst[len++] = 0xFF;
+        dst[len++] = 0xD8;
+      }
+    } else {
+      if (len >= dstMaxLen) {
+        copyText(reason, reasonSize, "frame too large");
+        return false;
+      }
+      dst[len++] = b;
+      if (prev == 0xFF && b == 0xD9) {
+        *outLen = len;
+        return true;
+      }
+    }
+
+    prev = b;
+  }
+
+  copyText(reason, reasonSize, inFrame ? "incomplete frame" : "no frame found");
+  return false;
+}
+
+#if LV_USE_SJPG
+struct VideoJpegDecodeContext {
+  const uint8_t *source = nullptr;
+  size_t sourceSize = 0;
+  size_t sourcePos = 0;
+  lv_color_t *target = nullptr;
+  uint16_t targetW = 0;
+  uint16_t targetH = 0;
+};
+
+static size_t videoJpegInputCallback(JDEC *jd, uint8_t *buff, size_t ndata) {
+  if (jd == nullptr) {
+    return 0;
+  }
+  VideoJpegDecodeContext *ctx = (VideoJpegDecodeContext *)jd->device;
+  if (ctx == nullptr || ctx->source == nullptr || ctx->sourcePos >= ctx->sourceSize) {
+    return 0;
+  }
+
+  size_t remain = ctx->sourceSize - ctx->sourcePos;
+  size_t readSize = (ndata < remain) ? ndata : remain;
+  if (buff != nullptr) {
+    memcpy(buff, ctx->source + ctx->sourcePos, readSize);
+  }
+  ctx->sourcePos += readSize;
+  return readSize;
+}
+
+static int videoJpegOutputCallback(JDEC *jd, void *bitmap, JRECT *rect) {
+  if (jd == nullptr || bitmap == nullptr || rect == nullptr) {
+    return 0;
+  }
+  VideoJpegDecodeContext *ctx = (VideoJpegDecodeContext *)jd->device;
+  if (ctx == nullptr || ctx->target == nullptr) {
+    return 0;
+  }
+
+#if JD_FORMAT != 0
+  return 0;
+#else
+  const uint8_t *src = (const uint8_t *)bitmap;
+  for (uint16_t y = rect->top; y <= rect->bottom; ++y) {
+    if (y >= ctx->targetH) {
+      src += (size_t)(rect->right - rect->left + 1) * 3;
+      continue;
+    }
+    size_t dstBase = (size_t)y * ctx->targetW;
+    for (uint16_t x = rect->left; x <= rect->right; ++x) {
+      if (x < ctx->targetW) {
+        ctx->target[dstBase + x] = lv_color_make(src[0], src[1], src[2]);
+      }
+      src += 3;
+    }
+  }
+  return 1;
+#endif
+}
+#endif
+
+static bool decodeVideoJpegToTrueColor(const uint8_t *jpegData, size_t jpegSize, lv_img_header_t *header, char *reason, size_t reasonSize) {
+  if (header == nullptr) {
+    copyText(reason, reasonSize, "invalid header");
+    return false;
+  }
+
+#if LV_USE_SJPG
+  if (jpegData == nullptr || jpegSize == 0) {
+    copyText(reason, reasonSize, "jpeg bytes missing");
+    return false;
+  }
+
+#if JD_FORMAT != 0
+  copyText(reason, reasonSize, "JD_FORMAT unsupported");
+  return false;
+#else
+  static constexpr size_t kWorkBufSize = 4096;
+  uint8_t *workBuf = (uint8_t *)heap_caps_malloc(kWorkBufSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (workBuf == nullptr) {
+    workBuf = (uint8_t *)malloc(kWorkBufSize);
+  }
+  if (workBuf == nullptr) {
+    copyText(reason, reasonSize, "jpeg workbuf OOM");
+    return false;
+  }
+
+  VideoJpegDecodeContext ctx;
+  ctx.source = jpegData;
+  ctx.sourceSize = jpegSize;
+  ctx.sourcePos = 0;
+
+  JDEC decoder;
+  JRESULT rc = jd_prepare(&decoder, videoJpegInputCallback, workBuf, kWorkBufSize, &ctx);
+  if (rc != JDR_OK) {
+    free(workBuf);
+    char text[48];
+    snprintf(text, sizeof(text), "jpeg prepare failed (%d)", (int)rc);
+    copyText(reason, reasonSize, text);
+    return false;
+  }
+
+  uint8_t scale = choosePhotoJpegScale(decoder.width, decoder.height);
+  uint16_t scaledW = (uint16_t)((decoder.width + ((1U << scale) - 1U)) >> scale);
+  uint16_t scaledH = (uint16_t)((decoder.height + ((1U << scale) - 1U)) >> scale);
+  if (scaledW == 0 || scaledH == 0) {
+    free(workBuf);
+    copyText(reason, reasonSize, "jpeg size invalid");
+    return false;
+  }
+
+  size_t requiredBytes = (size_t)scaledW * scaledH * sizeof(lv_color_t);
+  if (requiredBytes == 0 || requiredBytes > 900000UL) {
+    free(workBuf);
+    copyText(reason, reasonSize, "jpeg frame too large");
+    return false;
+  }
+
+  if (videoDecodedData == nullptr || videoDecodedCapacity < requiredBytes) {
+    if (videoDecodedData != nullptr) {
+      free(videoDecodedData);
+      videoDecodedData = nullptr;
+      videoDecodedCapacity = 0;
+    }
+    videoDecodedData = (uint8_t *)heap_caps_malloc(requiredBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (videoDecodedData == nullptr) {
+      videoDecodedData = (uint8_t *)malloc(requiredBytes);
+    }
+    if (videoDecodedData == nullptr) {
+      free(workBuf);
+      copyText(reason, reasonSize, "jpeg framebuf OOM");
+      return false;
+    }
+    videoDecodedCapacity = requiredBytes;
+  }
+
+  ctx.sourcePos = 0;
+  ctx.target = (lv_color_t *)videoDecodedData;
+  ctx.targetW = scaledW;
+  ctx.targetH = scaledH;
+
+  rc = jd_prepare(&decoder, videoJpegInputCallback, workBuf, kWorkBufSize, &ctx);
+  if (rc != JDR_OK) {
+    free(workBuf);
+    char text[48];
+    snprintf(text, sizeof(text), "jpeg reopen failed (%d)", (int)rc);
+    copyText(reason, reasonSize, text);
+    return false;
+  }
+
+  rc = jd_decomp(&decoder, videoJpegOutputCallback, scale);
+  free(workBuf);
+  if (rc != JDR_OK) {
+    char text[48];
+    snprintf(text, sizeof(text), "jpeg decomp failed (%d)", (int)rc);
+    copyText(reason, reasonSize, text);
+    return false;
+  }
+
+  memset(&videoDecodedDsc, 0, sizeof(videoDecodedDsc));
+  videoDecodedDsc.header.always_zero = 0;
+  videoDecodedDsc.header.w = scaledW;
+  videoDecodedDsc.header.h = scaledH;
+  videoDecodedDsc.header.cf = LV_IMG_CF_TRUE_COLOR;
+  videoDecodedDsc.data_size = (uint32_t)requiredBytes;
+  videoDecodedDsc.data = videoDecodedData;
+
+  header->always_zero = 0;
+  header->w = scaledW;
+  header->h = scaledH;
+  header->cf = LV_IMG_CF_TRUE_COLOR;
+  return true;
+#endif
+#else
+  copyText(reason, reasonSize, "sjpg disabled");
+  return false;
+#endif
+}
+
+static bool renderNextVideoFrame(bool allowLoop, char *reason, size_t reasonSize) {
+  if (reason != nullptr && reasonSize > 0) {
+    reason[0] = '\0';
+  }
+
+  if (!videoFile) {
+    copyText(reason, reasonSize, "video file not open");
+    return false;
+  }
+  if (!ensurePhotoDecoderReady()) {
+    copyText(reason, reasonSize, "jpeg decoder not ready");
+    return false;
+  }
+  if (!ensureVideoFrameBuffer()) {
+    copyText(reason, reasonSize, "frame buffer OOM");
+    return false;
+  }
+
+  size_t frameSize = 0;
+  char frameReason[48];
+  if (!readNextMjpegFrame(videoFile, videoFrameData, VIDEO_FRAME_MAX_BYTES, &frameSize, frameReason, sizeof(frameReason))) {
+    if (allowLoop) {
+      videoFile.seek(0);
+      if (!readNextMjpegFrame(videoFile, videoFrameData, VIDEO_FRAME_MAX_BYTES, &frameSize, frameReason, sizeof(frameReason))) {
+        copyText(reason, reasonSize, frameReason);
+        return false;
+      }
+    } else {
+      copyText(reason, reasonSize, frameReason);
+      return false;
+    }
+  }
+
+  lv_img_header_t frameHeader;
+  if (!decodeVideoJpegToTrueColor(videoFrameData, frameSize, &frameHeader, frameReason, sizeof(frameReason))) {
+    copyText(reason, reasonSize, frameReason);
+    return false;
+  }
+
+  videoFrameDataSize = frameSize;
+  if (videoImage != nullptr) {
+    lv_img_set_src(videoImage, nullptr);
+    lv_img_set_src(videoImage, (const void *)&videoDecodedDsc);
+
+    int32_t viewportW = 288;
+    int32_t viewportH = 196;
+    if (videoViewport != nullptr) {
+      int32_t w = lv_obj_get_content_width(videoViewport);
+      int32_t h = lv_obj_get_content_height(videoViewport);
+      if (w > 0) viewportW = w;
+      if (h > 0) viewportH = h;
+    }
+
+    int32_t zoomW = (viewportW * 256) / frameHeader.w;
+    int32_t zoomH = (viewportH * 256) / frameHeader.h;
+    int32_t zoom = (zoomW < zoomH) ? zoomW : zoomH;
+    if (zoom > 256) zoom = 256;
+    if (zoom < 16) zoom = 16;
+
+    lv_obj_set_size(videoImage, frameHeader.w, frameHeader.h);
+    lv_img_set_pivot(videoImage, frameHeader.w / 2, frameHeader.h / 2);
+    lv_img_set_zoom(videoImage, (uint16_t)zoom);
+    lv_obj_center(videoImage);
+  }
+  return true;
+}
+
+static void stopVideoPlayback(bool keepStatus) {
+  if (videoFile) {
+    videoFile.close();
+  }
+  videoPlaying = false;
+  videoPaused = false;
+  videoFrameDataSize = 0;
+  videoLastFrameMs = 0;
+  updateVideoControlButtons(sdVideoCount > 0);
+
+  if (!keepStatus) {
+    setVideoStatus("Stopped", lv_color_hex(0xFFB74D));
+  }
+}
+
+static void showCurrentVideoTrack() {
+  if (videoTrackLabel == nullptr || videoIndexLabel == nullptr) {
+    return;
+  }
+
+  if (!sdMounted) {
+    lv_label_set_text(videoTrackLabel, "No SD card");
+    lv_label_set_text(videoIndexLabel, "0/0");
+    setVideoStatus("SD not mounted", lv_color_hex(0xEF5350));
+    updateVideoControlButtons(false);
+    return;
+  }
+
+  if (sdVideoCount <= 0) {
+    lv_label_set_text(videoTrackLabel, "No MJPEG files on SD");
+    lv_label_set_text(videoIndexLabel, "0/0");
+    setVideoStatus("Supports .mjpeg/.mjpg", lv_color_hex(0xFFB74D));
+    updateVideoControlButtons(false);
+    return;
+  }
+
+  if (sdVideoIndex < 0) {
+    sdVideoIndex = 0;
+  }
+  if (sdVideoIndex >= sdVideoCount) {
+    sdVideoIndex = sdVideoCount - 1;
+  }
+
+  lv_label_set_text(videoTrackLabel, sdVideoFiles[sdVideoIndex].name);
+  lv_label_set_text_fmt(videoIndexLabel, "%d/%d", sdVideoIndex + 1, sdVideoCount);
+  if (videoPlaying) {
+    setVideoStatus(videoPaused ? "Paused" : "Playing MJPEG", videoPaused ? lv_color_hex(0xFFB74D) : lv_color_hex(0x81C784));
+  } else {
+    setVideoStatus("Ready", lv_color_hex(0x90CAF9));
+  }
+  updateVideoControlButtons(true);
+}
+
+static void loadSdVideoList() {
+  stopVideoPlayback(true);
+  sdVideoCount = 0;
+  sdVideoIndex = 0;
+
+  if (!sdMounted) {
+    showCurrentVideoTrack();
+    return;
+  }
+
+  scanVideoDirectoryRecursive("/", 0);
+  Serial.printf("[Video] scanned %d mjpeg files (.mjpeg/.mjpg)\n", sdVideoCount);
+  showCurrentVideoTrack();
+}
+
+static bool startVideoPlayback(int index) {
+  if (!sdMounted) {
+    setVideoStatus("SD not mounted", lv_color_hex(0xEF5350));
+    return false;
+  }
+  if (sdVideoCount <= 0) {
+    setVideoStatus("No MJPEG files", lv_color_hex(0xFFB74D));
+    return false;
+  }
+  if (index < 0 || index >= sdVideoCount) {
+    return false;
+  }
+
+  stopVideoPlayback(true);
+  if (!ensureVideoFrameBuffer()) {
+    setVideoStatus("Frame buffer OOM", lv_color_hex(0xEF5350));
+    return false;
+  }
+
+  videoFile = SD_MMC.open(sdVideoFiles[index].path, FILE_READ);
+  if (!videoFile) {
+    setVideoStatus("Open video failed", lv_color_hex(0xEF5350));
+    return false;
+  }
+
+  sdVideoIndex = index;
+  videoPlaying = true;
+  videoPaused = false;
+  videoLastFrameMs = 0;
+
+  char reason[64];
+  if (!renderNextVideoFrame(true, reason, sizeof(reason))) {
+    stopVideoPlayback(true);
+    char status[88];
+    snprintf(status, sizeof(status), "Decode failed: %s", reason[0] == '\0' ? "invalid mjpeg" : reason);
+    setVideoStatus(status, lv_color_hex(0xEF5350));
+    return false;
+  }
+
+  showCurrentVideoTrack();
+  videoLastFrameMs = millis();
+  pushInboxMessage("event", "Video playback", sdVideoFiles[sdVideoIndex].name);
+  return true;
+}
+
+static void processVideoPlayback() {
+  if (!videoPlaying || videoPaused) {
+    return;
+  }
+
+  uint32_t now = millis();
+  if (videoLastFrameMs != 0 && (uint32_t)(now - videoLastFrameMs) < videoFrameIntervalMs) {
+    return;
+  }
+
+  char reason[64];
+  if (!renderNextVideoFrame(true, reason, sizeof(reason))) {
+    stopVideoPlayback(true);
+    char status[88];
+    snprintf(status, sizeof(status), "Playback stopped: %s", reason[0] == '\0' ? "decode error" : reason);
+    setVideoStatus(status, lv_color_hex(0xEF5350));
+    return;
+  }
+
+  videoLastFrameMs = now;
+}
+
+static void processPendingVideoControl() {
+  int action = pendingVideoControlAction;
+  if (action == VIDEO_CONTROL_NONE) {
+    return;
+  }
+  pendingVideoControlAction = VIDEO_CONTROL_NONE;
+
+  if (action == VIDEO_CONTROL_RESCAN) {
+    setVideoStatus("Rescanning SD...", lv_color_hex(0x90CAF9));
+    detectAndScanSdCard();
+    loadSdVideoList();
+    return;
+  }
+
+  if (sdVideoCount <= 0) {
+    showCurrentVideoTrack();
+    return;
+  }
+
+  if (action == VIDEO_CONTROL_PREV) {
+    int prev = (sdVideoIndex - 1 + sdVideoCount) % sdVideoCount;
+    startVideoPlayback(prev);
+    return;
+  }
+
+  if (action == VIDEO_CONTROL_NEXT) {
+    int next = (sdVideoIndex + 1) % sdVideoCount;
+    startVideoPlayback(next);
+    return;
+  }
+
+  if (!videoPlaying) {
+    startVideoPlayback(sdVideoIndex);
+    return;
+  }
+
+  videoPaused = !videoPaused;
+  if (videoPaused) {
+    setVideoStatus("Paused", lv_color_hex(0xFFB74D));
+  } else {
+    videoLastFrameMs = 0;
+    setVideoStatus("Playing MJPEG", lv_color_hex(0x81C784));
+  }
+  updateVideoControlButtons(true);
+}
+
+static void videoControlCallback(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  if (shouldSuppressClick()) {
+    return;
+  }
+
+  uint32_t now = millis();
+  if ((uint32_t)(now - videoLastControlMs) < VIDEO_CONTROL_COOLDOWN_MS) {
+    return;
+  }
+  videoLastControlMs = now;
+
+  intptr_t action = (intptr_t)lv_event_get_user_data(e);
+  if (action < VIDEO_CONTROL_PREV || action > VIDEO_CONTROL_RESCAN) {
+    return;
+  }
+  pendingVideoControlAction = (int)action;
+}
+
+static void pauseDynamicWallpapersForMs(uint32_t durationMs) {
+  uint32_t target = millis() + durationMs;
+  if ((int32_t)(target - dynamicWallpaperPauseUntilMs) > 0) {
+    dynamicWallpaperPauseUntilMs = target;
+  }
+}
+
+static void refreshDynamicWallpaperSources() {
+  if (!sdMounted) {
+    homeWallpaper.path[0] = '\0';
+    clockWallpaper.path[0] = '\0';
+    homeWallpaper.enabled = false;
+    clockWallpaper.enabled = false;
+    resetDynamicWallpaperPlayer(homeWallpaper);
+    resetDynamicWallpaperPlayer(clockWallpaper);
+    if (homeWallpaperImage != nullptr) {
+      lv_img_set_src(homeWallpaperImage, nullptr);
+    }
+    if (clockWallpaperImage != nullptr) {
+      lv_img_set_src(clockWallpaperImage, nullptr);
+    }
+    return;
+  }
+
+  static const char *HOME_CANDIDATES[] = {
+    "/night7/boot.mjpeg",
+    "/night7/rhythmbg.mjpeg",
+    "/mjpeg/my0.mjpeg",
+    "/mjpeg/my1.mjpeg",
+    "/mjpeg/极乐净土360.mjpeg",
+  };
+  static const char *CLOCK_CANDIDATES[] = {
+    "/clockbg/clock_elysia360.mjpeg",
+    "/clockbg/clock_fuxuan360.mjpeg",
+    "/clockbg/clock_genshin360.mjpeg",
+  };
+
+  char homePath[192];
+  char clockPath[192];
+  homePath[0] = '\0';
+  clockPath[0] = '\0';
+  bool gotHome = false;
+  bool gotClock = false;
+
+  if (photoFrameSettings.homeWallpaperPath[0] != '\0' &&
+      hasMjpegPlaybackExtension(photoFrameSettings.homeWallpaperPath) &&
+      SD_MMC.exists(photoFrameSettings.homeWallpaperPath)) {
+    copyText(homePath, sizeof(homePath), photoFrameSettings.homeWallpaperPath);
+    gotHome = true;
+  }
+  if (photoFrameSettings.clockWallpaperPath[0] != '\0' &&
+      hasMjpegPlaybackExtension(photoFrameSettings.clockWallpaperPath) &&
+      SD_MMC.exists(photoFrameSettings.clockWallpaperPath)) {
+    copyText(clockPath, sizeof(clockPath), photoFrameSettings.clockWallpaperPath);
+    gotClock = true;
+  }
+
+  if (!gotHome) {
+    gotHome = pickFirstExistingPath(HOME_CANDIDATES, sizeof(HOME_CANDIDATES) / sizeof(HOME_CANDIDATES[0]), homePath, sizeof(homePath));
+  }
+  if (!gotClock) {
+    gotClock = pickFirstExistingPath(CLOCK_CANDIDATES, sizeof(CLOCK_CANDIDATES) / sizeof(CLOCK_CANDIDATES[0]), clockPath, sizeof(clockPath));
+  }
+
+  if (!gotHome) {
+    gotHome = findFirstMjpegInDirectory("/mjpeg", 0, homePath, sizeof(homePath)) ||
+              findFirstMjpegInDirectory("/night7", 0, homePath, sizeof(homePath));
+  }
+  if (!gotClock) {
+    gotClock = findFirstMjpegInDirectory("/clockbg", 0, clockPath, sizeof(clockPath));
+  }
+  if (!gotClock && gotHome) {
+    copyText(clockPath, sizeof(clockPath), homePath);
+    gotClock = true;
+  }
+
+  bool homeChanged = (!gotHome && homeWallpaper.path[0] != '\0') || (gotHome && strcmp(homeWallpaper.path, homePath) != 0);
+  bool clockChanged = (!gotClock && clockWallpaper.path[0] != '\0') || (gotClock && strcmp(clockWallpaper.path, clockPath) != 0);
+  if (homeChanged) {
+    resetDynamicWallpaperPlayer(homeWallpaper);
+  }
+  if (clockChanged) {
+    resetDynamicWallpaperPlayer(clockWallpaper);
+  }
+
+  if (gotHome) {
+    copyText(homeWallpaper.path, sizeof(homeWallpaper.path), homePath);
+    homeWallpaper.enabled = true;
+  } else {
+    homeWallpaper.path[0] = '\0';
+    homeWallpaper.enabled = false;
+    if (homeWallpaperImage != nullptr) {
+      lv_img_set_src(homeWallpaperImage, nullptr);
+    }
+  }
+
+  if (gotClock) {
+    copyText(clockWallpaper.path, sizeof(clockWallpaper.path), clockPath);
+    clockWallpaper.enabled = true;
+  } else {
+    clockWallpaper.path[0] = '\0';
+    clockWallpaper.enabled = false;
+    if (clockWallpaperImage != nullptr) {
+      lv_img_set_src(clockWallpaperImage, nullptr);
+    }
+  }
+
+  Serial.printf(
+    "[Wallpaper] home=%s clock=%s\n",
+    homeWallpaper.enabled ? homeWallpaper.path : "(disabled)",
+    clockWallpaper.enabled ? clockWallpaper.path : "(disabled)"
+  );
+}
+
+static void prepareDynamicWallpaperForPage(int pageIndex, bool forceFrame) {
+  DynamicWallpaperPlayer *target = nullptr;
+  DynamicWallpaperPlayer *other = nullptr;
+  if (pageIndex == UI_PAGE_HOME) {
+    target = &homeWallpaper;
+    other = &clockWallpaper;
+  } else if (pageIndex == UI_PAGE_CLOCK) {
+    target = &clockWallpaper;
+    other = &homeWallpaper;
+  }
+
+  if (target == nullptr) {
+    resetDynamicWallpaperPlayer(homeWallpaper);
+    resetDynamicWallpaperPlayer(clockWallpaper);
+    return;
+  }
+
+  if (other != nullptr) {
+    closeDynamicWallpaper(*other);
+  }
+
+  if (!target->enabled || target->path[0] == '\0' || target->imageObj == nullptr) {
+    return;
+  }
+
+  if (!openDynamicWallpaper(*target)) {
+    return;
+  }
+
+  if (forceFrame) {
+    char reason[64];
+    if (!renderNextDynamicWallpaperFrame(*target, true, reason, sizeof(reason))) {
+      Serial.printf("[Wallpaper] initial frame failed (%s): %s\n", target->path, reason);
+      target->failCount = 1;
+    } else {
+      target->lastFrameMs = millis();
+      target->failCount = 0;
+    }
+  }
+}
+
+static void processDynamicWallpapers() {
+  DynamicWallpaperPlayer *player = nullptr;
+  if (currentPage == UI_PAGE_HOME) {
+    player = &homeWallpaper;
+  } else if (currentPage == UI_PAGE_CLOCK) {
+    player = &clockWallpaper;
+  } else {
+    return;
+  }
+
+  if (player == nullptr || !player->enabled || player->imageObj == nullptr) {
+    return;
+  }
+
+  uint32_t now = millis();
+  if ((int32_t)(now - dynamicWallpaperPauseUntilMs) < 0) {
+    return;
+  }
+
+  if (!openDynamicWallpaper(*player)) {
+    return;
+  }
+
+  uint16_t effectiveInterval = player->intervalMs;
+  if (isAudioRunning() && !audioPaused && effectiveInterval < 280) {
+    effectiveInterval = 280;
+  }
+
+  if (player->lastFrameMs != 0 && (uint32_t)(now - player->lastFrameMs) < effectiveInterval) {
+    return;
+  }
+
+  uint32_t startMs = millis();
+  char reason[64];
+  bool ok = renderNextDynamicWallpaperFrame(*player, true, reason, sizeof(reason));
+  uint32_t decodeMs = millis() - startMs;
+  if (!ok) {
+    player->failCount++;
+    if (player->failCount >= 3) {
+      Serial.printf("[Wallpaper] disabled after repeated failure (%s): %s\n", player->path, reason);
+      player->enabled = false;
+      closeDynamicWallpaper(*player);
+    }
+    return;
+  }
+
+  player->failCount = 0;
+  player->lastFrameMs = millis();
+
+  bool slowFrame = decodeMs >= (uint32_t)(effectiveInterval * 8 / 10) || decodeMs > 110;
+  bool fastFrame = decodeMs <= (uint32_t)(effectiveInterval / 3);
+  if (slowFrame) {
+    if (player->intervalMs < DYNAMIC_WALLPAPER_MIN_INTERVAL_MS) {
+      uint16_t next = player->intervalMs + 24;
+      player->intervalMs = (next > DYNAMIC_WALLPAPER_MIN_INTERVAL_MS) ? DYNAMIC_WALLPAPER_MIN_INTERVAL_MS : next;
+    }
+    if (player->slowScore < 255) player->slowScore++;
+    player->fastScore = 0;
+  } else if (fastFrame) {
+    if (player->fastScore < 255) player->fastScore++;
+    if (player->fastScore >= 20 && player->intervalMs > player->baseIntervalMs) {
+      uint16_t next = (player->intervalMs > 10) ? (player->intervalMs - 10) : player->baseIntervalMs;
+      player->intervalMs = (next < player->baseIntervalMs) ? player->baseIntervalMs : next;
+      player->fastScore = 0;
+    }
+    if (player->slowScore > 0) player->slowScore--;
+  } else {
+    if (player->slowScore > 0) player->slowScore--;
+    if (player->fastScore > 0) player->fastScore--;
   }
 }
 
@@ -2589,6 +3758,30 @@ static void sendSdDeleteResponse(const char *requestId, const char *targetPath, 
   webSocket.sendTXT(output);
 }
 
+static void sendSdPreviewResponse(const char *requestId, const char *targetPath, bool success, uint32_t len, const char *reason) {
+  if (!isConnected) {
+    return;
+  }
+
+  StaticJsonDocument<384> doc;
+  doc["type"] = "sd_preview_response";
+  JsonObject data = doc.createNestedObject("data");
+  data["requestId"] = requestId == nullptr ? "" : requestId;
+  data["deviceId"] = DEVICE_ID;
+  data["path"] = targetPath == nullptr ? "" : targetPath;
+  data["success"] = success;
+  data["len"] = len;
+  data["mime"] = "image/jpeg";
+  data["timestamp"] = millis();
+  if (reason != nullptr && reason[0] != '\0') {
+    data["reason"] = reason;
+  }
+
+  String output;
+  serializeJson(doc, output);
+  webSocket.sendTXT(output);
+}
+
 static void processPendingAudioControl() {
   int action = pendingAudioControlAction;
   if (action == AUDIO_CONTROL_NONE) {
@@ -2699,6 +3892,305 @@ static void voiceCommandButtonCallback(lv_event_t *e) {
     lv_label_set_text_fmt(voiceResultLabel, "Command: %s", preset.text);
   }
   pushInboxMessage("event", "Voice command", preset.text);
+}
+
+static bool ensureVoiceMicReady(char *reason, size_t reasonSize) {
+  if (voiceMicInitialized) {
+    return true;
+  }
+
+  i2s_config_t micConfig = {};
+  micConfig.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
+  micConfig.sample_rate = VOICE_SAMPLE_RATE;
+  micConfig.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;
+  micConfig.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  micConfig.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  micConfig.intr_alloc_flags = 0;
+  micConfig.dma_buf_count = 6;
+  micConfig.dma_buf_len = 256;
+  micConfig.use_apll = false;
+  micConfig.tx_desc_auto_clear = false;
+  micConfig.fixed_mclk = 0;
+#if defined(I2S_MCLK_MULTIPLE_256)
+  micConfig.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+#endif
+#if defined(I2S_BITS_PER_CHAN_32BIT)
+  micConfig.bits_per_chan = I2S_BITS_PER_CHAN_32BIT;
+#endif
+
+  esp_err_t err = i2s_driver_install(VOICE_I2S_PORT, &micConfig, 0, nullptr);
+  if (err != ESP_OK) {
+    if (reason != nullptr && reasonSize > 0) {
+      snprintf(reason, reasonSize, "mic install err=0x%x", (unsigned int)err);
+    }
+    return false;
+  }
+
+  i2s_pin_config_t pinConfig = {};
+  pinConfig.bck_io_num = MIC_I2S_SCK;
+  pinConfig.ws_io_num = MIC_I2S_WS;
+  pinConfig.data_out_num = I2S_PIN_NO_CHANGE;
+  pinConfig.data_in_num = MIC_I2S_SD;
+
+  err = i2s_set_pin(VOICE_I2S_PORT, &pinConfig);
+  if (err != ESP_OK) {
+    i2s_driver_uninstall(VOICE_I2S_PORT);
+    if (reason != nullptr && reasonSize > 0) {
+      snprintf(reason, reasonSize, "mic pin err=0x%x", (unsigned int)err);
+    }
+    return false;
+  }
+
+  i2s_zero_dma_buffer(VOICE_I2S_PORT);
+  i2s_start(VOICE_I2S_PORT);
+  voiceMicInitialized = true;
+  return true;
+}
+
+static void releaseVoiceMic() {
+  if (!voiceMicInitialized) {
+    return;
+  }
+  i2s_stop(VOICE_I2S_PORT);
+  i2s_driver_uninstall(VOICE_I2S_PORT);
+  voiceMicInitialized = false;
+}
+
+static void sendVoiceStreamStart() {
+  if (!isConnected || voiceActiveStreamId[0] == '\0') {
+    return;
+  }
+
+  StaticJsonDocument<320> doc;
+  doc["type"] = "voice_stream_start";
+  JsonObject data = doc.createNestedObject("data");
+  data["deviceId"] = DEVICE_ID;
+  data["streamId"] = voiceActiveStreamId;
+  data["sampleRate"] = VOICE_SAMPLE_RATE;
+  data["channels"] = 1;
+  data["format"] = "pcm_s16le";
+  data["chunkSamples"] = (int)VOICE_SAMPLES_PER_CHUNK;
+  data["source"] = "esp32_mic";
+  data["timestamp"] = millis();
+
+  String output;
+  serializeJson(doc, output);
+  webSocket.sendTXT(output);
+}
+
+static void sendVoiceStreamStop(const char *reason) {
+  if (!isConnected || voiceActiveStreamId[0] == '\0') {
+    return;
+  }
+
+  StaticJsonDocument<320> doc;
+  doc["type"] = "voice_stream_stop";
+  JsonObject data = doc.createNestedObject("data");
+  data["deviceId"] = DEVICE_ID;
+  data["streamId"] = voiceActiveStreamId;
+  data["reason"] = (reason == nullptr) ? "manual" : reason;
+  data["chunksSent"] = voiceChunksSent;
+  data["bytesSent"] = voiceBytesSent;
+  data["timestamp"] = millis();
+
+  String output;
+  serializeJson(doc, output);
+  webSocket.sendTXT(output);
+}
+
+static void sendVoiceStreamChunkMeta(size_t byteLen, uint8_t levelPercent) {
+  if (!isConnected || !voiceMicStreaming || voiceActiveStreamId[0] == '\0') {
+    return;
+  }
+
+  StaticJsonDocument<256> doc;
+  doc["type"] = "voice_stream_chunk_meta";
+  JsonObject data = doc.createNestedObject("data");
+  data["streamId"] = voiceActiveStreamId;
+  data["seq"] = voiceChunkSeq;
+  data["len"] = (int)byteLen;
+  data["level"] = levelPercent;
+  data["timestamp"] = millis();
+
+  String output;
+  serializeJson(doc, output);
+  webSocket.sendTXT(output);
+}
+
+static void setVoiceMicStreaming(bool enabled, const char *reason, bool notifyServer) {
+  if (enabled == voiceMicStreaming) {
+    return;
+  }
+
+  if (enabled) {
+    if (!isConnected) {
+      if (voiceStatusLabel != nullptr) {
+        lv_label_set_text(voiceStatusLabel, "WS disconnected");
+        lv_obj_set_style_text_color(voiceStatusLabel, lv_color_hex(0xEF5350), LV_PART_MAIN);
+      }
+      return;
+    }
+
+    if (isAudioRunning()) {
+      stopAudioPlayback(true);
+      setAudioStatus("Audio paused by mic", lv_color_hex(0xFFB74D));
+    }
+
+    char micReason[64] = "";
+    if (!ensureVoiceMicReady(micReason, sizeof(micReason))) {
+      if (voiceStatusLabel != nullptr) {
+        lv_label_set_text_fmt(voiceStatusLabel, "Mic init failed: %s", micReason);
+        lv_obj_set_style_text_color(voiceStatusLabel, lv_color_hex(0xEF5350), LV_PART_MAIN);
+      }
+      return;
+    }
+
+    uint32_t randomPart = (uint32_t)esp_random();
+    snprintf(voiceActiveStreamId, sizeof(voiceActiveStreamId), "vs-%lu-%08lx", millis(), (unsigned long)randomPart);
+    voiceChunkSeq = 0;
+    voiceChunksSent = 0;
+    voiceBytesSent = 0;
+    voiceLastChunkMs = millis();
+    voiceLastStartSentMs = voiceLastChunkMs;
+    voiceLastLevelPercent = 0;
+    voiceStreamStartAcked = false;
+    voiceMicStreaming = true;
+    i2s_zero_dma_buffer(VOICE_I2S_PORT);
+    sendVoiceStreamStart();
+
+    if (voiceStatusLabel != nullptr) {
+      lv_label_set_text(voiceStatusLabel, "Mic streaming...");
+      lv_obj_set_style_text_color(voiceStatusLabel, lv_color_hex(0x81C784), LV_PART_MAIN);
+    }
+    if (voiceResultLabel != nullptr) {
+      lv_label_set_text(voiceResultLabel, "Level: 0% | 0 chunks");
+    }
+    if (voiceMicToggleLabel != nullptr) {
+      lv_label_set_text(voiceMicToggleLabel, "Stop Mic");
+    }
+    pushInboxMessage("event", "Voice stream", "Microphone streaming started");
+    return;
+  }
+
+  bool wasStreaming = voiceMicStreaming;
+  voiceMicStreaming = false;
+  voiceStreamStartAcked = false;
+  if (notifyServer && wasStreaming) {
+    sendVoiceStreamStop((reason == nullptr) ? "manual" : reason);
+  }
+  voiceActiveStreamId[0] = '\0';
+  releaseVoiceMic();
+
+  if (voiceMicToggleLabel != nullptr) {
+    lv_label_set_text(voiceMicToggleLabel, "Start Mic");
+  }
+  if (voiceStatusLabel != nullptr) {
+    const char *text = (reason == nullptr || reason[0] == '\0') ? "Mic stopped" : reason;
+    lv_label_set_text(voiceStatusLabel, text);
+    lv_obj_set_style_text_color(voiceStatusLabel, lv_color_hex(0xB0BEC5), LV_PART_MAIN);
+  }
+}
+
+static void processVoiceMicStreaming() {
+  if (!voiceMicStreaming || !voiceMicInitialized || !isConnected) {
+    return;
+  }
+
+  if (!voiceStreamStartAcked) {
+    uint32_t now = millis();
+    if ((uint32_t)(now - voiceLastStartSentMs) >= 1200) {
+      sendVoiceStreamStart();
+      voiceLastStartSentMs = now;
+    }
+    return;
+  }
+
+  size_t bytesRead = 0;
+  esp_err_t err = i2s_read(VOICE_I2S_PORT, voiceRawChunk, sizeof(voiceRawChunk), &bytesRead, 0);
+  if (err != ESP_OK || bytesRead == 0) {
+    return;
+  }
+
+  size_t framesRead = bytesRead / (sizeof(int32_t) * 2);
+  if (framesRead == 0) {
+    return;
+  }
+  if (framesRead > VOICE_SAMPLES_PER_CHUNK) {
+    framesRead = VOICE_SAMPLES_PER_CHUNK;
+  }
+
+  uint32_t peakAbsRaw = 0;
+  for (size_t i = 0; i < framesRead; ++i) {
+    int32_t left = voiceRawChunk[i * 2];
+    int32_t right = voiceRawChunk[i * 2 + 1];
+
+    uint32_t leftAbs = (uint32_t)((left >= 0) ? left : -left);
+    uint32_t rightAbs = (uint32_t)((right >= 0) ? right : -right);
+    int32_t chosen = (leftAbs >= rightAbs) ? left : right;
+    voiceMonoRaw[i] = chosen;
+
+    uint32_t chosenAbs = (leftAbs >= rightAbs) ? leftAbs : rightAbs;
+    if (chosenAbs > peakAbsRaw) {
+      peakAbsRaw = chosenAbs;
+    }
+  }
+
+  uint8_t shift = 0;
+  while (shift < 24 && (peakAbsRaw >> shift) > 24000UL) {
+    shift++;
+  }
+
+  uint64_t absSum = 0;
+  for (size_t i = 0; i < framesRead; ++i) {
+    int32_t scaled32 = (shift > 0) ? (voiceMonoRaw[i] >> shift) : voiceMonoRaw[i];
+    if (scaled32 > 32767) {
+      scaled32 = 32767;
+    } else if (scaled32 < -32768) {
+      scaled32 = -32768;
+    }
+
+    int16_t s16 = (int16_t)scaled32;
+    voicePcmChunk[i] = s16;
+    int32_t absVal = (s16 >= 0) ? s16 : -s16;
+    absSum += (uint32_t)absVal;
+  }
+
+  uint32_t avgAbs = (framesRead > 0) ? (uint32_t)(absSum / framesRead) : 0;
+  uint32_t scaled = (avgAbs * 100UL) / 4500UL;
+  if (scaled > 100UL) {
+    scaled = 100UL;
+  }
+  uint8_t levelPercent = (uint8_t)scaled;
+  voiceLastLevelPercent = levelPercent;
+
+  size_t pcmBytes = framesRead * sizeof(int16_t);
+  sendVoiceStreamChunkMeta(pcmBytes, levelPercent);
+  webSocket.sendBIN((uint8_t *)voicePcmChunk, pcmBytes);
+
+  voiceChunkSeq++;
+  voiceChunksSent++;
+  voiceBytesSent += (uint32_t)pcmBytes;
+  voiceLastChunkMs = millis();
+
+  if (voiceResultLabel != nullptr && (voiceChunksSent % 6) == 0) {
+    lv_label_set_text_fmt(
+      voiceResultLabel,
+      "Level: %u%% | %lu chunks | %lu KB",
+      (unsigned int)voiceLastLevelPercent,
+      (unsigned long)voiceChunksSent,
+      (unsigned long)(voiceBytesSent / 1024)
+    );
+  }
+}
+
+static void voiceMicToggleCallback(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  if (shouldSuppressClick()) {
+    return;
+  }
+  setVoiceMicStreaming(!voiceMicStreaming, "manual", true);
 }
 
 static void beginWebSocketClient() {
@@ -2976,6 +4468,14 @@ static void showPage(int pageIndex) {
     pageIndex %= UI_PAGE_COUNT;
   }
 
+  int previousPage = currentPage;
+  if (previousPage == UI_PAGE_VOICE && pageIndex != UI_PAGE_VOICE && voiceMicStreaming) {
+    setVoiceMicStreaming(false, "Mic stopped (leave page)", true);
+  }
+  if (previousPage == UI_PAGE_VIDEO_PLAYER && pageIndex != UI_PAGE_VIDEO_PLAYER && videoPlaying) {
+    stopVideoPlayback(true);
+  }
+
   currentPage = pageIndex;
   for (int i = 0; i < UI_PAGE_COUNT; ++i) {
     if (pages[i] == nullptr) {
@@ -3004,6 +4504,13 @@ static void showPage(int pageIndex) {
     }
     showCurrentAudioTrack();
   }
+  if (currentPage == UI_PAGE_VIDEO_PLAYER) {
+    if (sdMounted && sdVideoCount <= 0) {
+      loadSdVideoList();
+    }
+    showCurrentVideoTrack();
+  }
+  prepareDynamicWallpaperForPage(currentPage, true);
   updatePageIndicator();
 }
 
@@ -3630,7 +5137,11 @@ static void applyPhotoFrameSettings(const JsonObjectConst &data) {
   bool oldAutoPlay = photoFrameSettings.autoPlay;
   uint16_t oldMaxPhotoCount = photoFrameSettings.maxPhotoCount;
   char oldTheme[24];
+  char oldHomeWallpaperPath[192];
+  char oldClockWallpaperPath[192];
   copyText(oldTheme, sizeof(oldTheme), photoFrameSettings.theme);
+  copyText(oldHomeWallpaperPath, sizeof(oldHomeWallpaperPath), photoFrameSettings.homeWallpaperPath);
+  copyText(oldClockWallpaperPath, sizeof(oldClockWallpaperPath), photoFrameSettings.clockWallpaperPath);
 
   long intervalValue = photoFrameSettings.slideshowIntervalSec;
   if (!data["slideshowInterval"].isNull()) {
@@ -3673,6 +5184,29 @@ static void applyPhotoFrameSettings(const JsonObjectConst &data) {
     maxPhotoCountValue = data["max_photo_count"].as<long>();
   }
   photoFrameSettings.maxPhotoCount = clampPhotoMaxCount(maxPhotoCountValue);
+
+  if (!data["homeWallpaperPath"].isNull() || !data["home_wallpaper_path"].isNull()) {
+    const char *homePath = !data["homeWallpaperPath"].isNull()
+      ? data["homeWallpaperPath"].as<const char *>()
+      : data["home_wallpaper_path"].as<const char *>();
+    if (homePath == nullptr || homePath[0] == '\0') {
+      photoFrameSettings.homeWallpaperPath[0] = '\0';
+    } else if (homePath[0] == '/' && hasMjpegPlaybackExtension(homePath)) {
+      copyText(photoFrameSettings.homeWallpaperPath, sizeof(photoFrameSettings.homeWallpaperPath), homePath);
+    }
+  }
+
+  if (!data["clockWallpaperPath"].isNull() || !data["clock_wallpaper_path"].isNull()) {
+    const char *clockPath = !data["clockWallpaperPath"].isNull()
+      ? data["clockWallpaperPath"].as<const char *>()
+      : data["clock_wallpaper_path"].as<const char *>();
+    if (clockPath == nullptr || clockPath[0] == '\0') {
+      photoFrameSettings.clockWallpaperPath[0] = '\0';
+    } else if (clockPath[0] == '/' && hasMjpegPlaybackExtension(clockPath)) {
+      copyText(photoFrameSettings.clockWallpaperPath, sizeof(photoFrameSettings.clockWallpaperPath), clockPath);
+    }
+  }
+
   photoFrameSettings.valid = true;
   lastPhotoSettingsApplyMs = millis();
   lastPhotoAutoAdvanceMs = millis();
@@ -3680,16 +5214,20 @@ static void applyPhotoFrameSettings(const JsonObjectConst &data) {
   bool changed =
     oldInterval != photoFrameSettings.slideshowIntervalSec ||
     oldAutoPlay != photoFrameSettings.autoPlay ||
-    strcmp(oldTheme, photoFrameSettings.theme) != 0;
+    strcmp(oldTheme, photoFrameSettings.theme) != 0 ||
+    strcmp(oldHomeWallpaperPath, photoFrameSettings.homeWallpaperPath) != 0 ||
+    strcmp(oldClockWallpaperPath, photoFrameSettings.clockWallpaperPath) != 0;
 
   Serial.printf(
-    "[PhotoSettings] synced interval=%us autoPlay=%s theme=%s maxSize=%.1fMB autoCompress=%s maxCount=%u\n",
+    "[PhotoSettings] synced interval=%us autoPlay=%s theme=%s maxSize=%.1fMB autoCompress=%s maxCount=%u home=%s clock=%s\n",
     photoFrameSettings.slideshowIntervalSec,
     photoFrameSettings.autoPlay ? "true" : "false",
     photoFrameSettings.theme,
     (double)photoFrameSettings.maxFileSizeMb,
     photoFrameSettings.autoCompress ? "true" : "false",
-    photoFrameSettings.maxPhotoCount
+    photoFrameSettings.maxPhotoCount,
+    photoFrameSettings.homeWallpaperPath[0] != '\0' ? photoFrameSettings.homeWallpaperPath : "auto",
+    photoFrameSettings.clockWallpaperPath[0] != '\0' ? photoFrameSettings.clockWallpaperPath : "auto"
   );
 
   if (currentPage == UI_PAGE_PHOTO_FRAME) {
@@ -3721,6 +5259,15 @@ static void applyPhotoFrameSettings(const JsonObjectConst &data) {
     loadSdPhotoList();
     if (currentPage == UI_PAGE_PHOTO_FRAME) {
       showCurrentPhotoFrame();
+    }
+  }
+
+  if (sdMounted &&
+      (strcmp(oldHomeWallpaperPath, photoFrameSettings.homeWallpaperPath) != 0 ||
+       strcmp(oldClockWallpaperPath, photoFrameSettings.clockWallpaperPath) != 0)) {
+    refreshDynamicWallpaperSources();
+    if (pages[UI_PAGE_HOME] != nullptr) {
+      prepareDynamicWallpaperForPage(currentPage, true);
     }
   }
 
@@ -4229,6 +5776,7 @@ static void gestureEventCallback(lv_event_t *e) {
   lv_event_code_t code = lv_event_get_code(e);
 
   if (code == LV_EVENT_PRESSED) {
+    pauseDynamicWallpapersForMs(DYNAMIC_WALLPAPER_TOUCH_PAUSE_MS);
     gestureState.pressed = true;
     gestureState.longPressHandled = false;
     gestureState.startMs = millis();
@@ -4242,6 +5790,7 @@ static void gestureEventCallback(lv_event_t *e) {
   }
 
   if (code == LV_EVENT_PRESSING) {
+    pauseDynamicWallpapersForMs(DYNAMIC_WALLPAPER_TOUCH_PAUSE_MS);
     if (!gestureState.pressed || gestureState.longPressHandled) {
       return;
     }
@@ -4259,6 +5808,7 @@ static void gestureEventCallback(lv_event_t *e) {
   }
 
   if (code == LV_EVENT_RELEASED) {
+    pauseDynamicWallpapersForMs(DYNAMIC_WALLPAPER_TOUCH_PAUSE_MS);
     if (!gestureState.pressed) {
       return;
     }
@@ -4295,6 +5845,7 @@ static void gestureEventCallback(lv_event_t *e) {
   }
 
   if (code == LV_EVENT_PRESS_LOST) {
+    pauseDynamicWallpapersForMs(DYNAMIC_WALLPAPER_TOUCH_PAUSE_MS);
     gestureState = TouchGestureState();
   }
 }
@@ -4306,6 +5857,21 @@ static void createUi() {
   // Page 1: Home Hub
   pages[UI_PAGE_HOME] = createBasePage();
 
+  homeWallpaperImage = lv_img_create(pages[UI_PAGE_HOME]);
+  lv_img_set_src(homeWallpaperImage, nullptr);
+  lv_obj_set_size(homeWallpaperImage, 360, 360);
+  lv_obj_center(homeWallpaperImage);
+  lv_obj_clear_flag(homeWallpaperImage, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+  homeWallpaper.imageObj = homeWallpaperImage;
+
+  homeWallpaperShade = lv_obj_create(pages[UI_PAGE_HOME]);
+  lv_obj_remove_style_all(homeWallpaperShade);
+  lv_obj_set_size(homeWallpaperShade, 360, 360);
+  lv_obj_center(homeWallpaperShade);
+  lv_obj_set_style_bg_opa(homeWallpaperShade, LV_OPA_20, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(homeWallpaperShade, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_clear_flag(homeWallpaperShade, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
   lv_obj_t *homeOuter = lv_obj_create(pages[UI_PAGE_HOME]);
   lv_obj_set_size(homeOuter, 344, 344);
   lv_obj_align(homeOuter, LV_ALIGN_CENTER, 0, 4);
@@ -4313,6 +5879,7 @@ static void createUi() {
   lv_obj_set_style_bg_color(homeOuter, lv_color_hex(0x0B0F20), LV_PART_MAIN);
   lv_obj_set_style_bg_grad_color(homeOuter, lv_color_hex(0x121A3A), LV_PART_MAIN);
   lv_obj_set_style_bg_grad_dir(homeOuter, LV_GRAD_DIR_VER, LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(homeOuter, LV_OPA_60, LV_PART_MAIN);
   lv_obj_set_style_border_width(homeOuter, 2, LV_PART_MAIN);
   lv_obj_set_style_border_color(homeOuter, lv_color_hex(0x1C2448), LV_PART_MAIN);
   lv_obj_clear_flag(homeOuter, LV_OBJ_FLAG_SCROLLABLE);
@@ -4325,6 +5892,7 @@ static void createUi() {
   lv_obj_set_style_bg_color(homeInner, lv_color_hex(0x111735), LV_PART_MAIN);
   lv_obj_set_style_bg_grad_color(homeInner, lv_color_hex(0x191F43), LV_PART_MAIN);
   lv_obj_set_style_bg_grad_dir(homeInner, LV_GRAD_DIR_VER, LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(homeInner, LV_OPA_60, LV_PART_MAIN);
   lv_obj_set_style_border_width(homeInner, 1, LV_PART_MAIN);
   lv_obj_set_style_border_color(homeInner, lv_color_hex(0x222B58), LV_PART_MAIN);
   lv_obj_clear_flag(homeInner, LV_OBJ_FLAG_SCROLLABLE);
@@ -4497,6 +6065,22 @@ static void createUi() {
 
   // Page 3: Clock
   pages[UI_PAGE_CLOCK] = createBasePage();
+
+  clockWallpaperImage = lv_img_create(pages[UI_PAGE_CLOCK]);
+  lv_img_set_src(clockWallpaperImage, nullptr);
+  lv_obj_set_size(clockWallpaperImage, 360, 360);
+  lv_obj_center(clockWallpaperImage);
+  lv_obj_clear_flag(clockWallpaperImage, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+  clockWallpaper.imageObj = clockWallpaperImage;
+
+  clockWallpaperShade = lv_obj_create(pages[UI_PAGE_CLOCK]);
+  lv_obj_remove_style_all(clockWallpaperShade);
+  lv_obj_set_size(clockWallpaperShade, 360, 360);
+  lv_obj_center(clockWallpaperShade);
+  lv_obj_set_style_bg_opa(clockWallpaperShade, LV_OPA_50, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(clockWallpaperShade, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_clear_flag(clockWallpaperShade, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
   lv_obj_t *clockTitle = lv_label_create(pages[UI_PAGE_CLOCK]);
   lv_label_set_text(clockTitle, "Clock");
   lv_obj_align(clockTitle, LV_ALIGN_TOP_MID, 0, 20);
@@ -5101,7 +6685,134 @@ static void createUi() {
 
   updateAudioControlButtons(false, false);
 
-  // Page 11: Voice Commands (phase-1 bridge)
+  // Page 11: Video Player (SD, MJPEG MVP)
+  pages[UI_PAGE_VIDEO_PLAYER] = createBasePage();
+
+  lv_obj_t *videoTitle = lv_label_create(pages[UI_PAGE_VIDEO_PLAYER]);
+  lv_label_set_text(videoTitle, "Video Player (SD)");
+  lv_obj_set_style_text_color(videoTitle, lv_color_hex(0x90CAF9), LV_PART_MAIN);
+  lv_obj_align(videoTitle, LV_ALIGN_TOP_MID, 0, 14);
+
+  lv_obj_t *videoCard = lv_obj_create(pages[UI_PAGE_VIDEO_PLAYER]);
+  lv_obj_set_size(videoCard, 300, 196);
+  lv_obj_align(videoCard, LV_ALIGN_TOP_MID, 0, 54);
+  lv_obj_set_style_radius(videoCard, 12, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(videoCard, lv_color_hex(0x101010), LV_PART_MAIN);
+  lv_obj_set_style_border_color(videoCard, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(videoCard, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(videoCard, 6, LV_PART_MAIN);
+  lv_obj_clear_flag(videoCard, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(videoCard, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  attachGestureHandlers(videoCard);
+
+  videoViewport = lv_obj_create(videoCard);
+  lv_obj_set_size(videoViewport, 286, 148);
+  lv_obj_align(videoViewport, LV_ALIGN_TOP_MID, 0, 2);
+  lv_obj_set_style_radius(videoViewport, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(videoViewport, lv_color_hex(0x050505), LV_PART_MAIN);
+  lv_obj_set_style_border_color(videoViewport, lv_color_hex(0x202020), LV_PART_MAIN);
+  lv_obj_set_style_border_width(videoViewport, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(videoViewport, 0, LV_PART_MAIN);
+  lv_obj_set_style_clip_corner(videoViewport, true, LV_PART_MAIN);
+  lv_obj_clear_flag(videoViewport, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(videoViewport, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  attachGestureHandlers(videoViewport);
+
+  videoImage = lv_img_create(videoViewport);
+  lv_img_set_src(videoImage, nullptr);
+  lv_obj_center(videoImage);
+
+  videoTrackLabel = lv_label_create(videoCard);
+  lv_label_set_text(videoTrackLabel, "Scanning SD...");
+  lv_obj_set_width(videoTrackLabel, 276);
+  lv_label_set_long_mode(videoTrackLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);
+  lv_obj_set_style_text_font(videoTrackLabel, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_set_style_text_align(videoTrackLabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_align(videoTrackLabel, LV_ALIGN_TOP_MID, 0, 154);
+
+  videoHintLabel = lv_label_create(videoCard);
+  lv_label_set_text(videoHintLabel, "MJPEG only (.mjpeg/.mjpg)");
+  lv_obj_set_style_text_color(videoHintLabel, lv_color_hex(0xAFAFAF), LV_PART_MAIN);
+  lv_obj_set_style_text_font(videoHintLabel, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_set_width(videoHintLabel, 276);
+  lv_obj_set_style_text_align(videoHintLabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_align(videoHintLabel, LV_ALIGN_TOP_MID, 0, 172);
+
+  lv_obj_t *videoRescanBtn = lv_btn_create(videoCard);
+  lv_obj_set_size(videoRescanBtn, 74, 28);
+  lv_obj_align(videoRescanBtn, LV_ALIGN_TOP_RIGHT, -8, 8);
+  lv_obj_set_style_radius(videoRescanBtn, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(videoRescanBtn, lv_color_hex(0x252525), LV_PART_MAIN);
+  lv_obj_add_flag(videoRescanBtn, LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_PRESS_LOCK);
+  attachGestureHandlers(videoRescanBtn);
+  lv_obj_add_event_cb(videoRescanBtn, videoControlCallback, LV_EVENT_CLICKED, (void *)VIDEO_CONTROL_RESCAN);
+  lv_obj_t *videoRescanLabel = lv_label_create(videoRescanBtn);
+  lv_label_set_text(videoRescanLabel, "Rescan");
+  lv_obj_set_style_text_font(videoRescanLabel, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_center(videoRescanLabel);
+
+  videoStatusLabel = lv_label_create(pages[UI_PAGE_VIDEO_PLAYER]);
+  lv_label_set_text(videoStatusLabel, "Ready");
+  lv_obj_set_style_text_color(videoStatusLabel, lv_color_hex(0x90CAF9), LV_PART_MAIN);
+  lv_obj_align(videoStatusLabel, LV_ALIGN_TOP_MID, 0, 252);
+
+  lv_obj_t *videoNavBar = lv_obj_create(pages[UI_PAGE_VIDEO_PLAYER]);
+  lv_obj_set_size(videoNavBar, 304, 50);
+  lv_obj_align(videoNavBar, LV_ALIGN_TOP_MID, 0, 292);
+  lv_obj_set_style_radius(videoNavBar, 14, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(videoNavBar, lv_color_hex(0x151515), LV_PART_MAIN);
+  lv_obj_set_style_border_color(videoNavBar, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(videoNavBar, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(videoNavBar, 5, LV_PART_MAIN);
+  lv_obj_clear_flag(videoNavBar, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(videoNavBar, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  attachGestureHandlers(videoNavBar);
+
+  videoPrevBtn = lv_btn_create(videoNavBar);
+  lv_obj_set_size(videoPrevBtn, 94, 38);
+  lv_obj_align(videoPrevBtn, LV_ALIGN_LEFT_MID, 6, 0);
+  lv_obj_set_style_radius(videoPrevBtn, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(videoPrevBtn, lv_color_hex(0x252525), LV_PART_MAIN);
+  lv_obj_add_flag(videoPrevBtn, LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_PRESS_LOCK);
+  attachGestureHandlers(videoPrevBtn);
+  lv_obj_add_event_cb(videoPrevBtn, videoControlCallback, LV_EVENT_CLICKED, (void *)VIDEO_CONTROL_PREV);
+  lv_obj_t *videoPrevLabel = lv_label_create(videoPrevBtn);
+  lv_label_set_text(videoPrevLabel, "Prev");
+  lv_obj_center(videoPrevLabel);
+
+  videoPlayBtn = lv_btn_create(videoNavBar);
+  lv_obj_set_size(videoPlayBtn, 94, 38);
+  lv_obj_align(videoPlayBtn, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_style_radius(videoPlayBtn, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(videoPlayBtn, lv_color_hex(0x2E7D32), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(videoPlayBtn, lv_color_hex(0x1B5E20), LV_PART_MAIN | LV_STATE_PRESSED);
+  lv_obj_add_flag(videoPlayBtn, LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_PRESS_LOCK);
+  attachGestureHandlers(videoPlayBtn);
+  lv_obj_add_event_cb(videoPlayBtn, videoControlCallback, LV_EVENT_CLICKED, (void *)VIDEO_CONTROL_TOGGLE);
+  videoPlayBtnLabel = lv_label_create(videoPlayBtn);
+  lv_label_set_text(videoPlayBtnLabel, "Play");
+  lv_obj_center(videoPlayBtnLabel);
+
+  videoNextBtn = lv_btn_create(videoNavBar);
+  lv_obj_set_size(videoNextBtn, 94, 38);
+  lv_obj_align(videoNextBtn, LV_ALIGN_RIGHT_MID, -6, 0);
+  lv_obj_set_style_radius(videoNextBtn, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(videoNextBtn, lv_color_hex(0x252525), LV_PART_MAIN);
+  lv_obj_add_flag(videoNextBtn, LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_PRESS_LOCK);
+  attachGestureHandlers(videoNextBtn);
+  lv_obj_add_event_cb(videoNextBtn, videoControlCallback, LV_EVENT_CLICKED, (void *)VIDEO_CONTROL_NEXT);
+  lv_obj_t *videoNextLabel = lv_label_create(videoNextBtn);
+  lv_label_set_text(videoNextLabel, "Next");
+  lv_obj_center(videoNextLabel);
+
+  videoIndexLabel = lv_label_create(pages[UI_PAGE_VIDEO_PLAYER]);
+  lv_label_set_text(videoIndexLabel, "0/0");
+  lv_obj_set_style_text_color(videoIndexLabel, lv_color_hex(0xBFBFBF), LV_PART_MAIN);
+  lv_obj_align(videoIndexLabel, LV_ALIGN_BOTTOM_MID, 0, -12);
+
+  updateVideoControlButtons(false);
+
+  // Page 12: Voice Commands (phase-1 bridge)
   pages[UI_PAGE_VOICE] = createBasePage();
 
   lv_obj_t *voiceTitle = lv_label_create(pages[UI_PAGE_VOICE]);
@@ -5110,7 +6821,7 @@ static void createUi() {
   lv_obj_align(voiceTitle, LV_ALIGN_TOP_MID, 0, 14);
 
   lv_obj_t *voiceHint = lv_label_create(pages[UI_PAGE_VOICE]);
-  lv_label_set_text(voiceHint, "Phase-1: tap preset command");
+  lv_label_set_text(voiceHint, "Preset commands + live mic stream");
   lv_obj_set_style_text_color(voiceHint, lv_color_hex(0xB0BEC5), LV_PART_MAIN);
   lv_obj_set_style_text_font(voiceHint, &lv_font_montserrat_14, LV_PART_MAIN);
   lv_obj_align(voiceHint, LV_ALIGN_TOP_MID, 0, 38);
@@ -5152,19 +6863,34 @@ static void createUi() {
     lv_obj_center(label);
   }
 
+  voiceMicToggleBtn = lv_btn_create(voiceCard);
+  lv_obj_set_size(voiceMicToggleBtn, 108, 38);
+  lv_obj_align(voiceMicToggleBtn, LV_ALIGN_BOTTOM_RIGHT, -10, -8);
+  lv_obj_set_style_radius(voiceMicToggleBtn, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(voiceMicToggleBtn, lv_color_hex(0x00695C), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(voiceMicToggleBtn, lv_color_hex(0x00796B), LV_PART_MAIN | LV_STATE_PRESSED);
+  lv_obj_add_flag(voiceMicToggleBtn, LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_PRESS_LOCK);
+  attachGestureHandlers(voiceMicToggleBtn);
+  lv_obj_add_event_cb(voiceMicToggleBtn, voiceMicToggleCallback, LV_EVENT_CLICKED, nullptr);
+
+  voiceMicToggleLabel = lv_label_create(voiceMicToggleBtn);
+  lv_label_set_text(voiceMicToggleLabel, "Start Mic");
+  lv_obj_set_style_text_font(voiceMicToggleLabel, &lv_font_montserrat_16, LV_PART_MAIN);
+  lv_obj_center(voiceMicToggleLabel);
+
   voiceStatusLabel = lv_label_create(voiceCard);
   lv_label_set_text(voiceStatusLabel, "Ready");
   lv_obj_set_style_text_color(voiceStatusLabel, lv_color_hex(0x80CBC4), LV_PART_MAIN);
   lv_obj_set_style_text_font(voiceStatusLabel, &lv_font_montserrat_14, LV_PART_MAIN);
-  lv_obj_align(voiceStatusLabel, LV_ALIGN_BOTTOM_LEFT, 10, -34);
+  lv_obj_align(voiceStatusLabel, LV_ALIGN_BOTTOM_LEFT, 10, -56);
 
   voiceResultLabel = lv_label_create(voiceCard);
   lv_label_set_text(voiceResultLabel, "Result: --");
-  lv_obj_set_width(voiceResultLabel, 286);
+  lv_obj_set_width(voiceResultLabel, 176);
   lv_label_set_long_mode(voiceResultLabel, LV_LABEL_LONG_DOT);
   lv_obj_set_style_text_color(voiceResultLabel, lv_color_hex(0xCFD8DC), LV_PART_MAIN);
   lv_obj_set_style_text_font(voiceResultLabel, &lv_font_montserrat_14, LV_PART_MAIN);
-  lv_obj_align(voiceResultLabel, LV_ALIGN_BOTTOM_LEFT, 10, -12);
+  lv_obj_align(voiceResultLabel, LV_ALIGN_BOTTOM_LEFT, 10, -30);
 
   // Global page indicator
   pageIndicatorLabel = lv_label_create(lv_scr_act());
@@ -5320,6 +7046,7 @@ static int parseUiPageFromVoiceName(const char *name) {
   if (strcmp(name, "apps") == 0 || strcmp(name, "app_launcher") == 0 || strcmp(name, "launcher") == 0) return UI_PAGE_APP_LAUNCHER;
   if (strcmp(name, "photo") == 0 || strcmp(name, "photos") == 0) return UI_PAGE_PHOTO_FRAME;
   if (strcmp(name, "music") == 0 || strcmp(name, "audio") == 0) return UI_PAGE_AUDIO_PLAYER;
+  if (strcmp(name, "video") == 0 || strcmp(name, "videos") == 0) return UI_PAGE_VIDEO_PLAYER;
   if (strcmp(name, "voice") == 0) return UI_PAGE_VOICE;
   return -1;
 }
@@ -5340,7 +7067,9 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
       isConnected = false;
       resetSdUploadSession(true);
       setWsStatus("WS: disconnected");
-      if (voiceStatusLabel != nullptr) {
+      if (voiceMicStreaming) {
+        setVoiceMicStreaming(false, "WS disconnected", false);
+      } else if (voiceStatusLabel != nullptr) {
         lv_label_set_text(voiceStatusLabel, "WS disconnected");
         lv_obj_set_style_text_color(voiceStatusLabel, lv_color_hex(0xEF5350), LV_PART_MAIN);
       }
@@ -5503,6 +7232,70 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
           setAppLauncherStatus(detail, lv_color_hex(0xEF5350), true, 4800);
           pushInboxMessage("alert", "App launch failed", detail);
         }
+      } else if (strcmp(messageType, "voice_stream_ack") == 0) {
+        JsonObjectConst data = doc["data"].as<JsonObjectConst>();
+        const char *streamId = data["streamId"] | "";
+        bool success = data["success"] | false;
+        const char *status = data["status"] | "";
+        const char *reason = data["reason"] | "";
+        const char *text = data["text"] | "";
+        bool isFinal = data["isFinal"] | false;
+
+        if (streamId[0] != '\0' && voiceActiveStreamId[0] != '\0' && strcmp(streamId, voiceActiveStreamId) != 0) {
+          break;
+        }
+
+        if (success && strcmp(status, "ready") == 0) {
+          voiceStreamStartAcked = true;
+        } else if (strcmp(status, "accepted") == 0) {
+          voiceStreamStartAcked = false;
+        }
+
+        if (!success) {
+          const char *errorText = (reason[0] != '\0') ? reason : "voice stream error";
+          if (voiceStatusLabel != nullptr) {
+            lv_label_set_text_fmt(voiceStatusLabel, "Mic error: %s", errorText);
+            lv_obj_set_style_text_color(voiceStatusLabel, lv_color_hex(0xEF5350), LV_PART_MAIN);
+          }
+          if (voiceMicStreaming) {
+            setVoiceMicStreaming(false, errorText, false);
+          }
+        } else if (voiceStatusLabel != nullptr) {
+          if (strcmp(status, "accepted") == 0) {
+            lv_label_set_text(voiceStatusLabel, "Mic stream accepted");
+          } else if (strcmp(status, "ready") == 0) {
+            lv_label_set_text(voiceStatusLabel, "Mic stream ready");
+          } else if (strcmp(status, "stopped") == 0) {
+            lv_label_set_text(voiceStatusLabel, "Mic stopped");
+          }
+          lv_obj_set_style_text_color(voiceStatusLabel, lv_color_hex(0x81C784), LV_PART_MAIN);
+        }
+
+        if (text[0] != '\0' && voiceResultLabel != nullptr) {
+          lv_label_set_text_fmt(voiceResultLabel, "ASR: %s", text);
+          if (isFinal) {
+            pushInboxMessage("event", "Voice transcript", text);
+          }
+        }
+      } else if (strcmp(messageType, "voice_stream_chunk_ack") == 0) {
+        JsonObjectConst data = doc["data"].as<JsonObjectConst>();
+        bool success = data["success"] | false;
+        int seq = data["seq"] | -1;
+        const char *reason = data["reason"] | "";
+
+        if (!success) {
+          const char *errorText = (reason[0] != '\0') ? reason : "chunk upload failed";
+          if (voiceStatusLabel != nullptr) {
+            lv_label_set_text_fmt(voiceStatusLabel, "Mic chunk err: %s", errorText);
+            lv_obj_set_style_text_color(voiceStatusLabel, lv_color_hex(0xEF5350), LV_PART_MAIN);
+          }
+          if (voiceMicStreaming) {
+            setVoiceMicStreaming(false, errorText, false);
+          }
+        } else if (voiceStatusLabel != nullptr && seq >= 0 && (seq % 24) == 0) {
+          lv_label_set_text_fmt(voiceStatusLabel, "Mic streaming (%d)", seq);
+          lv_obj_set_style_text_color(voiceStatusLabel, lv_color_hex(0x81C784), LV_PART_MAIN);
+        }
       } else if (strcmp(messageType, "voice_command_result") == 0) {
         JsonObjectConst data = doc["data"].as<JsonObjectConst>();
         bool success = data["success"] | false;
@@ -5613,6 +7406,51 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
         int limit = data["limit"] | SD_BROWSER_RESPONSE_MAX_FILES;
         Serial.printf("[SD] list request: requestId=%s offset=%d limit=%d\n", requestId, offset, limit);
         sendSdListResponse(requestId, offset, limit);
+      } else if (strcmp(messageType, "sd_preview_request") == 0) {
+        JsonObjectConst data = doc["data"].as<JsonObjectConst>();
+        const char *requestId = data["requestId"] | "";
+        const char *targetPath = data["path"] | "";
+        if (requestId == nullptr || requestId[0] == '\0' || targetPath == nullptr || targetPath[0] != '/') {
+          sendSdPreviewResponse(requestId, targetPath, false, 0, "invalid request/path");
+          break;
+        }
+        if (!hasMjpegPlaybackExtension(targetPath)) {
+          sendSdPreviewResponse(requestId, targetPath, false, 0, "only mjpeg/mjpg supported");
+          break;
+        }
+
+        detectAndScanSdCard();
+        if (!sdMounted) {
+          sendSdPreviewResponse(requestId, targetPath, false, 0, "sd not mounted");
+          break;
+        }
+        if (!SD_MMC.exists(targetPath)) {
+          sendSdPreviewResponse(requestId, targetPath, false, 0, "file not found");
+          break;
+        }
+        if (!ensureVideoFrameBuffer()) {
+          sendSdPreviewResponse(requestId, targetPath, false, 0, "preview buffer OOM");
+          break;
+        }
+
+        File previewFile = SD_MMC.open(targetPath, FILE_READ);
+        if (!previewFile) {
+          sendSdPreviewResponse(requestId, targetPath, false, 0, "open failed");
+          break;
+        }
+
+        size_t frameSize = 0;
+        char reason[72];
+        bool ok = readNextMjpegFrame(previewFile, videoFrameData, VIDEO_FRAME_MAX_BYTES, &frameSize, reason, sizeof(reason));
+        previewFile.close();
+        if (!ok || frameSize == 0) {
+          sendSdPreviewResponse(requestId, targetPath, false, 0, reason[0] == '\0' ? "preview decode failed" : reason);
+          break;
+        }
+
+        sendSdPreviewResponse(requestId, targetPath, true, (uint32_t)frameSize, "");
+        webSocket.sendBIN(videoFrameData, frameSize);
+        Serial.printf("[SD] preview sent requestId=%s path=%s bytes=%u\n", requestId, targetPath, (unsigned)frameSize);
       } else if (strcmp(messageType, "sd_delete_request") == 0) {
         JsonObjectConst data = doc["data"].as<JsonObjectConst>();
         const char *requestId = data["requestId"] | "";
@@ -5850,6 +7688,7 @@ void setup() {
   loadSdPhotoList();
   showCurrentPhotoFrame();
   loadSdAudioList();
+  loadSdVideoList();
 
   Serial.printf("Connecting WiFi: %s\n", WIFI_SSID);
   setWifiStatus("WiFi: connecting...");
@@ -5890,6 +7729,7 @@ void setup() {
 void loop() {
   webSocket.loop();
   processPendingAction();
+  processVoiceMicStreaming();
 
   static unsigned long lastHeartbeat = 0;
   if (isConnected && millis() - lastHeartbeat > 5000) {
@@ -5917,7 +7757,11 @@ void loop() {
   }
 
   lv_timer_handler();
+  processDynamicWallpapers();
+  processPendingVideoControl();
+  processVideoPlayback();
   processPendingAudioControl();
   processAudioPlayback();
-  delay((isAudioRunning() && !audioPaused) ? 1 : 5);
+  bool mediaBusy = (isAudioRunning() && !audioPaused) || (videoPlaying && !videoPaused);
+  delay(mediaBusy ? 1 : 5);
 }

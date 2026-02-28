@@ -1,10 +1,25 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Box, Typography, IconButton } from '@mui/material';
+import { Box, Typography, IconButton, FormControlLabel, Switch } from '@mui/material';
 import { Mic, MicOff, ContentCopy, Send, Close } from '@mui/icons-material';
 
 interface VoicePageProps {
   onBack: () => void;
   onNavigate: (page: string) => void;
+}
+
+interface VoiceDispatchAck {
+  requestId: string;
+  success: boolean;
+  action?: 'navigate' | 'launch_app' | 'unknown';
+  page?: string;
+  appName?: string;
+  appPath?: string;
+  message?: string;
+  reason?: string;
+  command?: string;
+  normalized?: string;
+  deviceId?: string;
+  timestamp?: number;
 }
 
 const VoicePage: React.FC<VoicePageProps> = ({ onBack, onNavigate }) => {
@@ -13,12 +28,18 @@ const VoicePage: React.FC<VoicePageProps> = ({ onBack, onNavigate }) => {
   const [voiceFinal, setVoiceFinal] = useState('');
   const [voicePreview, setVoicePreview] = useState('');
   const [voiceStatus, setVoiceStatus] = useState<string | null>(null);
+  const [voiceBridgeConnected, setVoiceBridgeConnected] = useState(false);
+  const [autoExecuteOnFinal, setAutoExecuteOnFinal] = useState(true);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const lastFinalRef = useRef<string>('');
   const audioChunkCountRef = useRef<number>(0);
+  const executingCommandRef = useRef(false);
+  const voiceBridgeWsRef = useRef<WebSocket | null>(null);
+  const voiceBridgeReconnectTimerRef = useRef<number | null>(null);
+  const voiceDispatchResolversRef = useRef<Map<string, (ack: VoiceDispatchAck) => void>>(new Map());
 
   // 获取 ipcRenderer - 使用 require 而不是 import
   const getIpcRenderer = () => {
@@ -31,6 +52,109 @@ const VoicePage: React.FC<VoicePageProps> = ({ onBack, onNavigate }) => {
   };
 
   const ipcRenderer = getIpcRenderer();
+
+  useEffect(() => {
+    let disposed = false;
+
+    const scheduleReconnect = () => {
+      if (disposed || voiceBridgeReconnectTimerRef.current !== null) return;
+      voiceBridgeReconnectTimerRef.current = window.setTimeout(() => {
+        voiceBridgeReconnectTimerRef.current = null;
+        connectBridge();
+      }, 2500);
+    };
+
+    const connectBridge = () => {
+      if (disposed) return;
+      const existing = voiceBridgeWsRef.current;
+      if (existing && (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
+
+      const ws = new WebSocket('ws://localhost:8765');
+      voiceBridgeWsRef.current = ws;
+
+      ws.onopen = () => {
+        if (disposed) return;
+        setVoiceBridgeConnected(true);
+        ws.send(JSON.stringify({
+          type: 'handshake',
+          clientType: 'control_panel',
+        }));
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const packet = JSON.parse(event.data);
+          if (packet?.type !== 'voice_command_dispatch_ack') return;
+
+          const payload = (packet?.data || {}) as Partial<VoiceDispatchAck>;
+          const requestId = typeof payload.requestId === 'string' ? payload.requestId : '';
+          if (!requestId) return;
+
+          const resolver = voiceDispatchResolversRef.current.get(requestId);
+          if (!resolver) return;
+
+          voiceDispatchResolversRef.current.delete(requestId);
+          resolver({
+            requestId,
+            success: Boolean(payload.success),
+            action: payload.action,
+            page: payload.page,
+            appName: payload.appName,
+            appPath: payload.appPath,
+            message: typeof payload.message === 'string' ? payload.message : '',
+            reason: typeof payload.reason === 'string' ? payload.reason : '',
+            command: typeof payload.command === 'string' ? payload.command : '',
+            normalized: typeof payload.normalized === 'string' ? payload.normalized : '',
+            deviceId: typeof payload.deviceId === 'string' ? payload.deviceId : '',
+            timestamp: Number(payload.timestamp || Date.now()),
+          });
+        } catch {
+          // ignore malformed packets
+        }
+      };
+
+      ws.onclose = () => {
+        if (disposed) return;
+        if (voiceBridgeWsRef.current === ws) {
+          voiceBridgeWsRef.current = null;
+        }
+        setVoiceBridgeConnected(false);
+        scheduleReconnect();
+      };
+
+      ws.onerror = () => {
+        // close will trigger reconnect
+      };
+    };
+
+    connectBridge();
+
+    return () => {
+      disposed = true;
+      if (voiceBridgeReconnectTimerRef.current !== null) {
+        window.clearTimeout(voiceBridgeReconnectTimerRef.current);
+        voiceBridgeReconnectTimerRef.current = null;
+      }
+
+      voiceDispatchResolversRef.current.forEach((resolve, requestId) => {
+        resolve({
+          requestId,
+          success: false,
+          reason: 'bridge closed',
+        });
+      });
+      voiceDispatchResolversRef.current.clear();
+
+      const ws = voiceBridgeWsRef.current;
+      voiceBridgeWsRef.current = null;
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        ws.close();
+      }
+      setVoiceBridgeConnected(false);
+    };
+  }, []);
 
   // 监听 ASR 结果
   useEffect(() => {
@@ -61,6 +185,14 @@ const VoicePage: React.FC<VoicePageProps> = ({ onBack, onNavigate }) => {
           console.log('[VoicePage] 更新 voiceFinal 从', prev, '到', next);
           return next;
         });
+
+        if (autoExecuteOnFinal) {
+          setTimeout(() => {
+            executeCommandText(clean, 'auto').catch((error) => {
+              setVoiceStatus(`自动执行失败: ${String(error)}`);
+            });
+          }, 120);
+        }
         return;
       }
       setVoicePreview(data.text);
@@ -78,7 +210,7 @@ const VoicePage: React.FC<VoicePageProps> = ({ onBack, onNavigate }) => {
       ipcRenderer.removeListener('asr-result', handleAsrResult);
       ipcRenderer.removeListener('asr-error', handleAsrError);
     };
-  }, []);
+  }, [autoExecuteOnFinal]);
 
   // 同步 voiceFinal 到 voiceText
   useEffect(() => {
@@ -169,14 +301,54 @@ const VoicePage: React.FC<VoicePageProps> = ({ onBack, onNavigate }) => {
     }
   };
 
-  // 执行命令
-  const handleCommand = async () => {
-    if (!voiceText.trim()) return;
+  const dispatchVoiceCommandToDevice = async (command: string): Promise<VoiceDispatchAck> => {
+    const ws = voiceBridgeWsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return {
+        requestId: '',
+        success: false,
+        reason: 'bridge disconnected',
+      };
+    }
 
-    const text = voiceText.toLowerCase();
-    console.log('[VoicePage] 执行命令:', text);
+    const requestId = `voice-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    const timeoutMs = 7000;
 
-    // 页面切换指令
+    try {
+      return await new Promise<VoiceDispatchAck>((resolve) => {
+        const timeout = window.setTimeout(() => {
+          voiceDispatchResolversRef.current.delete(requestId);
+          resolve({
+            requestId,
+            success: false,
+            reason: `dispatch timeout (${timeoutMs}ms)`,
+          });
+        }, timeoutMs);
+
+        voiceDispatchResolversRef.current.set(requestId, (ack) => {
+          window.clearTimeout(timeout);
+          resolve(ack);
+        });
+
+        ws.send(JSON.stringify({
+          type: 'voice_command_from_panel',
+          data: {
+            requestId,
+            text: command,
+          },
+        }));
+      });
+    } catch (error) {
+      voiceDispatchResolversRef.current.delete(requestId);
+      return {
+        requestId,
+        success: false,
+        reason: String(error),
+      };
+    }
+  };
+
+  const executeLocalCommand = async (text: string) => {
     if (text.includes('返回') || text.includes('主页') || text.includes('回到主页')) {
       setVoiceStatus('返回主页');
       setTimeout(() => onBack(), 500);
@@ -201,9 +373,7 @@ const VoicePage: React.FC<VoicePageProps> = ({ onBack, onNavigate }) => {
     } else if (text.includes('设置') || text.includes('快捷设置')) {
       setVoiceStatus('打开设置');
       setTimeout(() => onNavigate('settings'), 500);
-    }
-    // 应用启动指令
-    else if (text.includes('打开') || text.includes('启动') || text.includes('运行')) {
+    } else if (text.includes('打开') || text.includes('启动') || text.includes('运行')) {
       const appName = extractAppName(text);
       if (appName) {
         setVoiceStatus(`正在打开 ${appName}...`);
@@ -216,7 +386,7 @@ const VoicePage: React.FC<VoicePageProps> = ({ onBack, onNavigate }) => {
               setVoiceStatus(`打开失败: ${appName}`);
             }
           }
-        } catch (error) {
+        } catch {
           setVoiceStatus(`打开失败: ${appName}`);
         }
       } else {
@@ -227,6 +397,63 @@ const VoicePage: React.FC<VoicePageProps> = ({ onBack, onNavigate }) => {
     }
 
     setTimeout(() => setVoiceStatus(null), 2000);
+  };
+
+  async function executeCommandText(rawText: string, source: 'manual' | 'auto' = 'manual') {
+    const text = rawText.trim().toLowerCase();
+    if (!text) return;
+    if (executingCommandRef.current) {
+      if (source === 'manual') {
+        setVoiceStatus('上一条命令执行中，请稍候...');
+      }
+      return;
+    }
+
+    executingCommandRef.current = true;
+    try {
+      if (source === 'auto') {
+        setVoiceStatus(`自动执行: ${text}`);
+      } else {
+        setVoiceStatus('正在下发到 ESP32...');
+      }
+
+      const dispatch = await dispatchVoiceCommandToDevice(text);
+      if (dispatch.success) {
+        const detail = dispatch.message || '命令执行成功';
+        const targetLabel = dispatch.deviceId ? ` (${dispatch.deviceId})` : '';
+        setVoiceStatus(`ESP32${targetLabel}: ${detail}`);
+        setTimeout(() => setVoiceStatus(null), 2600);
+        return;
+      }
+
+      const reason = dispatch.reason || 'unknown error';
+      const fallbackToLocal =
+        reason.includes('no online esp32 device') ||
+        reason.includes('device not online') ||
+        reason.includes('bridge disconnected');
+
+      if (fallbackToLocal) {
+        setVoiceStatus('未检测到在线 ESP32，改为本地模拟执行');
+        setTimeout(() => {
+          executeLocalCommand(text).catch((error) => {
+            setVoiceStatus(`本地执行失败: ${String(error)}`);
+          });
+        }, 200);
+        return;
+      }
+
+      setVoiceStatus(`ESP32 执行失败: ${reason}`);
+      setTimeout(() => setVoiceStatus(null), 3000);
+    } finally {
+      executingCommandRef.current = false;
+    }
+  }
+
+  // 执行命令
+  const handleCommand = async () => {
+    if (!voiceText.trim()) return;
+    console.log('[VoicePage] 执行命令:', voiceText);
+    await executeCommandText(voiceText, 'manual');
   };
 
   // 从语音文本中提取应用名称
@@ -341,6 +568,36 @@ const VoicePage: React.FC<VoicePageProps> = ({ onBack, onNavigate }) => {
       >
         语音控制
       </Typography>
+
+      <Typography
+        variant="caption"
+        sx={{
+          color: voiceBridgeConnected ? '#81c784' : 'rgba(255, 255, 255, 0.55)',
+          fontSize: '0.72rem',
+          marginTop: -1.2,
+        }}
+      >
+        设备桥接: {voiceBridgeConnected ? '已连接（优先控制 ESP32）' : '未连接（执行将回退本地模拟）'}
+      </Typography>
+
+      <FormControlLabel
+        sx={{ marginTop: -1.2 }}
+        control={(
+          <Switch
+            size="small"
+            checked={autoExecuteOnFinal}
+            onChange={(event) => setAutoExecuteOnFinal(event.target.checked)}
+          />
+        )}
+        label={(
+          <Typography
+            variant="caption"
+            sx={{ color: 'rgba(255, 255, 255, 0.7)', fontSize: '0.72rem' }}
+          >
+            识别结束自动执行
+          </Typography>
+        )}
+      />
 
       {/* 波形可视化 */}
       <Box

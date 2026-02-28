@@ -13,6 +13,7 @@ import VoicePage from './simulator/VoicePage';
 import AIPage from './simulator/AIPage';
 
 const ESP32Simulator: React.FC = () => {
+  const DEBUG_LOG = false;
   const [currentPage, setCurrentPage] = useState<string>('home');
   const [wsConnected, setWsConnected] = useState(false);
   const [systemStats, setSystemStats] = useState({
@@ -31,13 +32,19 @@ const ESP32Simulator: React.FC = () => {
 
   // WebSocket 连接初始化
   useEffect(() => {
+    const log = (...args: unknown[]) => {
+      if (DEBUG_LOG) {
+        console.log('[ESP32 Simulator]', ...args);
+      }
+    };
+
     const connectWebSocket = () => {
-      console.log('[ESP32 Simulator] 正在连接 WebSocket...');
+      log('正在连接 WebSocket...');
       const ws = new WebSocket('ws://localhost:8765');
       wsRef.current = ws;
 
       ws.onopen = () => {
-        console.log('[ESP32 Simulator] WebSocket 已连接');
+        log('WebSocket 已连接');
         setWsConnected(true);
 
         // 发送握手消息
@@ -51,7 +58,7 @@ const ESP32Simulator: React.FC = () => {
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          console.log('[ESP32 Simulator] 收到消息:', data.type);
+          log('收到消息:', data.type);
 
           if (data.type === 'system_stats') {
             setSystemStats({
@@ -60,7 +67,7 @@ const ESP32Simulator: React.FC = () => {
               network: data.data.network
             });
           } else if (data.type === 'handshake_ack') {
-            console.log('[ESP32 Simulator] 握手成功:', data.data);
+            log('握手成功:', data.data);
           }
         } catch (error) {
           console.error('[ESP32 Simulator] 解析消息失败:', error);
@@ -68,7 +75,7 @@ const ESP32Simulator: React.FC = () => {
       };
 
       ws.onclose = () => {
-        console.log('[ESP32 Simulator] WebSocket 已断开');
+        log('WebSocket 已断开');
         setWsConnected(false);
 
         // 清理心跳定时器
@@ -79,7 +86,7 @@ const ESP32Simulator: React.FC = () => {
 
         // 5 秒后重连
         reconnectTimeoutRef.current = setTimeout(() => {
-          console.log('[ESP32 Simulator] 尝试重新连接...');
+          log('尝试重新连接...');
           connectWebSocket();
         }, 5000);
       };
@@ -108,8 +115,6 @@ const ESP32Simulator: React.FC = () => {
   useEffect(() => {
     if (!wsConnected) return;
 
-    console.log('[ESP32 Simulator] 启动心跳发送');
-
     heartbeatIntervalRef.current = setInterval(() => {
       setDeviceStatus(prev => {
         const newStatus = {
@@ -128,7 +133,6 @@ const ESP32Simulator: React.FC = () => {
               wifiSignal: Math.round(newStatus.wifiSignal)
             }
           }));
-          console.log('[ESP32 Simulator] 发送心跳, uptime:', newStatus.uptime);
         }
 
         return newStatus;
