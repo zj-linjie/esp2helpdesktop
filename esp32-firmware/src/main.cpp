@@ -46,6 +46,9 @@ struct TouchGestureState {
 };
 
 static constexpr uint32_t LONG_PRESS_MS = 800;
+static constexpr int16_t SWIPE_HOME_THRESHOLD = 60;
+static constexpr int16_t SWIPE_HOME_DIRECTION_MARGIN = 12;
+static constexpr int16_t SWIPE_HOME_MAX_X_DRIFT = 120;
 static constexpr uint32_t CLICK_SUPPRESS_MS_AFTER_HOME = 320;
 static constexpr float HOME_DEG_TO_RAD = 0.01745329252f;
 static uint32_t suppressClickUntilMs = 0;
@@ -1673,6 +1676,18 @@ static bool shouldSuppressClick() {
   return (int32_t)(millis() - suppressClickUntilMs) < 0;
 }
 
+static bool getActiveTouchPoint(lv_point_t *point) {
+  if (point == nullptr) {
+    return false;
+  }
+  lv_indev_t *indev = lv_indev_get_act();
+  if (indev == nullptr) {
+    return false;
+  }
+  lv_indev_get_point(indev, point);
+  return true;
+}
+
 static void suppressClicksAfterHome() {
   suppressClickUntilMs = millis() + CLICK_SUPPRESS_MS_AFTER_HOME;
 }
@@ -2680,6 +2695,12 @@ static void gestureEventCallback(lv_event_t *e) {
     gestureState.pressed = true;
     gestureState.longPressHandled = false;
     gestureState.startMs = millis();
+    lv_point_t start = {0, 0};
+    if (getActiveTouchPoint(&start)) {
+      gestureState.startPoint = start;
+    } else {
+      gestureState.startPoint = lv_point_t{0, 0};
+    }
     return;
   }
 
@@ -2704,6 +2725,25 @@ static void gestureEventCallback(lv_event_t *e) {
     if (!gestureState.pressed) {
       return;
     }
+
+    if (!gestureState.longPressHandled && currentPage != UI_PAGE_HOME) {
+      lv_point_t endPoint = gestureState.startPoint;
+      if (getActiveTouchPoint(&endPoint)) {
+        int32_t dx = (int32_t)endPoint.x - (int32_t)gestureState.startPoint.x;
+        int32_t dy = (int32_t)endPoint.y - (int32_t)gestureState.startPoint.y;
+        int32_t adx = (dx >= 0) ? dx : -dx;
+        int32_t ady = (dy >= 0) ? dy : -dy;
+
+        bool swipeUp = (dy <= -SWIPE_HOME_THRESHOLD) &&
+                       (ady > (adx + SWIPE_HOME_DIRECTION_MARGIN)) &&
+                       (adx <= SWIPE_HOME_MAX_X_DRIFT);
+        if (swipeUp) {
+          showPage(UI_PAGE_HOME);
+          suppressClicksAfterHome();
+        }
+      }
+    }
+
     gestureState = TouchGestureState();
     return;
   }
