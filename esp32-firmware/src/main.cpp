@@ -100,6 +100,9 @@ static lv_obj_t *appLauncherList = nullptr;
 static lv_obj_t *appLauncherTitle = nullptr;
 static lv_obj_t *appLauncherPageLabel = nullptr;
 static lv_obj_t *appLauncherStatusLabel = nullptr;
+static lv_obj_t *appLauncherPrevBtn = nullptr;
+static lv_obj_t *appLauncherNextBtn = nullptr;
+static lv_timer_t *appLauncherStatusTimer = nullptr;
 
 struct MacApp {
   char name[32];
@@ -700,6 +703,17 @@ static void showPage(int pageIndex) {
   updatePageIndicator();
 }
 
+static void attachGestureHandlers(lv_obj_t *obj) {
+  if (obj == nullptr) {
+    return;
+  }
+
+  lv_obj_add_event_cb(obj, gestureEventCallback, LV_EVENT_PRESSED, nullptr);
+  lv_obj_add_event_cb(obj, gestureEventCallback, LV_EVENT_PRESSING, nullptr);
+  lv_obj_add_event_cb(obj, gestureEventCallback, LV_EVENT_RELEASED, nullptr);
+  lv_obj_add_event_cb(obj, gestureEventCallback, LV_EVENT_PRESS_LOST, nullptr);
+}
+
 static lv_obj_t *createBasePage() {
   lv_obj_t *page = lv_obj_create(lv_scr_act());
   lv_obj_remove_style_all(page);
@@ -707,10 +721,7 @@ static lv_obj_t *createBasePage() {
   lv_obj_set_style_bg_opa(page, LV_OPA_TRANSP, LV_PART_MAIN);
   lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(page, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(page, gestureEventCallback, LV_EVENT_PRESSED, nullptr);
-  lv_obj_add_event_cb(page, gestureEventCallback, LV_EVENT_PRESSING, nullptr);
-  lv_obj_add_event_cb(page, gestureEventCallback, LV_EVENT_RELEASED, nullptr);
-  lv_obj_add_event_cb(page, gestureEventCallback, LV_EVENT_PRESS_LOST, nullptr);
+  attachGestureHandlers(page);
   return page;
 }
 
@@ -962,9 +973,70 @@ static uint32_t getColorFromString(const char* str) {
   return colors[hash % 12];
 }
 
+static void appLauncherStatusTimerCallback(lv_timer_t *timer) {
+  (void)timer;
+  appLauncherStatusTimer = nullptr;
+  if (appLauncherStatusLabel != nullptr) {
+    lv_obj_add_flag(appLauncherStatusLabel, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+static void setAppLauncherStatus(const char *text, lv_color_t color, bool autoHide = false, uint32_t hideMs = 2200) {
+  if (appLauncherStatusLabel == nullptr) {
+    return;
+  }
+
+  if (text == nullptr) {
+    text = "";
+  }
+
+  lv_label_set_text(appLauncherStatusLabel, text);
+  lv_obj_set_style_text_color(appLauncherStatusLabel, color, LV_PART_MAIN);
+  lv_obj_clear_flag(appLauncherStatusLabel, LV_OBJ_FLAG_HIDDEN);
+
+  if (appLauncherStatusTimer != nullptr) {
+    lv_timer_del(appLauncherStatusTimer);
+    appLauncherStatusTimer = nullptr;
+  }
+
+  if (autoHide) {
+    appLauncherStatusTimer = lv_timer_create(appLauncherStatusTimerCallback, hideMs, nullptr);
+    lv_timer_set_repeat_count(appLauncherStatusTimer, 1);
+  }
+}
+
+static void updateAppLauncherNavButtons() {
+  int totalPages = (appCount > 0) ? ((appCount + APPS_PER_PAGE - 1) / APPS_PER_PAGE) : 1;
+  bool canPrev = appPage > 0;
+  bool canNext = appPage < (totalPages - 1);
+
+  if (appLauncherPrevBtn != nullptr) {
+    if (canPrev) {
+      lv_obj_add_flag(appLauncherPrevBtn, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_set_style_opa(appLauncherPrevBtn, LV_OPA_COVER, LV_PART_MAIN);
+    } else {
+      lv_obj_clear_flag(appLauncherPrevBtn, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_set_style_opa(appLauncherPrevBtn, LV_OPA_50, LV_PART_MAIN);
+    }
+  }
+
+  if (appLauncherNextBtn != nullptr) {
+    if (canNext) {
+      lv_obj_add_flag(appLauncherNextBtn, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_set_style_opa(appLauncherNextBtn, LV_OPA_COVER, LV_PART_MAIN);
+    } else {
+      lv_obj_clear_flag(appLauncherNextBtn, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_set_style_opa(appLauncherNextBtn, LV_OPA_50, LV_PART_MAIN);
+    }
+  }
+}
+
 static void requestAppList() {
   if (!isConnected) {
     Serial.println("[AppLauncher] WebSocket not connected");
+    if (currentPage == UI_PAGE_APP_LAUNCHER) {
+      setAppLauncherStatus("WS disconnected", lv_color_hex(0xEF5350), true, 2800);
+    }
     return;
   }
 
@@ -981,13 +1053,23 @@ static void requestAppList() {
   webSocket.sendTXT(output);
 }
 
-static void launchApp(const char* appPath) {
-  if (!isConnected) {
-    Serial.println("[AppLauncher] WebSocket not connected");
-    return;
+static bool launchApp(const char *appPath, const char *appName, char *reason, size_t reasonSize) {
+  if (reason != nullptr && reasonSize > 0) {
+    reason[0] = '\0';
   }
 
-  Serial.printf("[AppLauncher] Launching app: %s\n", appPath);
+  if (!isConnected) {
+    Serial.println("[AppLauncher] WebSocket not connected");
+    copyText(reason, reasonSize, "WS disconnected");
+    return false;
+  }
+
+  if (appPath == nullptr || appPath[0] == '\0') {
+    copyText(reason, reasonSize, "Invalid app path");
+    return false;
+  }
+
+  Serial.printf("[AppLauncher] Launching app: %s (%s)\n", appName == nullptr ? "App" : appName, appPath);
 
   StaticJsonDocument<256> doc;
   doc["type"] = "launch_app";
@@ -999,6 +1081,7 @@ static void launchApp(const char* appPath) {
   String output;
   serializeJson(doc, output);
   webSocket.sendTXT(output);
+  return true;
 }
 
 static void updateAppLauncherDisplay() {
@@ -1009,6 +1092,28 @@ static void updateAppLauncherDisplay() {
   // Clear existing items
   lv_obj_clean(appLauncherList);
 
+  if (appCount <= 0) {
+    lv_obj_t *empty = lv_label_create(appLauncherList);
+    lv_label_set_text(empty, "No apps loaded.\nReconnect WS or retry.");
+    lv_obj_set_width(empty, 260);
+    lv_obj_set_style_text_color(empty, lv_color_hex(0xBDBDBD), LV_PART_MAIN);
+    lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
+    lv_obj_align(empty, LV_ALIGN_CENTER, 0, 0);
+    if (appLauncherPageLabel != nullptr) {
+      lv_label_set_text(appLauncherPageLabel, "0/0");
+    }
+    updateAppLauncherNavButtons();
+    return;
+  }
+
+  int totalPages = (appCount + APPS_PER_PAGE - 1) / APPS_PER_PAGE;
+  if (appPage >= totalPages) {
+    appPage = totalPages - 1;
+  }
+  if (appPage < 0) {
+    appPage = 0;
+  }
+
   int startIdx = appPage * APPS_PER_PAGE;
   int endIdx = min(startIdx + APPS_PER_PAGE, appCount);
 
@@ -1017,12 +1122,17 @@ static void updateAppLauncherDisplay() {
 
     // Create app item container
     lv_obj_t *item = lv_obj_create(appLauncherList);
-    lv_obj_set_size(item, 280, 60);
+    lv_obj_set_size(item, 280, 44);
     lv_obj_set_style_radius(item, 10, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(item, lv_color_hex(0x1E1E1E), LV_PART_MAIN);
-    lv_obj_set_style_border_width(item, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(item, lv_color_hex(0x171717), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(item, lv_color_hex(0x252525), LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(item, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(item, lv_color_hex(0x2B2B2B), LV_PART_MAIN);
     lv_obj_clear_flag(item, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(item, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(item, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_set_style_pad_all(item, 4, LV_PART_MAIN);
+    attachGestureHandlers(item);
 
     // Store app index in user data
     lv_obj_set_user_data(item, (void*)(intptr_t)i);
@@ -1035,65 +1145,61 @@ static void updateAppLauncherDisplay() {
       int appIdx = (int)(intptr_t)lv_obj_get_user_data(target);
 
       if (appIdx >= 0 && appIdx < appCount) {
-        // 显示启动状态
-        if (appLauncherStatusLabel != nullptr) {
-          char statusText[64];
+        char reason[96];
+        if (launchApp(appList[appIdx].path, appList[appIdx].name, reason, sizeof(reason))) {
+          char statusText[96];
           snprintf(statusText, sizeof(statusText), "Launching %s...", appList[appIdx].name);
-          lv_label_set_text(appLauncherStatusLabel, statusText);
-          lv_obj_clear_flag(appLauncherStatusLabel, LV_OBJ_FLAG_HIDDEN);
+          setAppLauncherStatus(statusText, lv_color_hex(0x81C784), true, 2600);
+          pushInboxMessage("app", "Launching", appList[appIdx].name);
+        } else {
+          char statusText[96];
+          snprintf(statusText, sizeof(statusText), "Launch blocked: %s", reason);
+          setAppLauncherStatus(statusText, lv_color_hex(0xEF5350), true, 3600);
+          pushInboxMessage("alert", "App launch blocked", reason);
         }
-
-        launchApp(appList[appIdx].path);
-        pushInboxMessage("app", "Launching", appList[appIdx].name);
-
-        // 2秒后隐藏状态标签
-        lv_timer_t *timer = lv_timer_create([](lv_timer_t *t) {
-          if (appLauncherStatusLabel != nullptr) {
-            lv_obj_add_flag(appLauncherStatusLabel, LV_OBJ_FLAG_HIDDEN);
-          }
-          lv_timer_del(t);
-        }, 2000, nullptr);
-        lv_timer_set_repeat_count(timer, 1);
       }
     }, LV_EVENT_CLICKED, nullptr);
 
     // Icon circle
     lv_obj_t *icon = lv_obj_create(item);
-    lv_obj_set_size(icon, 44, 44);
-    lv_obj_align(icon, LV_ALIGN_LEFT_MID, 8, 0);
-    lv_obj_set_style_radius(icon, 22, LV_PART_MAIN);
+    lv_obj_set_size(icon, 30, 30);
+    lv_obj_align(icon, LV_ALIGN_LEFT_MID, 4, 0);
+    lv_obj_set_style_radius(icon, 15, LV_PART_MAIN);
     lv_obj_set_style_bg_color(icon, lv_color_hex(app.color), LV_PART_MAIN);
     lv_obj_set_style_border_width(icon, 0, LV_PART_MAIN);
     lv_obj_clear_flag(icon, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(icon, LV_OBJ_FLAG_CLICKABLE);
 
     // Letter label
     lv_obj_t *letter = lv_label_create(icon);
     char letterStr[2] = {app.letter, '\0'};
     lv_label_set_text(letter, letterStr);
-    lv_obj_set_style_text_font(letter, &lv_font_montserrat_22, LV_PART_MAIN);
+    lv_obj_set_style_text_font(letter, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(letter, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
     lv_obj_center(letter);
 
-    // App name - 使用更大的字体
+    // App name
     lv_obj_t *name = lv_label_create(item);
     lv_label_set_text(name, app.name);
     lv_obj_set_style_text_font(name, &lv_font_montserrat_16, LV_PART_MAIN);
-    lv_obj_align(name, LV_ALIGN_LEFT_MID, 60, 0);
-    lv_label_set_long_mode(name, LV_LABEL_LONG_SCROLL_CIRCULAR); // 如果名称太长，滚动显示
-    lv_obj_set_width(name, 200); // 限制宽度
+    lv_obj_set_style_text_color(name, lv_color_hex(0xF5F5F5), LV_PART_MAIN);
+    lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(name, 220);
+    lv_obj_align(name, LV_ALIGN_LEFT_MID, 40, 0);
   }
 
   // Update page indicator
   if (appLauncherPageLabel != nullptr) {
-    int totalPages = (appCount + APPS_PER_PAGE - 1) / APPS_PER_PAGE;
     lv_label_set_text_fmt(appLauncherPageLabel, "%d/%d", appPage + 1, totalPages);
   }
+  updateAppLauncherNavButtons();
 }
 
 static void appLauncherPageCallback(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
   intptr_t direction = (intptr_t)lv_event_get_user_data(e);
-  int totalPages = (appCount + APPS_PER_PAGE - 1) / APPS_PER_PAGE;
+  int totalPages = (appCount > 0) ? ((appCount + APPS_PER_PAGE - 1) / APPS_PER_PAGE) : 1;
 
   if (direction == 0) { // Previous
     if (appPage > 0) {
@@ -1637,52 +1743,72 @@ static void createUi() {
   appLauncherTitle = lv_label_create(pages[UI_PAGE_APP_LAUNCHER]);
   lv_label_set_text(appLauncherTitle, "App Launcher");
   lv_obj_set_style_text_color(appLauncherTitle, lv_color_hex(0x90CAF9), LV_PART_MAIN);
-  lv_obj_align(appLauncherTitle, LV_ALIGN_TOP_MID, 0, 20);
+  lv_obj_align(appLauncherTitle, LV_ALIGN_TOP_MID, 0, 14);
 
   // App list container
   appLauncherList = lv_obj_create(pages[UI_PAGE_APP_LAUNCHER]);
-  lv_obj_set_size(appLauncherList, 300, 240);
-  lv_obj_align(appLauncherList, LV_ALIGN_CENTER, 0, 10);
+  lv_obj_set_size(appLauncherList, 300, 216);
+  lv_obj_align(appLauncherList, LV_ALIGN_TOP_MID, 0, 66);
   lv_obj_set_style_bg_color(appLauncherList, lv_color_hex(0x000000), LV_PART_MAIN);
-  lv_obj_set_style_border_width(appLauncherList, 0, LV_PART_MAIN);
+  lv_obj_set_style_border_width(appLauncherList, 1, LV_PART_MAIN);
+  lv_obj_set_style_border_color(appLauncherList, lv_color_hex(0x202020), LV_PART_MAIN);
+  lv_obj_set_style_radius(appLauncherList, 12, LV_PART_MAIN);
+  lv_obj_clear_flag(appLauncherList, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(appLauncherList, LV_OBJ_FLAG_GESTURE_BUBBLE);
   lv_obj_set_flex_flow(appLauncherList, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(appLauncherList, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  lv_obj_set_style_pad_row(appLauncherList, 8, LV_PART_MAIN);
+  lv_obj_set_style_pad_row(appLauncherList, 6, LV_PART_MAIN);
   lv_obj_set_style_pad_all(appLauncherList, 10, LV_PART_MAIN);
-
-  // Page navigation buttons
-  lv_obj_t *prevBtn = lv_btn_create(pages[UI_PAGE_APP_LAUNCHER]);
-  lv_obj_set_size(prevBtn, 60, 30);
-  lv_obj_align(prevBtn, LV_ALIGN_BOTTOM_LEFT, 30, -15);
-  lv_obj_set_style_radius(prevBtn, 8, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(prevBtn, lv_color_hex(0x1E1E1E), LV_PART_MAIN);
-  lv_obj_add_event_cb(prevBtn, appLauncherPageCallback, LV_EVENT_CLICKED, (void*)0);
-  lv_obj_t *prevLabel = lv_label_create(prevBtn);
-  lv_label_set_text(prevLabel, "Prev");
-  lv_obj_center(prevLabel);
-
-  appLauncherPageLabel = lv_label_create(pages[UI_PAGE_APP_LAUNCHER]);
-  lv_label_set_text(appLauncherPageLabel, "1/1");
-  lv_obj_set_style_text_color(appLauncherPageLabel, lv_color_hex(0x808080), LV_PART_MAIN);
-  lv_obj_align(appLauncherPageLabel, LV_ALIGN_BOTTOM_MID, 0, -20);
-
-  lv_obj_t *nextBtn = lv_btn_create(pages[UI_PAGE_APP_LAUNCHER]);
-  lv_obj_set_size(nextBtn, 60, 30);
-  lv_obj_align(nextBtn, LV_ALIGN_BOTTOM_RIGHT, -30, -15);
-  lv_obj_set_style_radius(nextBtn, 8, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(nextBtn, lv_color_hex(0x1E1E1E), LV_PART_MAIN);
-  lv_obj_add_event_cb(nextBtn, appLauncherPageCallback, LV_EVENT_CLICKED, (void*)1);
-  lv_obj_t *nextLabel = lv_label_create(nextBtn);
-  lv_label_set_text(nextLabel, "Next");
-  lv_obj_center(nextLabel);
+  attachGestureHandlers(appLauncherList);
 
   // Status label for launch feedback
   appLauncherStatusLabel = lv_label_create(pages[UI_PAGE_APP_LAUNCHER]);
-  lv_label_set_text(appLauncherStatusLabel, "Launching...");
-  lv_obj_set_style_text_color(appLauncherStatusLabel, lv_color_hex(0x4CAF50), LV_PART_MAIN);
-  lv_obj_set_style_text_font(appLauncherStatusLabel, &lv_font_montserrat_16, LV_PART_MAIN);
-  lv_obj_align(appLauncherStatusLabel, LV_ALIGN_TOP_MID, 0, 45);
-  lv_obj_add_flag(appLauncherStatusLabel, LV_OBJ_FLAG_HIDDEN); // 默认隐藏
+  lv_label_set_text(appLauncherStatusLabel, "Ready");
+  lv_obj_set_style_text_color(appLauncherStatusLabel, lv_color_hex(0xAFAFAF), LV_PART_MAIN);
+  lv_obj_set_style_text_font(appLauncherStatusLabel, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_align(appLauncherStatusLabel, LV_ALIGN_TOP_MID, 0, 42);
+  lv_obj_add_flag(appLauncherStatusLabel, LV_OBJ_FLAG_HIDDEN);
+
+  // Navigation bar (moved inward for easier tapping on circular screen)
+  lv_obj_t *appNavBar = lv_obj_create(pages[UI_PAGE_APP_LAUNCHER]);
+  lv_obj_set_size(appNavBar, 280, 46);
+  lv_obj_align(appNavBar, LV_ALIGN_BOTTOM_MID, 0, -30);
+  lv_obj_set_style_radius(appNavBar, 14, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(appNavBar, lv_color_hex(0x141414), LV_PART_MAIN);
+  lv_obj_set_style_border_color(appNavBar, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(appNavBar, 1, LV_PART_MAIN);
+  lv_obj_clear_flag(appNavBar, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(appNavBar, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  attachGestureHandlers(appNavBar);
+
+  appLauncherPrevBtn = lv_btn_create(appNavBar);
+  lv_obj_set_size(appLauncherPrevBtn, 94, 34);
+  lv_obj_align(appLauncherPrevBtn, LV_ALIGN_LEFT_MID, 6, 0);
+  lv_obj_set_style_radius(appLauncherPrevBtn, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(appLauncherPrevBtn, lv_color_hex(0x222222), LV_PART_MAIN);
+  lv_obj_add_flag(appLauncherPrevBtn, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  attachGestureHandlers(appLauncherPrevBtn);
+  lv_obj_add_event_cb(appLauncherPrevBtn, appLauncherPageCallback, LV_EVENT_CLICKED, (void*)0);
+  lv_obj_t *prevLabel = lv_label_create(appLauncherPrevBtn);
+  lv_label_set_text(prevLabel, "Prev");
+  lv_obj_center(prevLabel);
+
+  appLauncherPageLabel = lv_label_create(appNavBar);
+  lv_label_set_text(appLauncherPageLabel, "1/1");
+  lv_obj_set_style_text_color(appLauncherPageLabel, lv_color_hex(0xC2C2C2), LV_PART_MAIN);
+  lv_obj_align(appLauncherPageLabel, LV_ALIGN_CENTER, 0, 0);
+
+  appLauncherNextBtn = lv_btn_create(appNavBar);
+  lv_obj_set_size(appLauncherNextBtn, 94, 34);
+  lv_obj_align(appLauncherNextBtn, LV_ALIGN_RIGHT_MID, -6, 0);
+  lv_obj_set_style_radius(appLauncherNextBtn, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(appLauncherNextBtn, lv_color_hex(0x222222), LV_PART_MAIN);
+  lv_obj_add_flag(appLauncherNextBtn, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  attachGestureHandlers(appLauncherNextBtn);
+  lv_obj_add_event_cb(appLauncherNextBtn, appLauncherPageCallback, LV_EVENT_CLICKED, (void*)1);
+  lv_obj_t *nextLabel = lv_label_create(appLauncherNextBtn);
+  lv_label_set_text(nextLabel, "Next");
+  lv_obj_center(nextLabel);
 
   // Global page indicator
   pageIndicatorLabel = lv_label_create(lv_scr_act());
@@ -1809,6 +1935,7 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
       isConnected = false;
       setWsStatus("WS: disconnected");
       pushInboxMessage("alert", "WebSocket", "Connection lost");
+      setAppLauncherStatus("WS disconnected", lv_color_hex(0xEF5350), true, 2800);
       break;
 
     case WStype_CONNECTED:
@@ -1882,9 +2009,42 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
         const char *taskId = data["taskId"] | data["id"] | "";
         bool actionable = data["actionable"] | true;
         pushInboxMessage(actionable ? "task" : "info", title, body, taskId, actionable);
+      } else if (strcmp(messageType, "launch_app_response") == 0) {
+        JsonObjectConst data = doc["data"].as<JsonObjectConst>();
+        bool success = data["success"] | false;
+        const char *message = data["message"] | "";
+        const char *reason = data["reason"] | "";
+        const char *appPath = data["appPath"] | "";
+        const char *appNameRaw = data["appName"] | "";
+
+        char appName[48];
+        if (appNameRaw[0] != '\0') {
+          copyText(appName, sizeof(appName), appNameRaw);
+        } else if (appPath[0] != '\0') {
+          const char *base = strrchr(appPath, '/');
+          base = (base == nullptr) ? appPath : (base + 1);
+          copyText(appName, sizeof(appName), base);
+          size_t len = strlen(appName);
+          if (len > 4 && strcmp(appName + len - 4, ".app") == 0) {
+            appName[len - 4] = '\0';
+          }
+        } else {
+          copyText(appName, sizeof(appName), "App");
+        }
+
+        char detail[120];
+        if (success) {
+          snprintf(detail, sizeof(detail), "Opened: %s", appName);
+          setAppLauncherStatus(detail, lv_color_hex(0x81C784), true, 2400);
+          pushInboxMessage("event", "App launch OK", detail);
+        } else {
+          const char *errorText = (reason[0] != '\0') ? reason : ((message[0] != '\0') ? message : "Unknown error");
+          snprintf(detail, sizeof(detail), "Launch failed: %s", errorText);
+          setAppLauncherStatus(detail, lv_color_hex(0xEF5350), true, 4800);
+          pushInboxMessage("alert", "App launch failed", detail);
+        }
       } else if (
         strcmp(messageType, "app_launched") == 0 ||
-        strcmp(messageType, "launch_app_response") == 0 ||
         strcmp(messageType, "command_result") == 0
       ) {
         JsonObjectConst data = doc["data"].as<JsonObjectConst>();
@@ -1920,8 +2080,16 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
           const char *path = app["path"] | "";
 
           strncpy(appList[appCount].name, name, sizeof(appList[appCount].name) - 1);
+          appList[appCount].name[sizeof(appList[appCount].name) - 1] = '\0';
           strncpy(appList[appCount].path, path, sizeof(appList[appCount].path) - 1);
-          appList[appCount].letter = name[0];
+          appList[appCount].path[sizeof(appList[appCount].path) - 1] = '\0';
+          char letter = appList[appCount].name[0];
+          if (letter >= 'a' && letter <= 'z') {
+            letter = letter - 'a' + 'A';
+          } else if (!((letter >= 'A' && letter <= 'Z') || (letter >= '0' && letter <= '9'))) {
+            letter = '#';
+          }
+          appList[appCount].letter = letter;
           appList[appCount].color = getColorFromString(name);
 
           appCount++;
@@ -1929,6 +2097,7 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
 
         Serial.printf("[AppLauncher] Received %d apps\n", appCount);
         appPage = 0;
+        setAppLauncherStatus("App list updated", lv_color_hex(0x9CCC65), true, 1600);
         updateAppLauncherDisplay();
       } else {
         Serial.printf("[WebSocket] unhandled type: %s\n", messageType);

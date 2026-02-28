@@ -166,9 +166,9 @@ cd /Users/apple/dev/esp2helpdesktop/esp32-firmware
 
 ---
 
-## 6. 已知未解决问题（重点）
+## 6. 当时未解决问题（已在第 11 节闭环）
 
-问题：  
+当时问题：  
 在第 8 页点击应用后，屏幕会出现 `Launching ...`，但 Mac 侧应用没有被拉起。
 
 已确认事实：
@@ -240,3 +240,110 @@ ioreg -p IOUSB -w0 -l | rg -i "esp|usb jtag|serial"
 - 第一版接力文档：`docs/progress/2026-02-27-esp32-handoff.md`
 - 本文档：在上述基础上补齐 2/28 新增开发记录与 App Launcher 问题状态，供当前同事直接接手。
 
+---
+
+## 10. 2026-02-28 二次修复（App Launcher 可用性 + 启动反馈链路）
+
+本轮针对用户提出的 5 个问题完成了落地修改：
+
+1. 应用名称可见性  
+- 列表项改为固定“图标 + 名称”行布局
+- 名称颜色强制为亮色，非仅首字母图标
+- 长名称使用 `LV_LABEL_LONG_DOT` 防止溢出
+
+2. 翻页按钮可点性  
+- `Prev/Next` 从边角移到底部中间安全区导航条
+- 按钮尺寸加大，点击热区变大
+- 支持根据页码自动禁用不可点击按钮（透明度降低）
+
+3. 未连接时阻断假启动  
+- 点击应用前先校验 `isConnected`
+- 断连时页面状态栏显示 `WS disconnected`，并写入 Inbox 告警
+
+4. 后端返回详细失败原因  
+- `launch_app` 改用 `execFile('open', [path])`，避免 shell 引号问题
+- 增加路径校验（必须是 `/Applications/*.app`）
+- 增加文件存在性校验
+- 失败响应返回 `reason`（截断至 180 字符）
+
+5. 启动响应双通道展示  
+- 固件新增 `launch_app_response` 专门处理分支
+- 成功/失败同时更新：
+  - App Launcher 状态栏（绿色成功、红色失败）
+  - Inbox 消息（event/alert）
+
+本轮改动文件：
+
+- `esp32-firmware/src/main.cpp`
+- `electron-app/src/main/websocket.ts`
+
+本轮验证：
+
+- Electron 构建通过：`npm run build`
+- 固件构建通过：`platformio run -e esp32-s3-devkit`
+- 固件已烧录到设备：`platformio run -t upload --upload-port /dev/cu.usbmodem21101`
+
+备注：
+
+- 串口监视阶段未抓到可读业务日志（设备持续输出点状字符），建议接手同事在下轮调试时配合 Electron 控制台日志做端到端确认。
+
+---
+
+## 11. 失败经验复盘（本轮已闭环）
+
+本轮“点击有 Launching 但不打开 / 左右滑动疑似假死”的根因不是单点，而是多因素叠加：
+
+1. WiFi 配置误刷为占位值  
+- 现象：设备看起来卡住、页面交互异常，串口持续异常输出。
+- 根因：`esp32-firmware/src/config.h` 被模板值覆盖，设备无法稳定连到后端。
+- 处理：恢复本地 WiFi 与 WS 地址后重新烧录。
+
+2. App Launcher 容器吞手势  
+- 现象：在第 8 页左右滑动不灵，像“假死”。
+- 根因：列表容器与按钮区域对触摸事件拦截，页面级手势没有稳定透传。
+- 处理：关闭列表滚动、开启 gesture bubble，并对关键容器绑定手势回调。
+
+3. 启动链路错误信息不透明  
+- 现象：只有“Failed to launch app”，无法判断失败点。
+- 根因：后端未返回详细失败原因。
+- 处理：后端新增路径校验/文件存在性校验，返回 `reason` 字段；固件页面 + Inbox 同步展示。
+
+4. 并行构建导致伪失败  
+- 现象：一度出现 `undefined reference to setup/loop` 与 `firmware.elf not found`。
+- 根因：同一环境并行启动多个 PlatformIO 任务，构建产物竞争。
+- 处理：统一改为串行流程：`run` 后再 `run -t upload`。
+
+当前状态：  
+- 第 8 页应用名称显示正常  
+- 翻页按钮命中率已提升  
+- Launch 成功/失败路径均有可读反馈  
+- 设备联机后左右滑动恢复正常（用户已口头确认“好了成功了”）
+
+---
+
+## 12. Electron 端“自定义 Launch 配置”现状
+
+结论：已有基础代码，不是从零开始。
+
+已有能力：
+
+1. 主进程 IPC  
+- `electron-app/src/main/index.ts` 已有：
+  - `launch-app`
+  - `scan-applications`
+
+2. 渲染层配置服务  
+- `electron-app/src/renderer/services/appLauncherService.ts` 已支持：
+  - 本地持久化（`app_launcher_settings`）
+  - 扫描应用、添加/删除应用、启动应用
+
+3. 设置界面  
+- `electron-app/src/renderer/components/SettingsPanel.tsx` 已有“应用启动器管理”卡片：
+  - 扫描 `/Applications`
+  - 已添加应用列表
+  - 可添加应用列表 + 搜索 + 删除
+
+与当前 ESP32 第 8 页关系：
+
+- 现在 ESP32 从 WebSocket 端拿到的是后端临时扫描的 top 12。
+- 若要“后台自定义后再同步到硬件”，下一步应把 SettingsPanel 里维护的 app 列表接入 `websocket.ts` 的 `app_list_request` 响应源（而不是每次临时扫描）。

@@ -1,9 +1,12 @@
 import { WebSocketServer, WebSocket } from 'ws'
 import { SystemMonitor } from './system.js'
-import { exec } from 'child_process'
+import { exec, execFile } from 'child_process'
 import { promisify } from 'util'
+import { access } from 'fs/promises'
+import { constants as fsConstants } from 'fs'
 
 const execAsync = promisify(exec)
+const execFileAsync = promisify(execFile)
 
 interface ClientInfo {
   ws: WebSocket
@@ -340,22 +343,63 @@ export class DeviceWebSocketServer {
   private async handleLaunchApp(ws: WebSocket, client: ClientInfo, message: any) {
     if (client.type !== 'esp32_device') return
 
-    const { appPath } = message.data
-    console.log(`[启动应用] 设备: ${client.deviceId}, 应用: ${appPath}`)
+    const rawPath = typeof message?.data?.appPath === 'string' ? message.data.appPath.trim() : ''
+    const appName = rawPath.split('/').pop()?.replace(/\.app$/i, '') || 'App'
+
+    console.log(`[启动应用] 设备: ${client.deviceId}, 应用: ${rawPath}, 长度: ${rawPath.length}`)
+
+    const sendFailure = (reason: string) => {
+      const compactReason = reason.length > 180 ? `${reason.slice(0, 180)}...` : reason
+      console.error(`[启动应用] 失败: ${compactReason}`)
+      this.sendMessage(ws, {
+        type: 'launch_app_response',
+        data: {
+          success: false,
+          appPath: rawPath,
+          appName,
+          message: 'Failed to launch app',
+          reason: compactReason
+        }
+      })
+    }
+
+    if (!rawPath) {
+      sendFailure('appPath missing')
+      return
+    }
+
+    if (!rawPath.startsWith('/Applications/') || !rawPath.toLowerCase().endsWith('.app')) {
+      sendFailure(`invalid app path: ${rawPath}`)
+      return
+    }
 
     try {
-      // 使用 open 命令启动应用
-      await execAsync(`open "${appPath}"`)
+      await access(rawPath, fsConstants.F_OK)
+    } catch {
+      sendFailure(`app not found: ${rawPath}`)
+      return
+    }
 
-      console.log(`[启动应用] 成功: ${appPath}`)
+    try {
+      // Use execFile to avoid shell quoting issues.
+      const { stdout, stderr } = await execFileAsync('open', [rawPath])
+      if (stdout.trim().length > 0) {
+        console.log(`[启动应用] stdout: ${stdout.trim()}`)
+      }
+      if (stderr.trim().length > 0) {
+        console.log(`[启动应用] stderr: ${stderr.trim()}`)
+      }
+
+      console.log(`[启动应用] 成功: ${rawPath}`)
 
       // 发送成功响应
       this.sendMessage(ws, {
         type: 'launch_app_response',
         data: {
           success: true,
-          appPath,
-          message: 'App launched successfully'
+          appPath: rawPath,
+          appName,
+          message: `App launched: ${appName}`
         }
       })
 
@@ -364,22 +408,18 @@ export class DeviceWebSocketServer {
         type: 'app_launched',
         data: {
           deviceId: client.deviceId,
-          appPath,
+          appPath: rawPath,
+          appName,
           success: true
         }
       })
     } catch (error) {
-      console.error('[启动应用] 失败:', error)
-
-      // 发送失败响应
-      this.sendMessage(ws, {
-        type: 'launch_app_response',
-        data: {
-          success: false,
-          appPath,
-          message: 'Failed to launch app'
-        }
-      })
+      const err = error as Error & { stderr?: string; stdout?: string; code?: number | string }
+      const stderrText = typeof err.stderr === 'string' ? err.stderr.trim() : ''
+      const reason = stderrText.length > 0
+        ? `${err.message}${err.code !== undefined ? ` (code ${err.code})` : ''} | ${stderrText}`
+        : `${err.message}${err.code !== undefined ? ` (code ${err.code})` : ''}`
+      sendFailure(reason)
     }
   }
 
