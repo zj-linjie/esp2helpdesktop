@@ -5,6 +5,7 @@
 #include <HTTPClient.h>
 #include <lvgl.h>
 #include <Preferences.h>
+#include <SD_MMC.h>
 #include <stdint.h>
 #include <time.h>
 #include "config.h"
@@ -71,6 +72,8 @@ static lv_obj_t *diagIpLabel = nullptr;
 static lv_obj_t *diagRssiLabel = nullptr;
 static lv_obj_t *diagUptimeLabel = nullptr;
 static lv_obj_t *diagServerLabel = nullptr;
+static lv_obj_t *diagSdLabel = nullptr;
+static lv_obj_t *diagSdRootLabel = nullptr;
 static lv_obj_t *diagActionLabel = nullptr;
 static lv_obj_t *brightnessSlider = nullptr;
 static lv_obj_t *brightnessValueLabel = nullptr;
@@ -124,6 +127,16 @@ static uint8_t screenBrightness = 100;
 static bool aiStatusInitialized = false;
 static bool lastAiOnline = false;
 static bool lastAiTalking = false;
+static bool sdInitAttempted = false;
+static bool sdMounted = false;
+static bool sdMode1Bit = false;
+static uint8_t sdCardType = CARD_NONE;
+static uint64_t sdTotalBytes = 0;
+static uint64_t sdUsedBytes = 0;
+static uint32_t sdRootDirCount = 0;
+static uint32_t sdRootFileCount = 0;
+static char sdRootPreview[96] = "--";
+static char sdMountReason[64] = "not checked";
 
 enum PomodoroMode {
   POMODORO_WORK = 0,
@@ -451,6 +464,163 @@ static void applyBrightness(uint8_t brightness, bool persist) {
   }
 }
 
+static const char *sdCardTypeToText(uint8_t cardType) {
+  switch (cardType) {
+    case CARD_MMC: return "MMC";
+    case CARD_SD: return "SDSC";
+    case CARD_SDHC: return "SDHC";
+    default: return "NONE";
+  }
+}
+
+static void formatStorageSize(uint64_t bytes, char *dst, size_t dstSize) {
+  if (dst == nullptr || dstSize == 0) {
+    return;
+  }
+
+  const char *units[] = {"B", "KB", "MB", "GB"};
+  double value = (double)bytes;
+  int unit = 0;
+  while (value >= 1024.0 && unit < 3) {
+    value /= 1024.0;
+    unit++;
+  }
+
+  if (unit == 0) {
+    snprintf(dst, dstSize, "%llu%s", (unsigned long long)bytes, units[unit]);
+  } else {
+    snprintf(dst, dstSize, "%.1f%s", value, units[unit]);
+  }
+}
+
+static void scanSdRootDirectory() {
+  sdRootDirCount = 0;
+  sdRootFileCount = 0;
+  copyText(sdRootPreview, sizeof(sdRootPreview), "(empty)");
+
+  File root = SD_MMC.open("/");
+  if (!root || !root.isDirectory()) {
+    copyText(sdRootPreview, sizeof(sdRootPreview), "root open failed");
+    return;
+  }
+
+  char preview[96];
+  preview[0] = '\0';
+  int previewItems = 0;
+
+  while (true) {
+    File entry = root.openNextFile();
+    if (!entry) {
+      break;
+    }
+
+    if (entry.isDirectory()) {
+      sdRootDirCount++;
+    } else {
+      sdRootFileCount++;
+    }
+
+    if (previewItems < 3) {
+      const char *name = entry.name();
+      if (name != nullptr && name[0] != '\0') {
+        while (*name == '/') {
+          name++;
+        }
+
+        char shortName[32];
+        if (strlen(name) > 18) {
+          snprintf(shortName, sizeof(shortName), "%.18s...", name);
+        } else {
+          snprintf(shortName, sizeof(shortName), "%s", name);
+        }
+
+        size_t offset = strlen(preview);
+        if (previewItems > 0 && offset < sizeof(preview) - 1) {
+          snprintf(preview + offset, sizeof(preview) - offset, ", ");
+          offset = strlen(preview);
+        }
+        if (offset < sizeof(preview) - 1) {
+          snprintf(preview + offset, sizeof(preview) - offset, "%s", shortName);
+        }
+        previewItems++;
+      }
+    }
+
+    entry.close();
+  }
+
+  root.close();
+
+  if (previewItems > 0) {
+    copyText(sdRootPreview, sizeof(sdRootPreview), preview);
+  }
+}
+
+static void detectAndScanSdCard() {
+  sdInitAttempted = true;
+  sdMounted = false;
+  sdMode1Bit = false;
+  sdCardType = CARD_NONE;
+  sdTotalBytes = 0;
+  sdUsedBytes = 0;
+  sdRootDirCount = 0;
+  sdRootFileCount = 0;
+  copyText(sdRootPreview, sizeof(sdRootPreview), "--");
+  copyText(sdMountReason, sizeof(sdMountReason), "mounting");
+
+  SD_MMC.end();
+
+  bool mounted = false;
+  if (SD_MMC.setPins(SD_MMC_CLK_PIN, SD_MMC_CMD_PIN, SD_MMC_D0_PIN, SD_MMC_D1_PIN, SD_MMC_D2_PIN, SD_MMC_D3_PIN)) {
+    mounted = SD_MMC.begin("/sdcard", false, false, SDMMC_FREQ_DEFAULT);
+    sdMode1Bit = false;
+  }
+
+  if (!mounted) {
+    SD_MMC.end();
+    if (SD_MMC.setPins(SD_MMC_CLK_PIN, SD_MMC_CMD_PIN, SD_MMC_D0_PIN)) {
+      mounted = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT);
+      sdMode1Bit = true;
+    }
+  }
+
+  if (!mounted) {
+    copyText(sdMountReason, sizeof(sdMountReason), "mount failed");
+    Serial.println("[SD] mount failed");
+    return;
+  }
+
+  sdCardType = SD_MMC.cardType();
+  if (sdCardType == CARD_NONE) {
+    SD_MMC.end();
+    copyText(sdMountReason, sizeof(sdMountReason), "no card");
+    Serial.println("[SD] no card");
+    return;
+  }
+
+  sdMounted = true;
+  sdTotalBytes = SD_MMC.totalBytes();
+  sdUsedBytes = SD_MMC.usedBytes();
+  scanSdRootDirectory();
+  copyText(sdMountReason, sizeof(sdMountReason), "ok");
+
+  char totalText[16];
+  char usedText[16];
+  formatStorageSize(sdTotalBytes, totalText, sizeof(totalText));
+  formatStorageSize(sdUsedBytes, usedText, sizeof(usedText));
+
+  Serial.printf(
+    "[SD] mounted mode=%s type=%s used=%s total=%s dirs=%lu files=%lu root=%s\n",
+    sdMode1Bit ? "1-bit" : "4-bit",
+    sdCardTypeToText(sdCardType),
+    usedText,
+    totalText,
+    (unsigned long)sdRootDirCount,
+    (unsigned long)sdRootFileCount,
+    sdRootPreview
+  );
+}
+
 static void beginWebSocketClient() {
   setWsStatus("WS: connecting...");
   webSocket.begin(WS_SERVER_HOST, WS_SERVER_PORT, "/");
@@ -489,6 +659,37 @@ static void updateDiagnosticStatus() {
 
   if (diagServerLabel != nullptr) {
     lv_label_set_text_fmt(diagServerLabel, "Server: %s:%d", WS_SERVER_HOST, WS_SERVER_PORT);
+  }
+
+  if (diagSdLabel != nullptr) {
+    if (!sdInitAttempted) {
+      lv_label_set_text(diagSdLabel, "SD: checking...");
+    } else if (!sdMounted) {
+      lv_label_set_text_fmt(diagSdLabel, "SD: %s", sdMountReason);
+    } else {
+      char totalText[16];
+      char usedText[16];
+      formatStorageSize(sdTotalBytes, totalText, sizeof(totalText));
+      formatStorageSize(sdUsedBytes, usedText, sizeof(usedText));
+      lv_label_set_text_fmt(
+        diagSdLabel,
+        "SD: %s %s %s/%s D%lu F%lu",
+        sdMode1Bit ? "1-bit" : "4-bit",
+        sdCardTypeToText(sdCardType),
+        usedText,
+        totalText,
+        (unsigned long)sdRootDirCount,
+        (unsigned long)sdRootFileCount
+      );
+    }
+  }
+
+  if (diagSdRootLabel != nullptr) {
+    if (!sdMounted) {
+      lv_label_set_text(diagSdRootLabel, "Root: --");
+    } else {
+      lv_label_set_text_fmt(diagSdRootLabel, "Root: %s", sdRootPreview);
+    }
   }
 }
 
@@ -1489,7 +1690,7 @@ static void createUi() {
   lv_obj_align(settingsTitle, LV_ALIGN_TOP_MID, 0, 14);
 
   lv_obj_t *diagPanel = lv_obj_create(pages[UI_PAGE_SETTINGS]);
-  lv_obj_set_size(diagPanel, 300, 98);
+  lv_obj_set_size(diagPanel, 300, 124);
   lv_obj_align(diagPanel, LV_ALIGN_TOP_MID, 0, 36);
   lv_obj_set_style_radius(diagPanel, 12, LV_PART_MAIN);
   lv_obj_set_style_bg_color(diagPanel, lv_color_hex(0x111111), LV_PART_MAIN);
@@ -1521,14 +1722,25 @@ static void createUi() {
   lv_label_set_text(diagServerLabel, "Server: --");
   lv_obj_align(diagServerLabel, LV_ALIGN_TOP_LEFT, 148, 74);
 
-  createSettingsButton(pages[UI_PAGE_SETTINGS], "WiFi Reconnect", 34, 142, SETTINGS_ACTION_WIFI_RECONNECT);
-  createSettingsButton(pages[UI_PAGE_SETTINGS], "WS Reconnect", 190, 142, SETTINGS_ACTION_WS_RECONNECT);
-  createSettingsButton(pages[UI_PAGE_SETTINGS], "NTP Sync", 34, 182, SETTINGS_ACTION_NTP_SYNC);
-  createSettingsButton(pages[UI_PAGE_SETTINGS], "Reboot", 190, 182, SETTINGS_ACTION_REBOOT);
+  diagSdLabel = lv_label_create(diagPanel);
+  lv_label_set_text(diagSdLabel, "SD: checking...");
+  lv_obj_align(diagSdLabel, LV_ALIGN_TOP_LEFT, 10, 90);
+
+  diagSdRootLabel = lv_label_create(diagPanel);
+  lv_label_set_text(diagSdRootLabel, "Root: --");
+  lv_obj_set_width(diagSdRootLabel, 280);
+  lv_label_set_long_mode(diagSdRootLabel, LV_LABEL_LONG_DOT);
+  lv_obj_set_style_text_color(diagSdRootLabel, lv_color_hex(0xB0B0B0), LV_PART_MAIN);
+  lv_obj_align(diagSdRootLabel, LV_ALIGN_TOP_LEFT, 10, 106);
+
+  createSettingsButton(pages[UI_PAGE_SETTINGS], "WiFi Reconnect", 34, 166, SETTINGS_ACTION_WIFI_RECONNECT);
+  createSettingsButton(pages[UI_PAGE_SETTINGS], "WS Reconnect", 190, 166, SETTINGS_ACTION_WS_RECONNECT);
+  createSettingsButton(pages[UI_PAGE_SETTINGS], "NTP Sync", 34, 206, SETTINGS_ACTION_NTP_SYNC);
+  createSettingsButton(pages[UI_PAGE_SETTINGS], "Reboot", 190, 206, SETTINGS_ACTION_REBOOT);
 
   lv_obj_t *brightnessPanel = lv_obj_create(pages[UI_PAGE_SETTINGS]);
   lv_obj_set_size(brightnessPanel, 300, 54);
-  lv_obj_align(brightnessPanel, LV_ALIGN_TOP_MID, 0, 222);
+  lv_obj_align(brightnessPanel, LV_ALIGN_TOP_MID, 0, 246);
   lv_obj_set_style_radius(brightnessPanel, 12, LV_PART_MAIN);
   lv_obj_set_style_bg_color(brightnessPanel, lv_color_hex(0x111111), LV_PART_MAIN);
   lv_obj_set_style_border_color(brightnessPanel, lv_color_hex(0x2E2E2E), LV_PART_MAIN);
@@ -1558,7 +1770,7 @@ static void createUi() {
 
   diagUptimeLabel = lv_label_create(pages[UI_PAGE_SETTINGS]);
   lv_label_set_text(diagUptimeLabel, "Uptime: 00:00:00");
-  lv_obj_align(diagUptimeLabel, LV_ALIGN_TOP_MID, 0, 282);
+  lv_obj_align(diagUptimeLabel, LV_ALIGN_TOP_MID, 0, 306);
 
   // Page 5: Inbox & Tasks
   pages[UI_PAGE_INBOX] = createBasePage();
@@ -2128,6 +2340,24 @@ void setup() {
 
   scr_lvgl_init();
   createUi();
+  detectAndScanSdCard();
+  if (sdMounted) {
+    char body[128];
+    snprintf(
+      body,
+      sizeof(body),
+      "%s, D%lu/F%lu, %s",
+      sdCardTypeToText(sdCardType),
+      (unsigned long)sdRootDirCount,
+      (unsigned long)sdRootFileCount,
+      sdRootPreview
+    );
+    pushInboxMessage("event", "SD mounted", body);
+  } else {
+    char body[96];
+    snprintf(body, sizeof(body), "status: %s", sdMountReason);
+    pushInboxMessage("alert", "SD not mounted", body);
+  }
 
   Serial.printf("Connecting WiFi: %s\n", WIFI_SSID);
   setWifiStatus("WiFi: connecting...");
