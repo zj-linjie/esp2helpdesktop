@@ -2,7 +2,7 @@ import { WebSocketServer, WebSocket } from 'ws'
 import { SystemMonitor } from './system.js'
 import { exec, execFile } from 'child_process'
 import { promisify } from 'util'
-import { access } from 'fs/promises'
+import { access, open as openFile, stat as statFile } from 'fs/promises'
 import { constants as fsConstants } from 'fs'
 
 const execAsync = promisify(exec)
@@ -21,6 +21,14 @@ interface LaunchAppConfig {
   name: string
   path: string
 }
+
+interface PendingRequest<T> {
+  resolve: (value: T) => void
+  reject: (reason?: unknown) => void
+  timeout: NodeJS.Timeout
+}
+
+type PhotoControlAction = 'prev' | 'next' | 'reload' | 'play' | 'pause' | 'set_interval'
 
 export interface PhotoFrameSettings {
   folderPath: string
@@ -42,6 +50,138 @@ const DEFAULT_PHOTO_FRAME_SETTINGS: PhotoFrameSettings = {
   maxPhotoCount: 20,
 }
 
+type VoiceCommandAction = 'navigate' | 'launch_app' | 'unknown'
+
+interface ParsedVoiceCommand {
+  action: VoiceCommandAction
+  page?: string
+  appName?: string
+  normalized: string
+}
+
+const VOICE_OPEN_KEYWORDS = ['open', 'launch', 'start', 'run', '打开', '启动', '运行']
+
+const VOICE_PAGE_RULES: Array<{ page: string; keywords: string[] }> = [
+  { page: 'home', keywords: ['主页', '返回', '回到主页', 'home', 'go home'] },
+  { page: 'monitor', keywords: ['监控', '系统监控', 'monitor'] },
+  { page: 'clock', keywords: ['时钟', '钟表', 'clock'] },
+  { page: 'pomodoro', keywords: ['番茄钟', '计时器', '定时器', 'pomodoro', 'timer'] },
+  { page: 'weather', keywords: ['天气', '天气预报', 'weather'] },
+  { page: 'photo', keywords: ['相框', '照片', '图片', 'photo', 'photos'] },
+  { page: 'apps', keywords: ['应用', '启动器', '应用列表', 'app launcher', 'apps', 'launcher'] },
+  { page: 'settings', keywords: ['设置', '快捷设置', 'settings', 'setting'] },
+  { page: 'music', keywords: ['音乐', '播放器', 'music', 'audio'] },
+  { page: 'inbox', keywords: ['消息', '任务', '待办', 'inbox', 'task'] },
+  { page: 'voice', keywords: ['语音', 'voice'] },
+]
+
+const VOICE_APP_ALIAS: Array<[string, string]> = [
+  ['微信', 'WeChat'],
+  ['wechat', 'WeChat'],
+  ['浏览器', 'Safari'],
+  ['safari', 'Safari'],
+  ['谷歌浏览器', 'Google Chrome'],
+  ['chrome', 'Google Chrome'],
+  ['firefox', 'Firefox'],
+  ['火狐', 'Firefox'],
+  ['终端', 'Terminal'],
+  ['terminal', 'Terminal'],
+  ['访达', 'Finder'],
+  ['finder', 'Finder'],
+  ['邮件', 'Mail'],
+  ['mail', 'Mail'],
+  ['日历', 'Calendar'],
+  ['calendar', 'Calendar'],
+  ['备忘录', 'Notes'],
+  ['notes', 'Notes'],
+  ['音乐', 'Music'],
+  ['music', 'Music'],
+  ['照片', 'Photos'],
+  ['photos', 'Photos'],
+  ['系统设置', 'System Settings'],
+  ['设置', 'System Settings'],
+  ['vscode', 'Visual Studio Code'],
+  ['vs code', 'Visual Studio Code'],
+  ['visual studio code', 'Visual Studio Code'],
+  ['xcode', 'Xcode'],
+  ['cursor', 'Cursor'],
+]
+
+const includesAny = (text: string, keywords: string[]): boolean => {
+  for (const keyword of keywords) {
+    if (keyword && text.includes(keyword)) {
+      return true
+    }
+  }
+  return false
+}
+
+const extractVoiceAppName = (normalizedText: string): string | null => {
+  let cleaned = normalizedText
+    .replace(/打开|启动|运行/g, ' ')
+    .replace(/\b(open|launch|start|run)\b/g, ' ')
+    .replace(/[。，、！？,.!?]/g, ' ')
+    .trim()
+
+  if (!cleaned) {
+    return null
+  }
+
+  for (const [alias, appName] of VOICE_APP_ALIAS) {
+    if (cleaned.includes(alias)) {
+      return appName
+    }
+  }
+
+  cleaned = cleaned.replace(/\b(app|application|应用)\b/g, ' ').trim()
+  if (!cleaned) {
+    return null
+  }
+
+  if (!/[a-z0-9]/i.test(cleaned)) {
+    return null
+  }
+
+  const candidate = cleaned
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ')
+    .trim()
+
+  return candidate.length > 0 ? candidate : null
+}
+
+const parseVoiceCommand = (rawText: string): ParsedVoiceCommand => {
+  const normalized = rawText.trim().toLowerCase()
+  if (!normalized) {
+    return { action: 'unknown', normalized }
+  }
+
+  for (const rule of VOICE_PAGE_RULES) {
+    if (includesAny(normalized, rule.keywords)) {
+      return {
+        action: 'navigate',
+        page: rule.page,
+        normalized,
+      }
+    }
+  }
+
+  if (includesAny(normalized, VOICE_OPEN_KEYWORDS)) {
+    const appName = extractVoiceAppName(normalized)
+    if (appName) {
+      return {
+        action: 'launch_app',
+        appName,
+        normalized,
+      }
+    }
+  }
+
+  return { action: 'unknown', normalized }
+}
+
 export class DeviceWebSocketServer {
   private wss: WebSocketServer
   private clients: Map<WebSocket, ClientInfo> = new Map()
@@ -50,6 +190,11 @@ export class DeviceWebSocketServer {
   private heartbeatMonitorInterval: NodeJS.Timeout | null = null
   private customLaunchApps: LaunchAppConfig[] = []
   private photoFrameSettings: PhotoFrameSettings = { ...DEFAULT_PHOTO_FRAME_SETTINGS }
+  private pendingSdListRequests: Map<string, PendingRequest<any>> = new Map()
+  private pendingSdDeleteRequests: Map<string, PendingRequest<any>> = new Map()
+  private pendingSdUploadBeginRequests: Map<string, PendingRequest<any>> = new Map()
+  private pendingSdUploadChunkRequests: Map<string, PendingRequest<any>> = new Map()
+  private pendingSdUploadCommitRequests: Map<string, PendingRequest<any>> = new Map()
 
   constructor(port: number = 8765) {
     this.wss = new WebSocketServer({ port })
@@ -176,6 +321,344 @@ export class DeviceWebSocketServer {
     })
   }
 
+  private findEsp32Client(targetDeviceId?: string): ClientInfo | null {
+    for (const client of this.clients.values()) {
+      if (client.type !== 'esp32_device' || !client.deviceId) {
+        continue
+      }
+      if (targetDeviceId && client.deviceId !== targetDeviceId) {
+        continue
+      }
+      return client
+    }
+    return null
+  }
+
+  private buildSdChunkRequestKey(uploadId: string, seq: number): string {
+    return `${uploadId}#${seq}`
+  }
+
+  public async requestSdFileList(
+    targetDeviceId?: string,
+    timeoutMs: number = 12000,
+    offset: number = 0,
+    limit: number = 24
+  ): Promise<any> {
+    const targetClient = this.findEsp32Client(targetDeviceId)
+    if (!targetClient || !targetClient.ws || targetClient.ws.readyState !== WebSocket.OPEN) {
+      return {
+        success: false,
+        reason: targetDeviceId ? `device not online: ${targetDeviceId}` : 'no online esp32 device',
+      }
+    }
+
+    const normalizedOffset = Number.isFinite(offset) ? Math.max(0, Math.floor(offset)) : 0
+    const normalizedLimit = Number.isFinite(limit) ? Math.max(1, Math.min(24, Math.floor(limit))) : 24
+    const requestId = `sd-list-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
+    console.log(
+      `[SD] request list -> device=${targetClient.deviceId} requestId=${requestId} offset=${normalizedOffset} limit=${normalizedLimit} timeout=${timeoutMs}ms`
+    )
+    return await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingSdListRequests.delete(requestId)
+        resolve({
+          success: false,
+          reason: `sd list timeout (${timeoutMs}ms)`,
+          requestId,
+          deviceId: targetClient.deviceId,
+        })
+      }, timeoutMs)
+
+      this.pendingSdListRequests.set(requestId, { resolve, reject, timeout })
+      this.sendMessage(targetClient.ws, {
+        type: 'sd_list_request',
+        data: {
+          requestId,
+          deviceId: targetClient.deviceId,
+          offset: normalizedOffset,
+          limit: normalizedLimit,
+          timestamp: Date.now(),
+        },
+      })
+    })
+  }
+
+  public async requestSdDelete(filePath: string, targetDeviceId?: string, timeoutMs: number = 6000): Promise<any> {
+    const targetClient = this.findEsp32Client(targetDeviceId)
+    if (!targetClient || !targetClient.ws || targetClient.ws.readyState !== WebSocket.OPEN) {
+      return {
+        success: false,
+        reason: targetDeviceId ? `device not online: ${targetDeviceId}` : 'no online esp32 device',
+      }
+    }
+
+    const trimmedPath = typeof filePath === 'string' ? filePath.trim() : ''
+    if (!trimmedPath.startsWith('/')) {
+      return {
+        success: false,
+        reason: 'invalid path',
+      }
+    }
+
+    const requestId = `sd-del-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
+    return await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingSdDeleteRequests.delete(requestId)
+        resolve({
+          success: false,
+          reason: `sd delete timeout (${timeoutMs}ms)`,
+          requestId,
+          path: trimmedPath,
+          deviceId: targetClient.deviceId,
+        })
+      }, timeoutMs)
+
+      this.pendingSdDeleteRequests.set(requestId, { resolve, reject, timeout })
+      this.sendMessage(targetClient.ws, {
+        type: 'sd_delete_request',
+        data: {
+          requestId,
+          deviceId: targetClient.deviceId,
+          path: trimmedPath,
+          timestamp: Date.now(),
+        },
+      })
+    })
+  }
+
+  public async uploadFileToSd(options: {
+    sourcePath: string
+    targetPath: string
+    targetDeviceId?: string
+    chunkSize?: number
+    overwrite?: boolean
+    timeoutMs?: number
+    onProgress?: (progress: {
+      uploadId: string
+      deviceId?: string
+      targetPath: string
+      bytesSent: number
+      totalBytes: number
+      seq: number
+    }) => void
+  }): Promise<any> {
+    const sourcePath = options.sourcePath
+    const targetPath = typeof options.targetPath === 'string' ? options.targetPath.trim() : ''
+    const timeoutMs = Number.isFinite(options.timeoutMs) ? Number(options.timeoutMs) : 12000
+    const overwrite = options.overwrite !== undefined ? Boolean(options.overwrite) : true
+
+    if (!sourcePath || !targetPath.startsWith('/')) {
+      return { success: false, reason: 'invalid sourcePath/targetPath' }
+    }
+
+    const targetClient = this.findEsp32Client(options.targetDeviceId)
+    if (!targetClient || !targetClient.ws || targetClient.ws.readyState !== WebSocket.OPEN) {
+      return {
+        success: false,
+        reason: options.targetDeviceId ? `device not online: ${options.targetDeviceId}` : 'no online esp32 device',
+      }
+    }
+
+    let sourceStat
+    try {
+      sourceStat = await statFile(sourcePath)
+    } catch (error) {
+      return { success: false, reason: `source stat failed: ${String(error)}` }
+    }
+    if (!sourceStat.isFile()) {
+      return { success: false, reason: 'source is not file' }
+    }
+
+    const fileSize = sourceStat.size
+    const chunkSizeRaw = Number(options.chunkSize)
+    const chunkSize = Number.isFinite(chunkSizeRaw)
+      ? Math.max(512, Math.min(4096, Math.floor(chunkSizeRaw)))
+      : 4096
+
+    const uploadId = `upload-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
+    const beginPromise = new Promise<any>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingSdUploadBeginRequests.delete(uploadId)
+        resolve({
+          success: false,
+          reason: `sd upload begin timeout (${timeoutMs}ms)`,
+          uploadId,
+        })
+      }, timeoutMs)
+      this.pendingSdUploadBeginRequests.set(uploadId, { resolve, reject, timeout })
+    })
+
+    this.sendMessage(targetClient.ws, {
+      type: 'sd_upload_begin',
+      data: {
+        uploadId,
+        deviceId: targetClient.deviceId,
+        path: targetPath,
+        size: fileSize,
+        chunkSize,
+        overwrite,
+        timestamp: Date.now(),
+      },
+    })
+
+    const beginAck = await beginPromise
+    if (!beginAck?.success) {
+      console.error(
+        `[SD upload] begin failed device=${targetClient.deviceId} path=${targetPath} reason=${beginAck?.reason || 'unknown'}`
+      )
+      return {
+        success: false,
+        reason: beginAck?.reason || 'sd upload begin failed',
+        uploadId,
+      }
+    }
+
+    const fileHandle = await openFile(sourcePath, 'r')
+    let position = 0
+    let seq = 0
+    let lastProgressEmitMs = 0
+
+    try {
+      options.onProgress?.({
+        uploadId,
+        deviceId: targetClient.deviceId,
+        targetPath,
+        bytesSent: 0,
+        totalBytes: fileSize,
+        seq: 0,
+      })
+    } catch {
+      // ignore callback errors
+    }
+
+    try {
+      while (position < fileSize) {
+        const expectedBytes = Math.min(chunkSize, fileSize - position)
+        const chunkBuffer = Buffer.allocUnsafe(expectedBytes)
+        const { bytesRead } = await fileHandle.read(chunkBuffer, 0, expectedBytes, position)
+        if (bytesRead <= 0) {
+          throw new Error('read failed before reaching expected file size')
+        }
+
+        const requestKey = this.buildSdChunkRequestKey(uploadId, seq)
+        const chunkAckPromise = new Promise<any>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            this.pendingSdUploadChunkRequests.delete(requestKey)
+            resolve({
+              success: false,
+              reason: `sd upload chunk timeout (${timeoutMs}ms)`,
+              uploadId,
+              seq,
+            })
+          }, timeoutMs)
+          this.pendingSdUploadChunkRequests.set(requestKey, { resolve, reject, timeout })
+        })
+
+        this.sendMessage(targetClient.ws, {
+          type: 'sd_upload_chunk_meta',
+          data: {
+            uploadId,
+            seq,
+            len: bytesRead,
+            timestamp: Date.now(),
+          },
+        })
+        targetClient.ws.send(chunkBuffer.subarray(0, bytesRead), { binary: true })
+
+        const chunkAck = await chunkAckPromise
+        if (!chunkAck?.success) {
+          console.error(
+            `[SD upload] chunk failed device=${targetClient.deviceId} path=${targetPath} seq=${seq} reason=${chunkAck?.reason || 'unknown'}`
+          )
+          throw new Error(chunkAck?.reason || `chunk ${seq} failed`)
+        }
+
+        position += bytesRead
+        seq += 1
+
+        const now = Date.now()
+        const shouldEmit = position >= fileSize || (now - lastProgressEmitMs) >= 120
+        if (shouldEmit) {
+          lastProgressEmitMs = now
+          try {
+            options.onProgress?.({
+              uploadId,
+              deviceId: targetClient.deviceId,
+              targetPath,
+              bytesSent: position,
+              totalBytes: fileSize,
+              seq,
+            })
+          } catch {
+            // ignore callback errors
+          }
+        }
+      }
+    } catch (error) {
+      try {
+        this.sendMessage(targetClient.ws, {
+          type: 'sd_upload_abort',
+          data: {
+            uploadId,
+            reason: String(error),
+            timestamp: Date.now(),
+          },
+        })
+      } catch {
+        // ignore abort send errors
+      }
+
+      return {
+        success: false,
+        reason: String(error),
+        uploadId,
+      }
+    } finally {
+      await fileHandle.close()
+    }
+
+    const commitPromise = new Promise<any>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingSdUploadCommitRequests.delete(uploadId)
+        resolve({
+          success: false,
+          reason: `sd upload commit timeout (${timeoutMs}ms)`,
+          uploadId,
+        })
+      }, timeoutMs)
+      this.pendingSdUploadCommitRequests.set(uploadId, { resolve, reject, timeout })
+    })
+
+    this.sendMessage(targetClient.ws, {
+      type: 'sd_upload_commit',
+      data: {
+        uploadId,
+        expectedSize: fileSize,
+        timestamp: Date.now(),
+      },
+    })
+
+    const commitAck = await commitPromise
+    if (!commitAck?.success) {
+      console.error(
+        `[SD upload] commit failed device=${targetClient.deviceId} path=${targetPath} reason=${commitAck?.reason || 'unknown'}`
+      )
+      return {
+        success: false,
+        reason: commitAck?.reason || 'sd upload commit failed',
+        uploadId,
+      }
+    }
+
+    return {
+      success: true,
+      uploadId,
+      targetPath: commitAck.path || targetPath,
+      bytes: fileSize,
+      deviceId: targetClient.deviceId,
+    }
+  }
+
   private async startSystemBroadcast() {
     // 每 5 秒广播系统数据到所有客户端（ESP32 设备和控制面板）
     this.systemBroadcastInterval = setInterval(async () => {
@@ -260,8 +743,40 @@ export class DeviceWebSocketServer {
         this.handleLaunchApp(ws, client, message)
         break
 
+      case 'voice_command':
+        this.handleVoiceCommand(ws, client, message)
+        break
+
       case 'photo_settings_request':
         this.handlePhotoSettingsRequest(ws, client)
+        break
+
+      case 'photo_control':
+        this.handlePhotoControl(ws, client, message)
+        break
+
+      case 'photo_state':
+        this.handlePhotoState(ws, client, message)
+        break
+
+      case 'sd_list_response':
+        this.handleSdListResponse(client, message)
+        break
+
+      case 'sd_delete_response':
+        this.handleSdDeleteResponse(client, message)
+        break
+
+      case 'sd_upload_begin_ack':
+        this.handleSdUploadBeginAck(client, message)
+        break
+
+      case 'sd_upload_chunk_ack':
+        this.handleSdUploadChunkAck(client, message)
+        break
+
+      case 'sd_upload_commit_ack':
+        this.handleSdUploadCommitAck(client, message)
         break
 
       default:
@@ -279,6 +794,213 @@ export class DeviceWebSocketServer {
         ...this.photoFrameSettings,
         timestamp: Date.now(),
       },
+    })
+  }
+
+  private handlePhotoControl(ws: WebSocket, client: ClientInfo, message: any) {
+    if (client.type !== 'control_panel') return
+
+    const data = message?.data ?? {}
+    const actionRaw = typeof data.action === 'string' ? data.action.trim() : ''
+    const targetDeviceId = typeof data.deviceId === 'string' ? data.deviceId.trim() : ''
+    const allowedActions = new Set<PhotoControlAction>(['prev', 'next', 'reload', 'play', 'pause', 'set_interval'])
+    if (!allowedActions.has(actionRaw as PhotoControlAction)) {
+      this.sendMessage(ws, {
+        type: 'photo_control_ack',
+        data: {
+          success: false,
+          reason: `unsupported action: ${actionRaw || 'empty'}`,
+        },
+      })
+      return
+    }
+    const action = actionRaw as PhotoControlAction
+
+    let targetClient: ClientInfo | undefined
+    for (const candidate of this.clients.values()) {
+      if (candidate.type !== 'esp32_device' || !candidate.deviceId) {
+        continue
+      }
+      if (targetDeviceId.length > 0 && candidate.deviceId !== targetDeviceId) {
+        continue
+      }
+      targetClient = candidate
+      break
+    }
+
+    if (!targetClient) {
+      this.sendMessage(ws, {
+        type: 'photo_control_ack',
+        data: {
+          success: false,
+          action,
+          reason: targetDeviceId ? `device not found: ${targetDeviceId}` : 'no online esp32 device',
+        },
+      })
+      return
+    }
+
+    const payload: Record<string, unknown> = {
+      deviceId: targetClient.deviceId,
+      action,
+      timestamp: Date.now(),
+    }
+
+    if (action === 'set_interval') {
+      const intervalRaw = Number(data.intervalSec ?? data.interval ?? data.slideshowInterval)
+      if (!Number.isFinite(intervalRaw)) {
+        this.sendMessage(ws, {
+          type: 'photo_control_ack',
+          data: {
+            success: false,
+            action,
+            reason: 'intervalSec required for set_interval',
+          },
+        })
+        return
+      }
+      payload.intervalSec = Math.max(3, Math.min(30, Math.round(intervalRaw)))
+    }
+
+    this.sendMessage(targetClient.ws, {
+      type: 'photo_control',
+      data: payload,
+    })
+
+    this.sendMessage(ws, {
+      type: 'photo_control_ack',
+      data: {
+        success: true,
+        action,
+        deviceId: targetClient.deviceId,
+        intervalSec: payload.intervalSec,
+      },
+    })
+  }
+
+  private handlePhotoState(_ws: WebSocket, client: ClientInfo, message: any) {
+    if (client.type !== 'esp32_device') return
+    const data = message?.data ?? {}
+
+    this.broadcastToControlPanels({
+      type: 'photo_state',
+      data: {
+        ...data,
+        deviceId: client.deviceId,
+        timestamp: Date.now(),
+      },
+    })
+  }
+
+  private handleSdListResponse(client: ClientInfo, message: any) {
+    if (client.type !== 'esp32_device') return
+    const data = message?.data ?? {}
+    const requestId = typeof data.requestId === 'string' ? data.requestId : ''
+
+    if (requestId && this.pendingSdListRequests.has(requestId)) {
+      const pending = this.pendingSdListRequests.get(requestId)
+      if (pending) {
+        clearTimeout(pending.timeout)
+        this.pendingSdListRequests.delete(requestId)
+        console.log(
+          `[SD] list response <- device=${client.deviceId} requestId=${requestId} total=${data.total ?? '-'} returned=${data.returned ?? (Array.isArray(data.files) ? data.files.length : '-')}`
+        )
+        pending.resolve({
+          success: true,
+          ...data,
+          deviceId: client.deviceId,
+        })
+      }
+    }
+
+    this.broadcastToControlPanels({
+      type: 'sd_list_response',
+      data: {
+        ...data,
+        deviceId: client.deviceId,
+        timestamp: Date.now(),
+      },
+    })
+  }
+
+  private handleSdDeleteResponse(client: ClientInfo, message: any) {
+    if (client.type !== 'esp32_device') return
+    const data = message?.data ?? {}
+    const requestId = typeof data.requestId === 'string' ? data.requestId : ''
+
+    if (requestId && this.pendingSdDeleteRequests.has(requestId)) {
+      const pending = this.pendingSdDeleteRequests.get(requestId)
+      if (pending) {
+        clearTimeout(pending.timeout)
+        this.pendingSdDeleteRequests.delete(requestId)
+        pending.resolve({
+          ...data,
+          deviceId: client.deviceId,
+        })
+      }
+    }
+
+    this.broadcastToControlPanels({
+      type: 'sd_delete_response',
+      data: {
+        ...data,
+        deviceId: client.deviceId,
+        timestamp: Date.now(),
+      },
+    })
+  }
+
+  private handleSdUploadBeginAck(client: ClientInfo, message: any) {
+    if (client.type !== 'esp32_device') return
+    const data = message?.data ?? {}
+    const uploadId = typeof data.uploadId === 'string' ? data.uploadId : ''
+    if (!uploadId) return
+
+    const pending = this.pendingSdUploadBeginRequests.get(uploadId)
+    if (!pending) return
+    clearTimeout(pending.timeout)
+    this.pendingSdUploadBeginRequests.delete(uploadId)
+    pending.resolve({
+      ...data,
+      success: Boolean(data.success),
+      deviceId: client.deviceId,
+    })
+  }
+
+  private handleSdUploadChunkAck(client: ClientInfo, message: any) {
+    if (client.type !== 'esp32_device') return
+    const data = message?.data ?? {}
+    const uploadId = typeof data.uploadId === 'string' ? data.uploadId : ''
+    const seqRaw = Number(data.seq)
+    const seq = Number.isFinite(seqRaw) ? Math.floor(seqRaw) : -1
+    if (!uploadId || seq < 0) return
+
+    const requestKey = this.buildSdChunkRequestKey(uploadId, seq)
+    const pending = this.pendingSdUploadChunkRequests.get(requestKey)
+    if (!pending) return
+    clearTimeout(pending.timeout)
+    this.pendingSdUploadChunkRequests.delete(requestKey)
+    pending.resolve({
+      ...data,
+      success: Boolean(data.success),
+      deviceId: client.deviceId,
+    })
+  }
+
+  private handleSdUploadCommitAck(client: ClientInfo, message: any) {
+    if (client.type !== 'esp32_device') return
+    const data = message?.data ?? {}
+    const uploadId = typeof data.uploadId === 'string' ? data.uploadId : ''
+    if (!uploadId) return
+
+    const pending = this.pendingSdUploadCommitRequests.get(uploadId)
+    if (!pending) return
+    clearTimeout(pending.timeout)
+    this.pendingSdUploadCommitRequests.delete(uploadId)
+    pending.resolve({
+      ...data,
+      success: Boolean(data.success),
+      deviceId: client.deviceId,
     })
   }
 
@@ -469,48 +1191,23 @@ export class DeviceWebSocketServer {
     }
   }
 
-  private async handleLaunchApp(ws: WebSocket, client: ClientInfo, message: any) {
-    if (client.type !== 'esp32_device') return
-
-    const rawPath = typeof message?.data?.appPath === 'string' ? message.data.appPath.trim() : ''
+  private async launchAppPath(rawPath: string): Promise<{ success: boolean; appName: string; reason?: string }> {
     const appName = rawPath.split('/').pop()?.replace(/\.app$/i, '') || 'App'
 
-    console.log(`[启动应用] 设备: ${client.deviceId}, 应用: ${rawPath}, 长度: ${rawPath.length}`)
-
-    const sendFailure = (reason: string) => {
-      const compactReason = reason.length > 180 ? `${reason.slice(0, 180)}...` : reason
-      console.error(`[启动应用] 失败: ${compactReason}`)
-      this.sendMessage(ws, {
-        type: 'launch_app_response',
-        data: {
-          success: false,
-          appPath: rawPath,
-          appName,
-          message: 'Failed to launch app',
-          reason: compactReason
-        }
-      })
-    }
-
     if (!rawPath) {
-      sendFailure('appPath missing')
-      return
+      return { success: false, appName, reason: 'appPath missing' }
     }
-
     if (!rawPath.startsWith('/Applications/') || !rawPath.toLowerCase().endsWith('.app')) {
-      sendFailure(`invalid app path: ${rawPath}`)
-      return
+      return { success: false, appName, reason: `invalid app path: ${rawPath}` }
     }
 
     try {
       await access(rawPath, fsConstants.F_OK)
     } catch {
-      sendFailure(`app not found: ${rawPath}`)
-      return
+      return { success: false, appName, reason: `app not found: ${rawPath}` }
     }
 
     try {
-      // Use execFile to avoid shell quoting issues.
       const { stdout, stderr } = await execFileAsync('open', [rawPath])
       if (stdout.trim().length > 0) {
         console.log(`[启动应用] stdout: ${stdout.trim()}`)
@@ -518,38 +1215,185 @@ export class DeviceWebSocketServer {
       if (stderr.trim().length > 0) {
         console.log(`[启动应用] stderr: ${stderr.trim()}`)
       }
-
-      console.log(`[启动应用] 成功: ${rawPath}`)
-
-      // 发送成功响应
-      this.sendMessage(ws, {
-        type: 'launch_app_response',
-        data: {
-          success: true,
-          appPath: rawPath,
-          appName,
-          message: `App launched: ${appName}`
-        }
-      })
-
-      // 转发到控制面板
-      this.broadcastToControlPanels({
-        type: 'app_launched',
-        data: {
-          deviceId: client.deviceId,
-          appPath: rawPath,
-          appName,
-          success: true
-        }
-      })
+      return { success: true, appName }
     } catch (error) {
       const err = error as Error & { stderr?: string; stdout?: string; code?: number | string }
       const stderrText = typeof err.stderr === 'string' ? err.stderr.trim() : ''
       const reason = stderrText.length > 0
         ? `${err.message}${err.code !== undefined ? ` (code ${err.code})` : ''} | ${stderrText}`
         : `${err.message}${err.code !== undefined ? ` (code ${err.code})` : ''}`
-      sendFailure(reason)
+      return { success: false, appName, reason }
     }
+  }
+
+  private resolveVoiceAppPath(appNameRaw: string): string {
+    const appName = appNameRaw.replace(/\.app$/i, '').trim()
+    if (!appName) {
+      return ''
+    }
+
+    const appNameLower = appName.toLowerCase()
+    for (const item of this.customLaunchApps) {
+      const customName = item.name.trim().toLowerCase()
+      if (!customName) continue
+      if (customName === appNameLower || customName.includes(appNameLower) || appNameLower.includes(customName)) {
+        return item.path
+      }
+    }
+
+    return `/Applications/${appName}.app`
+  }
+
+  private async handleVoiceCommand(ws: WebSocket, client: ClientInfo, message: any) {
+    if (client.type !== 'esp32_device') return
+
+    const rawText = typeof message?.data?.text === 'string' ? message.data.text.trim() : ''
+    const parsed = parseVoiceCommand(rawText)
+
+    const reply = (data: Record<string, unknown>) => {
+      this.sendMessage(ws, {
+        type: 'voice_command_result',
+        data: {
+          command: rawText,
+          normalized: parsed.normalized,
+          timestamp: Date.now(),
+          ...data,
+        },
+      })
+    }
+
+    if (!rawText) {
+      reply({
+        success: false,
+        action: 'unknown',
+        message: 'empty voice command',
+        reason: 'text missing',
+      })
+      return
+    }
+
+    if (parsed.action === 'navigate' && parsed.page) {
+      const pageTitle = parsed.page.charAt(0).toUpperCase() + parsed.page.slice(1)
+      reply({
+        success: true,
+        action: 'navigate',
+        page: parsed.page,
+        message: `Navigate to ${pageTitle}`,
+      })
+      this.broadcastToControlPanels({
+        type: 'voice_command_event',
+        data: {
+          deviceId: client.deviceId,
+          command: rawText,
+          action: 'navigate',
+          page: parsed.page,
+          success: true,
+          timestamp: Date.now(),
+        },
+      })
+      return
+    }
+
+    if (parsed.action === 'launch_app' && parsed.appName) {
+      const appPath = this.resolveVoiceAppPath(parsed.appName)
+      if (!appPath) {
+        reply({
+          success: false,
+          action: 'launch_app',
+          appName: parsed.appName,
+          message: 'failed to resolve app path',
+          reason: 'invalid app name',
+        })
+        return
+      }
+
+      const launchResult = await this.launchAppPath(appPath)
+      if (!launchResult.success) {
+        reply({
+          success: false,
+          action: 'launch_app',
+          appName: launchResult.appName,
+          appPath,
+          message: 'Failed to launch app',
+          reason: launchResult.reason,
+        })
+        return
+      }
+
+      reply({
+        success: true,
+        action: 'launch_app',
+        appName: launchResult.appName,
+        appPath,
+        message: `App launched: ${launchResult.appName}`,
+      })
+      this.broadcastToControlPanels({
+        type: 'voice_command_event',
+        data: {
+          deviceId: client.deviceId,
+          command: rawText,
+          action: 'launch_app',
+          appName: launchResult.appName,
+          appPath,
+          success: true,
+          timestamp: Date.now(),
+        },
+      })
+      return
+    }
+
+    reply({
+      success: false,
+      action: 'unknown',
+      message: 'Unsupported voice command',
+      reason: rawText,
+    })
+  }
+
+  private async handleLaunchApp(ws: WebSocket, client: ClientInfo, message: any) {
+    if (client.type !== 'esp32_device') return
+
+    const rawPath = typeof message?.data?.appPath === 'string' ? message.data.appPath.trim() : ''
+    const launchResult = await this.launchAppPath(rawPath)
+    const compactReason = launchResult.reason && launchResult.reason.length > 180
+      ? `${launchResult.reason.slice(0, 180)}...`
+      : launchResult.reason
+
+    console.log(`[启动应用] 设备: ${client.deviceId}, 应用: ${rawPath}, 成功: ${launchResult.success ? 'yes' : 'no'}`)
+
+    if (!launchResult.success) {
+      this.sendMessage(ws, {
+        type: 'launch_app_response',
+        data: {
+          success: false,
+          appPath: rawPath,
+          appName: launchResult.appName,
+          message: 'Failed to launch app',
+          reason: compactReason || 'unknown error',
+        },
+      })
+      return
+    }
+
+    this.sendMessage(ws, {
+      type: 'launch_app_response',
+      data: {
+        success: true,
+        appPath: rawPath,
+        appName: launchResult.appName,
+        message: `App launched: ${launchResult.appName}`,
+      },
+    })
+
+    this.broadcastToControlPanels({
+      type: 'app_launched',
+      data: {
+        deviceId: client.deviceId,
+        appPath: rawPath,
+        appName: launchResult.appName,
+        success: true,
+      },
+    })
   }
 
   private handleHandshake(ws: WebSocket, client: ClientInfo, message: any) {
@@ -680,6 +1524,17 @@ export class DeviceWebSocketServer {
   }
 
   public close() {
+    this.pendingSdListRequests.forEach((pending) => clearTimeout(pending.timeout))
+    this.pendingSdListRequests.clear()
+    this.pendingSdDeleteRequests.forEach((pending) => clearTimeout(pending.timeout))
+    this.pendingSdDeleteRequests.clear()
+    this.pendingSdUploadBeginRequests.forEach((pending) => clearTimeout(pending.timeout))
+    this.pendingSdUploadBeginRequests.clear()
+    this.pendingSdUploadChunkRequests.forEach((pending) => clearTimeout(pending.timeout))
+    this.pendingSdUploadChunkRequests.clear()
+    this.pendingSdUploadCommitRequests.forEach((pending) => clearTimeout(pending.timeout))
+    this.pendingSdUploadCommitRequests.clear()
+
     if (this.systemBroadcastInterval) {
       clearInterval(this.systemBroadcastInterval)
     }

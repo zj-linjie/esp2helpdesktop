@@ -41,7 +41,8 @@ enum UiPage {
   UI_PAGE_APP_LAUNCHER = 7,
   UI_PAGE_PHOTO_FRAME = 8,
   UI_PAGE_AUDIO_PLAYER = 9,
-  UI_PAGE_COUNT = 10
+  UI_PAGE_VOICE = 10,
+  UI_PAGE_COUNT = 11
 };
 
 struct TouchGestureState {
@@ -99,6 +100,7 @@ static const HomeShortcutConfig HOME_SHORTCUTS[] = {
   {"Clock", LV_SYMBOL_REFRESH, HOME_ICON_CLOCK, UI_PAGE_CLOCK, 0x1E88E5},
   {"Apps", LV_SYMBOL_BARS, HOME_ICON_APPS, UI_PAGE_APP_LAUNCHER, 0x5E35B1},
   {"Music", LV_SYMBOL_AUDIO, HOME_ICON_SYMBOL, UI_PAGE_AUDIO_PLAYER, 0x43A047},
+  {"Voice", LV_SYMBOL_CALL, HOME_ICON_SYMBOL, UI_PAGE_VOICE, 0x00897B},
   {"Inbox", LV_SYMBOL_LIST, HOME_ICON_SYMBOL, UI_PAGE_INBOX, 0x546E7A},
 };
 
@@ -187,6 +189,23 @@ static lv_obj_t *audioPrevBtn = nullptr;
 static lv_obj_t *audioPlayBtn = nullptr;
 static lv_obj_t *audioPlayBtnLabel = nullptr;
 static lv_obj_t *audioNextBtn = nullptr;
+
+static lv_obj_t *voiceStatusLabel = nullptr;
+static lv_obj_t *voiceResultLabel = nullptr;
+
+struct VoicePresetCommand {
+  const char *label;
+  const char *text;
+};
+
+static const VoicePresetCommand VOICE_PRESET_COMMANDS[] = {
+  {"Home", "go home"},
+  {"Monitor", "open monitor"},
+  {"Weather", "open weather"},
+  {"Clock", "open clock"},
+  {"Apps", "open apps"},
+  {"Safari", "open safari"},
+};
 
 struct MacApp {
   char name[32];
@@ -430,10 +449,13 @@ static bool ensureSdParentDirectories(const char *targetPath, char *reason, size
 static void sendSdUploadBeginAck(const char *uploadId, bool success, const char *reason);
 static void sendSdUploadChunkAck(const char *uploadId, int seq, bool success, const char *reason);
 static void sendSdUploadCommitAck(const char *uploadId, bool success, const char *finalPath, const char *reason);
+static void sendVoiceCommand(const char *text);
+static int parseUiPageFromVoiceName(const char *name);
 static bool shouldSuppressClick();
 static void suppressClicksForMs(uint32_t durationMs);
 static void suppressClicksAfterHome();
 static void homeShortcutEventCallback(lv_event_t *e);
+static void voiceCommandButtonCallback(lv_event_t *e);
 static void renderHomeShortcutIcon(uint8_t slotIdx, const HomeShortcutConfig &item);
 static void refreshHomeShortcutSlots();
 static void shiftHomeCarousel(int delta);
@@ -2655,6 +2677,28 @@ static void audioControlCallback(lv_event_t *e) {
     return;
   }
   pendingAudioControlAction = (int)action;
+}
+
+static void voiceCommandButtonCallback(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  if (shouldSuppressClick()) {
+    return;
+  }
+
+  intptr_t idxRaw = (intptr_t)lv_event_get_user_data(e);
+  if (idxRaw < 0 || idxRaw >= (intptr_t)(sizeof(VOICE_PRESET_COMMANDS) / sizeof(VOICE_PRESET_COMMANDS[0]))) {
+    return;
+  }
+
+  const VoicePresetCommand &preset = VOICE_PRESET_COMMANDS[idxRaw];
+  sendVoiceCommand(preset.text);
+
+  if (voiceResultLabel != nullptr) {
+    lv_label_set_text_fmt(voiceResultLabel, "Command: %s", preset.text);
+  }
+  pushInboxMessage("event", "Voice command", preset.text);
 }
 
 static void beginWebSocketClient() {
@@ -5057,6 +5101,71 @@ static void createUi() {
 
   updateAudioControlButtons(false, false);
 
+  // Page 11: Voice Commands (phase-1 bridge)
+  pages[UI_PAGE_VOICE] = createBasePage();
+
+  lv_obj_t *voiceTitle = lv_label_create(pages[UI_PAGE_VOICE]);
+  lv_label_set_text(voiceTitle, "Voice Commands");
+  lv_obj_set_style_text_color(voiceTitle, lv_color_hex(0x80CBC4), LV_PART_MAIN);
+  lv_obj_align(voiceTitle, LV_ALIGN_TOP_MID, 0, 14);
+
+  lv_obj_t *voiceHint = lv_label_create(pages[UI_PAGE_VOICE]);
+  lv_label_set_text(voiceHint, "Phase-1: tap preset command");
+  lv_obj_set_style_text_color(voiceHint, lv_color_hex(0xB0BEC5), LV_PART_MAIN);
+  lv_obj_set_style_text_font(voiceHint, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_align(voiceHint, LV_ALIGN_TOP_MID, 0, 38);
+
+  lv_obj_t *voiceCard = lv_obj_create(pages[UI_PAGE_VOICE]);
+  lv_obj_set_size(voiceCard, 312, 236);
+  lv_obj_align(voiceCard, LV_ALIGN_TOP_MID, 0, 66);
+  lv_obj_set_style_radius(voiceCard, 14, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(voiceCard, lv_color_hex(0x111111), LV_PART_MAIN);
+  lv_obj_set_style_border_color(voiceCard, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(voiceCard, 1, LV_PART_MAIN);
+  lv_obj_clear_flag(voiceCard, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(voiceCard, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  attachGestureHandlers(voiceCard);
+
+  const int buttonW = 140;
+  const int buttonH = 42;
+  const int startX = 10;
+  const int startY = 12;
+  const int gapX = 12;
+  const int gapY = 12;
+  for (int i = 0; i < (int)(sizeof(VOICE_PRESET_COMMANDS) / sizeof(VOICE_PRESET_COMMANDS[0])); ++i) {
+    int row = i / 2;
+    int col = i % 2;
+    lv_obj_t *btn = lv_btn_create(voiceCard);
+    lv_obj_set_size(btn, buttonW, buttonH);
+    lv_obj_set_pos(btn, startX + col * (buttonW + gapX), startY + row * (buttonH + gapY));
+    lv_obj_set_style_radius(btn, 10, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x1F2A44), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x263859), LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_PRESS_LOCK);
+    attachGestureHandlers(btn);
+    lv_obj_add_event_cb(btn, voiceCommandButtonCallback, LV_EVENT_CLICKED, (void *)((intptr_t)i));
+
+    lv_obj_t *label = lv_label_create(btn);
+    lv_label_set_text(label, VOICE_PRESET_COMMANDS[i].label);
+    lv_obj_set_style_text_color(label, lv_color_hex(0xE3F2FD), LV_PART_MAIN);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_center(label);
+  }
+
+  voiceStatusLabel = lv_label_create(voiceCard);
+  lv_label_set_text(voiceStatusLabel, "Ready");
+  lv_obj_set_style_text_color(voiceStatusLabel, lv_color_hex(0x80CBC4), LV_PART_MAIN);
+  lv_obj_set_style_text_font(voiceStatusLabel, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_align(voiceStatusLabel, LV_ALIGN_BOTTOM_LEFT, 10, -34);
+
+  voiceResultLabel = lv_label_create(voiceCard);
+  lv_label_set_text(voiceResultLabel, "Result: --");
+  lv_obj_set_width(voiceResultLabel, 286);
+  lv_label_set_long_mode(voiceResultLabel, LV_LABEL_LONG_DOT);
+  lv_obj_set_style_text_color(voiceResultLabel, lv_color_hex(0xCFD8DC), LV_PART_MAIN);
+  lv_obj_set_style_text_font(voiceResultLabel, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_align(voiceResultLabel, LV_ALIGN_BOTTOM_LEFT, 10, -12);
+
   // Global page indicator
   pageIndicatorLabel = lv_label_create(lv_scr_act());
   lv_obj_set_style_text_color(pageIndicatorLabel, lv_color_hex(0x8F8F8F), LV_PART_MAIN);
@@ -5166,6 +5275,55 @@ static void sendHeartbeat() {
   webSocket.sendTXT(output);
 }
 
+static void sendVoiceCommand(const char *text) {
+  if (text == nullptr || text[0] == '\0') {
+    return;
+  }
+
+  if (!isConnected) {
+    if (voiceStatusLabel != nullptr) {
+      lv_label_set_text(voiceStatusLabel, "WS disconnected");
+      lv_obj_set_style_text_color(voiceStatusLabel, lv_color_hex(0xEF5350), LV_PART_MAIN);
+    }
+    pushInboxMessage("alert", "Voice command", "WS disconnected");
+    return;
+  }
+
+  StaticJsonDocument<256> doc;
+  doc["type"] = "voice_command";
+  JsonObject data = doc.createNestedObject("data");
+  data["text"] = text;
+  data["source"] = "esp32_ui";
+
+  String output;
+  serializeJson(doc, output);
+  webSocket.sendTXT(output);
+
+  if (voiceStatusLabel != nullptr) {
+    lv_label_set_text_fmt(voiceStatusLabel, "Sending: %s", text);
+    lv_obj_set_style_text_color(voiceStatusLabel, lv_color_hex(0x90CAF9), LV_PART_MAIN);
+  }
+}
+
+static int parseUiPageFromVoiceName(const char *name) {
+  if (name == nullptr || name[0] == '\0') {
+    return -1;
+  }
+
+  if (strcmp(name, "home") == 0) return UI_PAGE_HOME;
+  if (strcmp(name, "monitor") == 0) return UI_PAGE_MONITOR;
+  if (strcmp(name, "clock") == 0) return UI_PAGE_CLOCK;
+  if (strcmp(name, "settings") == 0) return UI_PAGE_SETTINGS;
+  if (strcmp(name, "inbox") == 0) return UI_PAGE_INBOX;
+  if (strcmp(name, "pomodoro") == 0 || strcmp(name, "timer") == 0) return UI_PAGE_POMODORO;
+  if (strcmp(name, "weather") == 0) return UI_PAGE_WEATHER;
+  if (strcmp(name, "apps") == 0 || strcmp(name, "app_launcher") == 0 || strcmp(name, "launcher") == 0) return UI_PAGE_APP_LAUNCHER;
+  if (strcmp(name, "photo") == 0 || strcmp(name, "photos") == 0) return UI_PAGE_PHOTO_FRAME;
+  if (strcmp(name, "music") == 0 || strcmp(name, "audio") == 0) return UI_PAGE_AUDIO_PLAYER;
+  if (strcmp(name, "voice") == 0) return UI_PAGE_VOICE;
+  return -1;
+}
+
 static void handleSystemStats(const JsonObjectConst &data) {
   float cpu = data["cpu"] | 0;
   float memory = data["memory"] | 0;
@@ -5182,6 +5340,10 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
       isConnected = false;
       resetSdUploadSession(true);
       setWsStatus("WS: disconnected");
+      if (voiceStatusLabel != nullptr) {
+        lv_label_set_text(voiceStatusLabel, "WS disconnected");
+        lv_obj_set_style_text_color(voiceStatusLabel, lv_color_hex(0xEF5350), LV_PART_MAIN);
+      }
       pushInboxMessage("alert", "WebSocket", "Connection lost");
       setAppLauncherStatus("WS disconnected", lv_color_hex(0xEF5350), true, 2800);
       break;
@@ -5190,6 +5352,10 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
       Serial.println("[WebSocket] connected");
       isConnected = true;
       setWsStatus("WS: connected");
+      if (voiceStatusLabel != nullptr) {
+        lv_label_set_text(voiceStatusLabel, "WS connected");
+        lv_obj_set_style_text_color(voiceStatusLabel, lv_color_hex(0x80CBC4), LV_PART_MAIN);
+      }
       pushInboxMessage("event", "WebSocket", "Connected to server");
       sendHandshake();
 
@@ -5337,6 +5503,47 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
           setAppLauncherStatus(detail, lv_color_hex(0xEF5350), true, 4800);
           pushInboxMessage("alert", "App launch failed", detail);
         }
+      } else if (strcmp(messageType, "voice_command_result") == 0) {
+        JsonObjectConst data = doc["data"].as<JsonObjectConst>();
+        bool success = data["success"] | false;
+        const char *action = data["action"] | "unknown";
+        const char *page = data["page"] | "";
+        const char *message = data["message"] | "";
+        const char *reason = data["reason"] | "";
+        const char *command = data["command"] | "";
+
+        char statusLine[120];
+        if (success) {
+          snprintf(statusLine, sizeof(statusLine), "Voice OK: %s", action);
+        } else {
+          const char *why = (reason[0] != '\0') ? reason : "command failed";
+          snprintf(statusLine, sizeof(statusLine), "Voice failed: %s", why);
+        }
+
+        if (voiceStatusLabel != nullptr) {
+          lv_label_set_text(voiceStatusLabel, statusLine);
+          lv_obj_set_style_text_color(
+            voiceStatusLabel,
+            success ? lv_color_hex(0x81C784) : lv_color_hex(0xEF5350),
+            LV_PART_MAIN
+          );
+        }
+
+        if (voiceResultLabel != nullptr) {
+          const char *resultText = (message[0] != '\0') ? message : statusLine;
+          lv_label_set_text_fmt(voiceResultLabel, "Result: %s", resultText);
+        }
+
+        if (success && strcmp(action, "navigate") == 0 && page[0] != '\0') {
+          int targetPage = parseUiPageFromVoiceName(page);
+          if (targetPage >= 0 && targetPage < UI_PAGE_COUNT) {
+            showPage(targetPage);
+          }
+        }
+
+        const char *inboxTitle = success ? "Voice command OK" : "Voice command failed";
+        const char *inboxBody = (message[0] != '\0') ? message : ((reason[0] != '\0') ? reason : command);
+        pushInboxMessage(success ? "event" : "alert", inboxTitle, inboxBody);
       } else if (
         strcmp(messageType, "app_launched") == 0 ||
         strcmp(messageType, "command_result") == 0
