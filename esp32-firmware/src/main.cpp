@@ -6,10 +6,17 @@
 #include <lvgl.h>
 #include <Preferences.h>
 #include <SD_MMC.h>
+#include <esp_heap_caps.h>
+#include <string.h>
 #include <stdint.h>
 #include <time.h>
 #include "config.h"
 #include "display/scr_st77916.h"
+
+#if LV_USE_SJPG
+extern "C" void lv_split_jpeg_init(void);
+#include <extra/libs/sjpg/tjpgd.h>
+#endif
 
 WebSocketsClient webSocket;
 Preferences settingsStore;
@@ -26,7 +33,8 @@ enum UiPage {
   UI_PAGE_POMODORO = 5,
   UI_PAGE_WEATHER = 6,
   UI_PAGE_APP_LAUNCHER = 7,
-  UI_PAGE_COUNT = 8
+  UI_PAGE_PHOTO_FRAME = 8,
+  UI_PAGE_COUNT = 9
 };
 
 struct TouchGestureState {
@@ -107,6 +115,16 @@ static lv_obj_t *appLauncherPrevBtn = nullptr;
 static lv_obj_t *appLauncherNextBtn = nullptr;
 static lv_timer_t *appLauncherStatusTimer = nullptr;
 
+static lv_obj_t *photoFrameRootLabel = nullptr;
+static lv_obj_t *photoFrameViewport = nullptr;
+static lv_obj_t *photoFrameStatusLabel = nullptr;
+static lv_obj_t *photoFrameImage = nullptr;
+static lv_obj_t *photoFrameNameLabel = nullptr;
+static lv_obj_t *photoFrameIndexLabel = nullptr;
+static lv_obj_t *photoFramePrevBtn = nullptr;
+static lv_obj_t *photoFrameReloadBtn = nullptr;
+static lv_obj_t *photoFrameNextBtn = nullptr;
+
 struct MacApp {
   char name[32];
   char path[128];
@@ -137,6 +155,22 @@ static uint32_t sdRootDirCount = 0;
 static uint32_t sdRootFileCount = 0;
 static char sdRootPreview[96] = "--";
 static char sdMountReason[64] = "not checked";
+
+struct SdPhotoFile {
+  char path[192];
+  char name[64];
+};
+
+static SdPhotoFile sdPhotoFiles[64];
+static int sdPhotoCount = 0;
+static int sdPhotoIndex = 0;
+static bool photoDecoderReady = false;
+static uint8_t *photoRawData = nullptr;
+static size_t photoRawDataSize = 0;
+static lv_img_dsc_t photoRawDsc;
+static uint8_t *photoDecodedData = nullptr;
+static size_t photoDecodedDataSize = 0;
+static lv_img_dsc_t photoDecodedDsc;
 
 enum PomodoroMode {
   POMODORO_WORK = 0,
@@ -221,6 +255,8 @@ static void setWifiStatus(const String &text);
 static void setWsStatus(const String &text);
 static void gestureEventCallback(lv_event_t *e);
 static void refreshInboxView();
+static void loadSdPhotoList();
+static void showCurrentPhotoFrame();
 
 static int clampPercent(float value) {
   int v = (int)(value + 0.5f);
@@ -621,6 +657,670 @@ static void detectAndScanSdCard() {
   );
 }
 
+static bool equalsIgnoreCase(const char *a, const char *b) {
+  if (a == nullptr || b == nullptr) {
+    return false;
+  }
+
+  while (*a != '\0' && *b != '\0') {
+    char ca = *a;
+    char cb = *b;
+    if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+    if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+    if (ca != cb) {
+      return false;
+    }
+    a++;
+    b++;
+  }
+
+  return *a == '\0' && *b == '\0';
+}
+
+static bool hasPhotoExtension(const char *path) {
+  if (path == nullptr) {
+    return false;
+  }
+
+  const char *dot = strrchr(path, '.');
+  if (dot == nullptr) {
+    return false;
+  }
+
+  return equalsIgnoreCase(dot, ".jpg") || equalsIgnoreCase(dot, ".jpeg") || equalsIgnoreCase(dot, ".sjpg");
+}
+
+static const char *baseNameFromPath(const char *path) {
+  if (path == nullptr) {
+    return "";
+  }
+  const char *base = strrchr(path, '/');
+  if (base == nullptr) {
+    return path;
+  }
+  return base + 1;
+}
+
+static void freePhotoRawBytes() {
+  if (photoRawData != nullptr) {
+    free(photoRawData);
+    photoRawData = nullptr;
+  }
+  photoRawDataSize = 0;
+  memset(&photoRawDsc, 0, sizeof(photoRawDsc));
+}
+
+static void freePhotoDecodedData() {
+  if (photoDecodedData != nullptr) {
+    free(photoDecodedData);
+    photoDecodedData = nullptr;
+  }
+  photoDecodedDataSize = 0;
+  memset(&photoDecodedDsc, 0, sizeof(photoDecodedDsc));
+}
+
+static void freePhotoRawData() {
+  freePhotoRawBytes();
+  freePhotoDecodedData();
+}
+
+static bool isSplitJpegData(const uint8_t *data, size_t size) {
+  static const char kSjpgMagic[] = "_SJPG__";
+  if (data == nullptr || size < sizeof(kSjpgMagic) - 1) {
+    return false;
+  }
+  return memcmp(data, kSjpgMagic, sizeof(kSjpgMagic) - 1) == 0;
+}
+
+static bool ensurePhotoDecoderReady() {
+#if LV_USE_SJPG
+  if (!photoDecoderReady) {
+    lv_split_jpeg_init();
+    photoDecoderReady = true;
+    Serial.println("[Photo] LVGL SJPG decoder initialized");
+  }
+  return true;
+#else
+  return false;
+#endif
+}
+
+#if LV_USE_SJPG
+struct PhotoJpegDecodeContext {
+  const uint8_t *source = nullptr;
+  size_t sourceSize = 0;
+  size_t sourcePos = 0;
+  lv_color_t *target = nullptr;
+  uint16_t targetW = 0;
+  uint16_t targetH = 0;
+};
+
+static size_t photoJpegInputCallback(JDEC *jd, uint8_t *buff, size_t ndata) {
+  if (jd == nullptr) {
+    return 0;
+  }
+  PhotoJpegDecodeContext *ctx = (PhotoJpegDecodeContext *)jd->device;
+  if (ctx == nullptr || ctx->source == nullptr || ctx->sourcePos >= ctx->sourceSize) {
+    return 0;
+  }
+
+  size_t remain = ctx->sourceSize - ctx->sourcePos;
+  size_t readSize = (ndata < remain) ? ndata : remain;
+  if (buff != nullptr) {
+    memcpy(buff, ctx->source + ctx->sourcePos, readSize);
+  }
+  ctx->sourcePos += readSize;
+  return readSize;
+}
+
+static int photoJpegOutputCallback(JDEC *jd, void *bitmap, JRECT *rect) {
+  if (jd == nullptr || bitmap == nullptr || rect == nullptr) {
+    return 0;
+  }
+  PhotoJpegDecodeContext *ctx = (PhotoJpegDecodeContext *)jd->device;
+  if (ctx == nullptr || ctx->target == nullptr) {
+    return 0;
+  }
+
+#if JD_FORMAT != 0
+  return 0;
+#else
+  const uint8_t *src = (const uint8_t *)bitmap;
+  for (uint16_t y = rect->top; y <= rect->bottom; ++y) {
+    if (y >= ctx->targetH) {
+      src += (size_t)(rect->right - rect->left + 1) * 3;
+      continue;
+    }
+    size_t dstBase = (size_t)y * ctx->targetW;
+    for (uint16_t x = rect->left; x <= rect->right; ++x) {
+      if (x < ctx->targetW) {
+        ctx->target[dstBase + x] = lv_color_make(src[0], src[1], src[2]);
+      }
+      src += 3;
+    }
+  }
+  return 1;
+#endif
+}
+#endif
+
+static uint8_t choosePhotoJpegScale(uint16_t srcW, uint16_t srcH) {
+  static constexpr uint16_t kMaxDim = 720;
+  static constexpr uint32_t kMaxPixels = 450000UL;
+  uint8_t scale = 0;
+  while (scale < 3) {
+    uint16_t scaledW = (uint16_t)((srcW + ((1U << scale) - 1U)) >> scale);
+    uint16_t scaledH = (uint16_t)((srcH + ((1U << scale) - 1U)) >> scale);
+    if (scaledW <= kMaxDim && scaledH <= kMaxDim && (uint32_t)scaledW * scaledH <= kMaxPixels) {
+      break;
+    }
+    scale++;
+  }
+  return scale;
+}
+
+static bool decodePhotoJpegToTrueColor(lv_img_header_t *header, char *reason, size_t reasonSize) {
+  if (header == nullptr) {
+    copyText(reason, reasonSize, "invalid header");
+    return false;
+  }
+
+#if LV_USE_SJPG
+  if (photoRawData == nullptr || photoRawDataSize == 0) {
+    copyText(reason, reasonSize, "jpeg bytes missing");
+    return false;
+  }
+  if (isSplitJpegData(photoRawData, photoRawDataSize)) {
+    copyText(reason, reasonSize, "split jpeg");
+    return false;
+  }
+
+#if JD_FORMAT != 0
+  copyText(reason, reasonSize, "JD_FORMAT unsupported");
+  return false;
+#else
+  static constexpr size_t kWorkBufSize = 4096;
+  uint8_t *workBuf = (uint8_t *)heap_caps_malloc(kWorkBufSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (workBuf == nullptr) {
+    workBuf = (uint8_t *)malloc(kWorkBufSize);
+  }
+  if (workBuf == nullptr) {
+    copyText(reason, reasonSize, "jpeg workbuf OOM");
+    return false;
+  }
+
+  PhotoJpegDecodeContext ctx;
+  ctx.source = photoRawData;
+  ctx.sourceSize = photoRawDataSize;
+  ctx.sourcePos = 0;
+
+  JDEC decoder;
+  JRESULT rc = jd_prepare(&decoder, photoJpegInputCallback, workBuf, kWorkBufSize, &ctx);
+  if (rc != JDR_OK) {
+    free(workBuf);
+    char text[48];
+    snprintf(text, sizeof(text), "jpeg prepare failed (%d)", (int)rc);
+    copyText(reason, reasonSize, text);
+    return false;
+  }
+
+  uint8_t scale = choosePhotoJpegScale(decoder.width, decoder.height);
+  uint16_t scaledW = (uint16_t)((decoder.width + ((1U << scale) - 1U)) >> scale);
+  uint16_t scaledH = (uint16_t)((decoder.height + ((1U << scale) - 1U)) >> scale);
+  if (scaledW == 0 || scaledH == 0) {
+    free(workBuf);
+    copyText(reason, reasonSize, "jpeg size invalid");
+    return false;
+  }
+  if ((uint32_t)scaledW * scaledH > 800000UL) {
+    free(workBuf);
+    copyText(reason, reasonSize, "jpeg too large");
+    return false;
+  }
+
+  freePhotoDecodedData();
+  photoDecodedDataSize = (size_t)scaledW * scaledH * sizeof(lv_color_t);
+  photoDecodedData = (uint8_t *)heap_caps_malloc(photoDecodedDataSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (photoDecodedData == nullptr) {
+    photoDecodedData = (uint8_t *)malloc(photoDecodedDataSize);
+  }
+  if (photoDecodedData == nullptr) {
+    free(workBuf);
+    copyText(reason, reasonSize, "jpeg framebuf OOM");
+    return false;
+  }
+  memset(photoDecodedData, 0, photoDecodedDataSize);
+
+  ctx.sourcePos = 0;
+  ctx.target = (lv_color_t *)photoDecodedData;
+  ctx.targetW = scaledW;
+  ctx.targetH = scaledH;
+  rc = jd_prepare(&decoder, photoJpegInputCallback, workBuf, kWorkBufSize, &ctx);
+  if (rc != JDR_OK) {
+    free(workBuf);
+    freePhotoDecodedData();
+    char text[48];
+    snprintf(text, sizeof(text), "jpeg reopen failed (%d)", (int)rc);
+    copyText(reason, reasonSize, text);
+    return false;
+  }
+
+  rc = jd_decomp(&decoder, photoJpegOutputCallback, scale);
+  free(workBuf);
+  if (rc != JDR_OK) {
+    freePhotoDecodedData();
+    char text[48];
+    snprintf(text, sizeof(text), "jpeg decomp failed (%d)", (int)rc);
+    copyText(reason, reasonSize, text);
+    return false;
+  }
+
+  memset(&photoDecodedDsc, 0, sizeof(photoDecodedDsc));
+  photoDecodedDsc.header.always_zero = 0;
+  photoDecodedDsc.header.w = scaledW;
+  photoDecodedDsc.header.h = scaledH;
+  photoDecodedDsc.header.cf = LV_IMG_CF_TRUE_COLOR;
+  photoDecodedDsc.data_size = (uint32_t)photoDecodedDataSize;
+  photoDecodedDsc.data = photoDecodedData;
+
+  header->always_zero = 0;
+  header->w = scaledW;
+  header->h = scaledH;
+  header->cf = LV_IMG_CF_TRUE_COLOR;
+  return true;
+#endif
+#else
+  copyText(reason, reasonSize, "sjpg disabled");
+  return false;
+#endif
+}
+
+static bool validatePhotoRawSource(lv_img_header_t *header, char *reason, size_t reasonSize) {
+  if (header == nullptr) {
+    copyText(reason, reasonSize, "invalid header");
+    return false;
+  }
+  lv_img_header_t localHeader;
+  if (lv_img_decoder_get_info((const void *)&photoRawDsc, &localHeader) != LV_RES_OK || localHeader.w <= 0 || localHeader.h <= 0) {
+    copyText(reason, reasonSize, "decode header failed");
+    return false;
+  }
+
+  lv_img_decoder_dsc_t decoderDsc;
+  memset(&decoderDsc, 0, sizeof(decoderDsc));
+  if (lv_img_decoder_open(&decoderDsc, (const void *)&photoRawDsc, lv_color_black(), 0) != LV_RES_OK) {
+    copyText(reason, reasonSize, "decoder open failed");
+    return false;
+  }
+  lv_img_decoder_close(&decoderDsc);
+  *header = localHeader;
+  return true;
+}
+
+static void setPhotoFrameStatus(const char *text, lv_color_t color) {
+  if (photoFrameStatusLabel == nullptr) {
+    return;
+  }
+  lv_label_set_text(photoFrameStatusLabel, text == nullptr ? "" : text);
+  lv_obj_set_style_text_color(photoFrameStatusLabel, color, LV_PART_MAIN);
+}
+
+static void updatePhotoFrameNavButtons() {
+  bool canPrev = sdPhotoCount > 1;
+  bool canNext = sdPhotoCount > 1;
+  bool canReload = sdMounted;
+
+  if (photoFramePrevBtn != nullptr) {
+    if (canPrev) {
+      lv_obj_add_flag(photoFramePrevBtn, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_set_style_opa(photoFramePrevBtn, LV_OPA_COVER, LV_PART_MAIN);
+    } else {
+      lv_obj_clear_flag(photoFramePrevBtn, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_set_style_opa(photoFramePrevBtn, LV_OPA_50, LV_PART_MAIN);
+    }
+  }
+
+  if (photoFrameNextBtn != nullptr) {
+    if (canNext) {
+      lv_obj_add_flag(photoFrameNextBtn, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_set_style_opa(photoFrameNextBtn, LV_OPA_COVER, LV_PART_MAIN);
+    } else {
+      lv_obj_clear_flag(photoFrameNextBtn, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_set_style_opa(photoFrameNextBtn, LV_OPA_50, LV_PART_MAIN);
+    }
+  }
+
+  if (photoFrameReloadBtn != nullptr) {
+    if (canReload) {
+      lv_obj_add_flag(photoFrameReloadBtn, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_set_style_opa(photoFrameReloadBtn, LV_OPA_COVER, LV_PART_MAIN);
+    } else {
+      lv_obj_clear_flag(photoFrameReloadBtn, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_set_style_opa(photoFrameReloadBtn, LV_OPA_50, LV_PART_MAIN);
+    }
+  }
+}
+
+static void addPhotoCandidate(const char *path) {
+  if (path == nullptr || path[0] == '\0') {
+    return;
+  }
+  if (sdPhotoCount >= (int)(sizeof(sdPhotoFiles) / sizeof(sdPhotoFiles[0]))) {
+    return;
+  }
+
+  SdPhotoFile &target = sdPhotoFiles[sdPhotoCount];
+  copyText(target.path, sizeof(target.path), path);
+  copyText(target.name, sizeof(target.name), baseNameFromPath(path));
+  sdPhotoCount++;
+}
+
+static void scanPhotoDirectoryRecursive(const char *dirPath, int depth) {
+  if (dirPath == nullptr || depth > 4) {
+    return;
+  }
+  if (sdPhotoCount >= (int)(sizeof(sdPhotoFiles) / sizeof(sdPhotoFiles[0]))) {
+    return;
+  }
+
+  File dir = SD_MMC.open(dirPath);
+  if (!dir || !dir.isDirectory()) {
+    return;
+  }
+
+  while (sdPhotoCount < (int)(sizeof(sdPhotoFiles) / sizeof(sdPhotoFiles[0]))) {
+    File entry = dir.openNextFile();
+    if (!entry) {
+      break;
+    }
+
+    const char *entryPath = entry.name();
+    if (entryPath != nullptr && entryPath[0] != '\0') {
+      char childPath[192];
+      if (entryPath[0] == '/') {
+        copyText(childPath, sizeof(childPath), entryPath);
+      } else if (strcmp(dirPath, "/") == 0) {
+        snprintf(childPath, sizeof(childPath), "/%s", entryPath);
+      } else {
+        snprintf(childPath, sizeof(childPath), "%s/%s", dirPath, entryPath);
+      }
+
+      if (entry.isDirectory()) {
+        if (depth < 4) {
+          scanPhotoDirectoryRecursive(childPath, depth + 1);
+        }
+      } else if (hasPhotoExtension(childPath)) {
+        addPhotoCandidate(childPath);
+      }
+    }
+    entry.close();
+  }
+  dir.close();
+}
+
+static void loadSdPhotoList() {
+  sdPhotoCount = 0;
+  sdPhotoIndex = 0;
+
+  if (!sdMounted) {
+    setPhotoFrameStatus("SD not mounted", lv_color_hex(0xEF5350));
+    updatePhotoFrameNavButtons();
+    return;
+  }
+
+  scanPhotoDirectoryRecursive("/", 0);
+  Serial.printf("[Photo] scanned %d image files (jpg/jpeg/sjpg)\n", sdPhotoCount);
+
+  if (sdPhotoCount <= 0) {
+    setPhotoFrameStatus("No JPG/JPEG/SJPG found", lv_color_hex(0xFFB74D));
+  } else {
+    char status[48];
+    snprintf(status, sizeof(status), "Found %d images", sdPhotoCount);
+    setPhotoFrameStatus(status, lv_color_hex(0x81C784));
+  }
+
+  updatePhotoFrameNavButtons();
+}
+
+static bool loadPhotoFileToMemory(const char *path, char *reason, size_t reasonSize) {
+  if (reason != nullptr && reasonSize > 0) {
+    reason[0] = '\0';
+  }
+
+  if (path == nullptr || path[0] == '\0') {
+    copyText(reason, reasonSize, "Invalid path");
+    return false;
+  }
+  if (!sdMounted) {
+    copyText(reason, reasonSize, "SD not mounted");
+    return false;
+  }
+  if (!ensurePhotoDecoderReady()) {
+    copyText(reason, reasonSize, "SJPG decoder disabled");
+    return false;
+  }
+
+  File f = SD_MMC.open(path, FILE_READ);
+  if (!f) {
+    copyText(reason, reasonSize, "Open failed");
+    return false;
+  }
+
+  const size_t maxBytes = 3 * 1024 * 1024;
+  size_t fileSize = (size_t)f.size();
+  if (fileSize == 0 || fileSize > maxBytes) {
+    f.close();
+    copyText(reason, reasonSize, "File too large/empty");
+    return false;
+  }
+
+  freePhotoRawData();
+  photoRawData = (uint8_t *)heap_caps_malloc(fileSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (photoRawData == nullptr) {
+    photoRawData = (uint8_t *)malloc(fileSize);
+  }
+  if (photoRawData == nullptr) {
+    f.close();
+    copyText(reason, reasonSize, "No memory");
+    return false;
+  }
+
+  size_t offset = 0;
+  while (offset < fileSize) {
+    size_t chunk = fileSize - offset;
+    if (chunk > 4096) {
+      chunk = 4096;
+    }
+    size_t n = f.read(photoRawData + offset, chunk);
+    if (n == 0) {
+      break;
+    }
+    offset += n;
+  }
+  f.close();
+
+  if (offset != fileSize) {
+    freePhotoRawData();
+    copyText(reason, reasonSize, "Read incomplete");
+    return false;
+  }
+
+  photoRawDataSize = fileSize;
+  memset(&photoRawDsc, 0, sizeof(photoRawDsc));
+  photoRawDsc.header.always_zero = 0;
+  photoRawDsc.header.w = 0;
+  photoRawDsc.header.h = 0;
+  photoRawDsc.header.cf = LV_IMG_CF_RAW;
+  photoRawDsc.data_size = (uint32_t)photoRawDataSize;
+  photoRawDsc.data = photoRawData;
+  return true;
+}
+
+static void showCurrentPhotoFrame() {
+  if (photoFrameImage == nullptr || photoFrameNameLabel == nullptr || photoFrameIndexLabel == nullptr) {
+    return;
+  }
+
+  if (photoFrameRootLabel != nullptr) {
+    lv_label_set_text_fmt(photoFrameRootLabel, "Root: %s", sdRootPreview);
+  }
+
+  if (!sdMounted) {
+    freePhotoRawData();
+    lv_img_set_src(photoFrameImage, nullptr);
+    lv_label_set_text(photoFrameNameLabel, "No SD card");
+    lv_label_set_text(photoFrameIndexLabel, "0/0");
+    setPhotoFrameStatus("SD not mounted", lv_color_hex(0xEF5350));
+    updatePhotoFrameNavButtons();
+    return;
+  }
+
+  if (sdPhotoCount <= 0) {
+    freePhotoRawData();
+    lv_img_set_src(photoFrameImage, nullptr);
+    lv_label_set_text(photoFrameNameLabel, "No JPG/JPEG/SJPG on SD");
+    lv_label_set_text(photoFrameIndexLabel, "0/0");
+    setPhotoFrameStatus("Tap Reload to rescan", lv_color_hex(0xFFB74D));
+    updatePhotoFrameNavButtons();
+    return;
+  }
+
+  if (sdPhotoIndex < 0) sdPhotoIndex = 0;
+  if (sdPhotoIndex >= sdPhotoCount) sdPhotoIndex = sdPhotoCount - 1;
+  int startIndex = sdPhotoIndex;
+  int shownIndex = -1;
+  lv_img_header_t shownHeader;
+  memset(&shownHeader, 0, sizeof(shownHeader));
+  const void *shownSrc = nullptr;
+  char shownDecoder[16];
+  copyText(shownDecoder, sizeof(shownDecoder), "-");
+  char failReason[64];
+  failReason[0] = '\0';
+
+  for (int attempt = 0; attempt < sdPhotoCount; ++attempt) {
+    int idx = (startIndex + attempt) % sdPhotoCount;
+    SdPhotoFile &candidate = sdPhotoFiles[idx];
+
+    char reason[64];
+    if (!loadPhotoFileToMemory(candidate.path, reason, sizeof(reason))) {
+      copyText(failReason, sizeof(failReason), reason);
+      Serial.printf("[Photo] load failed: %s (%s)\n", candidate.path, reason);
+      continue;
+    }
+
+    lv_img_header_t header;
+    memset(&header, 0, sizeof(header));
+    bool useRgb565 = false;
+    if (!isSplitJpegData(photoRawData, photoRawDataSize)) {
+      if (decodePhotoJpegToTrueColor(&header, reason, sizeof(reason))) {
+        useRgb565 = true;
+      } else {
+        Serial.printf("[Photo] rgb565 decode failed: %s (%s), fallback raw decoder\n", candidate.path, reason);
+      }
+    }
+
+    if (!useRgb565) {
+      if (!validatePhotoRawSource(&header, reason, sizeof(reason))) {
+        copyText(failReason, sizeof(failReason), reason);
+        Serial.printf("[Photo] raw decoder failed: %s (%s)\n", candidate.path, reason);
+        continue;
+      }
+      copyText(shownDecoder, sizeof(shownDecoder), "raw");
+      shownSrc = (const void *)&photoRawDsc;
+    } else {
+      copyText(shownDecoder, sizeof(shownDecoder), "rgb565");
+      shownSrc = (const void *)&photoDecodedDsc;
+      freePhotoRawBytes();
+    }
+
+    shownIndex = idx;
+    shownHeader = header;
+    break;
+  }
+
+  if (shownIndex < 0 || shownSrc == nullptr) {
+    freePhotoRawData();
+    lv_img_set_src(photoFrameImage, nullptr);
+    lv_label_set_text(photoFrameNameLabel, "No decodable image");
+    lv_label_set_text(photoFrameIndexLabel, "0/0");
+    char status[96];
+    snprintf(status, sizeof(status), "Decode failed: %s", failReason[0] == '\0' ? "unsupported files" : failReason);
+    setPhotoFrameStatus(status, lv_color_hex(0xEF5350));
+    updatePhotoFrameNavButtons();
+    return;
+  }
+
+  sdPhotoIndex = shownIndex;
+  SdPhotoFile &photo = sdPhotoFiles[sdPhotoIndex];
+  lv_img_set_src(photoFrameImage, shownSrc);
+
+  int32_t viewportW = 288;
+  int32_t viewportH = 202;
+  if (photoFrameViewport != nullptr) {
+    int32_t w = lv_obj_get_content_width(photoFrameViewport);
+    int32_t h = lv_obj_get_content_height(photoFrameViewport);
+    if (w > 0) viewportW = w;
+    if (h > 0) viewportH = h;
+  }
+
+  int32_t zoomW = (viewportW * 256) / shownHeader.w;
+  int32_t zoomH = (viewportH * 256) / shownHeader.h;
+  int32_t zoom = (zoomW < zoomH) ? zoomW : zoomH;
+  if (zoom > 256) zoom = 256;
+  if (zoom < 16) zoom = 16;
+
+  lv_obj_set_size(photoFrameImage, shownHeader.w, shownHeader.h);
+  lv_img_set_pivot(photoFrameImage, shownHeader.w / 2, shownHeader.h / 2);
+  lv_img_set_zoom(photoFrameImage, (uint16_t)zoom);
+  lv_obj_center(photoFrameImage);
+  Serial.printf(
+    "[Photo] showing %d/%d %s (%dx%d zoom=%ld viewport=%ldx%ld decoder=%s)\n",
+    sdPhotoIndex + 1,
+    sdPhotoCount,
+    photo.path,
+    shownHeader.w,
+    shownHeader.h,
+    (long)zoom,
+    (long)viewportW,
+    (long)viewportH,
+    shownDecoder
+  );
+
+  lv_label_set_text(photoFrameNameLabel, photo.name);
+  lv_label_set_text_fmt(photoFrameIndexLabel, "%d/%d", sdPhotoIndex + 1, sdPhotoCount);
+  char status[64];
+  snprintf(status, sizeof(status), "Photo loaded (%s)", shownDecoder);
+  setPhotoFrameStatus(status, lv_color_hex(0x81C784));
+  updatePhotoFrameNavButtons();
+}
+
+static void photoFrameControlCallback(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+
+  intptr_t action = (intptr_t)lv_event_get_user_data(e);
+  Serial.printf("[Photo] nav click action=%ld count=%d idx=%d mounted=%d\n", (long)action, sdPhotoCount, sdPhotoIndex, sdMounted ? 1 : 0);
+  if (action == 0) { // Prev
+    if (sdPhotoCount > 0) {
+      setPhotoFrameStatus("Loading previous photo...", lv_color_hex(0x90CAF9));
+      sdPhotoIndex = (sdPhotoIndex - 1 + sdPhotoCount) % sdPhotoCount;
+      showCurrentPhotoFrame();
+    }
+  } else if (action == 1) { // Reload
+    setPhotoFrameStatus("Rescanning SD...", lv_color_hex(0x90CAF9));
+    detectAndScanSdCard();
+    loadSdPhotoList();
+    showCurrentPhotoFrame();
+  } else if (action == 2) { // Next
+    if (sdPhotoCount > 0) {
+      setPhotoFrameStatus("Loading next photo...", lv_color_hex(0x90CAF9));
+      sdPhotoIndex = (sdPhotoIndex + 1) % sdPhotoCount;
+      showCurrentPhotoFrame();
+    }
+  }
+}
+
 static void beginWebSocketClient() {
   setWsStatus("WS: connecting...");
   webSocket.begin(WS_SERVER_HOST, WS_SERVER_PORT, "/");
@@ -900,6 +1600,12 @@ static void showPage(int pageIndex) {
     } else {
       lv_obj_add_flag(pages[i], LV_OBJ_FLAG_HIDDEN);
     }
+  }
+  if (currentPage == UI_PAGE_PHOTO_FRAME) {
+    if (sdMounted && sdPhotoCount <= 0) {
+      loadSdPhotoList();
+    }
+    showCurrentPhotoFrame();
   }
   updatePageIndicator();
 }
@@ -2022,6 +2728,113 @@ static void createUi() {
   lv_label_set_text(nextLabel, "Next");
   lv_obj_center(nextLabel);
 
+  // Page 9: Photo Frame (SD)
+  pages[UI_PAGE_PHOTO_FRAME] = createBasePage();
+
+  lv_obj_t *photoTitle = lv_label_create(pages[UI_PAGE_PHOTO_FRAME]);
+  lv_label_set_text(photoTitle, "Photo Frame (SD)");
+  lv_obj_set_style_text_color(photoTitle, lv_color_hex(0x90CAF9), LV_PART_MAIN);
+  lv_obj_align(photoTitle, LV_ALIGN_TOP_MID, 0, 14);
+
+  photoFrameRootLabel = lv_label_create(pages[UI_PAGE_PHOTO_FRAME]);
+  lv_label_set_text(photoFrameRootLabel, "Root: --");
+  lv_obj_set_width(photoFrameRootLabel, 300);
+  lv_label_set_long_mode(photoFrameRootLabel, LV_LABEL_LONG_DOT);
+  lv_obj_set_style_text_color(photoFrameRootLabel, lv_color_hex(0xAFAFAF), LV_PART_MAIN);
+  lv_obj_align(photoFrameRootLabel, LV_ALIGN_TOP_MID, 0, 36);
+
+  lv_obj_t *photoCard = lv_obj_create(pages[UI_PAGE_PHOTO_FRAME]);
+  lv_obj_set_size(photoCard, 300, 208);
+  lv_obj_align(photoCard, LV_ALIGN_TOP_MID, 0, 58);
+  lv_obj_set_style_radius(photoCard, 12, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(photoCard, lv_color_hex(0x101010), LV_PART_MAIN);
+  lv_obj_set_style_border_color(photoCard, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(photoCard, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(photoCard, 6, LV_PART_MAIN);
+  lv_obj_clear_flag(photoCard, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(photoCard, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  attachGestureHandlers(photoCard);
+
+  photoFrameViewport = lv_obj_create(photoCard);
+  lv_obj_set_size(photoFrameViewport, 286, 194);
+  lv_obj_center(photoFrameViewport);
+  lv_obj_set_style_radius(photoFrameViewport, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(photoFrameViewport, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_border_width(photoFrameViewport, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(photoFrameViewport, 0, LV_PART_MAIN);
+  lv_obj_set_style_clip_corner(photoFrameViewport, true, LV_PART_MAIN);
+  lv_obj_clear_flag(photoFrameViewport, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(photoFrameViewport, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  attachGestureHandlers(photoFrameViewport);
+
+  photoFrameImage = lv_img_create(photoFrameViewport);
+  lv_img_set_src(photoFrameImage, nullptr);
+  lv_obj_center(photoFrameImage);
+
+  photoFrameStatusLabel = lv_label_create(pages[UI_PAGE_PHOTO_FRAME]);
+  lv_label_set_text(photoFrameStatusLabel, "Waiting SD scan...");
+  lv_obj_set_style_text_color(photoFrameStatusLabel, lv_color_hex(0xAFAFAF), LV_PART_MAIN);
+  lv_obj_align(photoFrameStatusLabel, LV_ALIGN_TOP_MID, 0, 266);
+
+  photoFrameNameLabel = lv_label_create(pages[UI_PAGE_PHOTO_FRAME]);
+  lv_label_set_text(photoFrameNameLabel, "--");
+  lv_obj_set_width(photoFrameNameLabel, 280);
+  lv_label_set_long_mode(photoFrameNameLabel, LV_LABEL_LONG_DOT);
+  lv_obj_align(photoFrameNameLabel, LV_ALIGN_TOP_MID, 0, 284);
+
+  lv_obj_t *photoNavBar = lv_obj_create(pages[UI_PAGE_PHOTO_FRAME]);
+  lv_obj_set_size(photoNavBar, 304, 50);
+  lv_obj_align(photoNavBar, LV_ALIGN_TOP_MID, 0, 292);
+  lv_obj_set_style_radius(photoNavBar, 14, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(photoNavBar, lv_color_hex(0x151515), LV_PART_MAIN);
+  lv_obj_set_style_border_color(photoNavBar, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(photoNavBar, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(photoNavBar, 5, LV_PART_MAIN);
+  lv_obj_clear_flag(photoNavBar, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(photoNavBar, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  attachGestureHandlers(photoNavBar);
+
+  photoFramePrevBtn = lv_btn_create(photoNavBar);
+  lv_obj_set_size(photoFramePrevBtn, 94, 38);
+  lv_obj_align(photoFramePrevBtn, LV_ALIGN_LEFT_MID, 6, 0);
+  lv_obj_set_style_radius(photoFramePrevBtn, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(photoFramePrevBtn, lv_color_hex(0x252525), LV_PART_MAIN);
+  lv_obj_add_flag(photoFramePrevBtn, LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_PRESS_LOCK);
+  attachGestureHandlers(photoFramePrevBtn);
+  lv_obj_add_event_cb(photoFramePrevBtn, photoFrameControlCallback, LV_EVENT_CLICKED, (void *)0);
+  lv_obj_t *photoPrevLabel = lv_label_create(photoFramePrevBtn);
+  lv_label_set_text(photoPrevLabel, "Prev");
+  lv_obj_center(photoPrevLabel);
+
+  photoFrameReloadBtn = lv_btn_create(photoNavBar);
+  lv_obj_set_size(photoFrameReloadBtn, 94, 38);
+  lv_obj_align(photoFrameReloadBtn, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_style_radius(photoFrameReloadBtn, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(photoFrameReloadBtn, lv_color_hex(0x252525), LV_PART_MAIN);
+  lv_obj_add_flag(photoFrameReloadBtn, LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_PRESS_LOCK);
+  attachGestureHandlers(photoFrameReloadBtn);
+  lv_obj_add_event_cb(photoFrameReloadBtn, photoFrameControlCallback, LV_EVENT_CLICKED, (void *)1);
+  lv_obj_t *photoReloadLabel = lv_label_create(photoFrameReloadBtn);
+  lv_label_set_text(photoReloadLabel, "Reload");
+  lv_obj_center(photoReloadLabel);
+
+  photoFrameNextBtn = lv_btn_create(photoNavBar);
+  lv_obj_set_size(photoFrameNextBtn, 94, 38);
+  lv_obj_align(photoFrameNextBtn, LV_ALIGN_RIGHT_MID, -6, 0);
+  lv_obj_set_style_radius(photoFrameNextBtn, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(photoFrameNextBtn, lv_color_hex(0x252525), LV_PART_MAIN);
+  lv_obj_add_flag(photoFrameNextBtn, LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_PRESS_LOCK);
+  attachGestureHandlers(photoFrameNextBtn);
+  lv_obj_add_event_cb(photoFrameNextBtn, photoFrameControlCallback, LV_EVENT_CLICKED, (void *)2);
+  lv_obj_t *photoNextLabel = lv_label_create(photoFrameNextBtn);
+  lv_label_set_text(photoNextLabel, "Next");
+  lv_obj_center(photoNextLabel);
+
+  photoFrameIndexLabel = lv_label_create(pages[UI_PAGE_PHOTO_FRAME]);
+  lv_label_set_text(photoFrameIndexLabel, "0/0");
+  lv_obj_set_style_text_color(photoFrameIndexLabel, lv_color_hex(0xBFBFBF), LV_PART_MAIN);
+  lv_obj_align(photoFrameIndexLabel, LV_ALIGN_BOTTOM_MID, 0, -12);
+
   // Global page indicator
   pageIndicatorLabel = lv_label_create(lv_scr_act());
   lv_obj_set_style_text_color(pageIndicatorLabel, lv_color_hex(0x8F8F8F), LV_PART_MAIN);
@@ -2358,6 +3171,8 @@ void setup() {
     snprintf(body, sizeof(body), "status: %s", sdMountReason);
     pushInboxMessage("alert", "SD not mounted", body);
   }
+  loadSdPhotoList();
+  showCurrentPhotoFrame();
 
   Serial.printf("Connecting WiFi: %s\n", WIFI_SSID);
   setWifiStatus("WiFi: connecting...");
