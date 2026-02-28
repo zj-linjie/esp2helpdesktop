@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include <math.h>
 #include "config.h"
 #include "display/scr_st77916.h"
 
@@ -44,10 +45,10 @@ struct TouchGestureState {
   uint32_t startMs = 0;
 };
 
-static constexpr int16_t SWIPE_THRESHOLD = 55;
-static constexpr int16_t SWIPE_DIRECTION_MARGIN = 10;
 static constexpr uint32_t LONG_PRESS_MS = 800;
-static constexpr int16_t CENTER_RADIUS = 72;
+static constexpr uint32_t CLICK_SUPPRESS_MS_AFTER_HOME = 320;
+static constexpr float HOME_DEG_TO_RAD = 0.01745329252f;
+static uint32_t suppressClickUntilMs = 0;
 
 static lv_obj_t *pages[UI_PAGE_COUNT] = {nullptr};
 static int currentPage = UI_PAGE_HOME;
@@ -57,6 +58,32 @@ static lv_obj_t *pageIndicatorLabel = nullptr;
 
 static lv_obj_t *homeWifiLabel = nullptr;
 static lv_obj_t *homeWsLabel = nullptr;
+static lv_obj_t *homeClockLabel = nullptr;
+static lv_obj_t *homeDateLabel = nullptr;
+
+struct HomeShortcutConfig {
+  const char *label;
+  const char *icon;
+  UiPage page;
+  uint32_t accentColor;
+};
+
+static const HomeShortcutConfig HOME_SHORTCUTS[] = {
+  {"Monitor", LV_SYMBOL_CHARGE, UI_PAGE_MONITOR, 0x6A1B9A},
+  {"Pomodoro", LV_SYMBOL_BELL, UI_PAGE_POMODORO, 0x7B1FA2},
+  {"Settings", LV_SYMBOL_SETTINGS, UI_PAGE_SETTINGS, 0x5E35B1},
+  {"Photo", LV_SYMBOL_IMAGE, UI_PAGE_PHOTO_FRAME, 0x673AB7},
+  {"Weather", LV_SYMBOL_GPS, UI_PAGE_WEATHER, 0x7E57C2},
+  {"Clock", LV_SYMBOL_REFRESH, UI_PAGE_CLOCK, 0x6A1B9A},
+  {"Apps", LV_SYMBOL_DIRECTORY, UI_PAGE_APP_LAUNCHER, 0x5E35B1},
+  {"Inbox", LV_SYMBOL_LIST, UI_PAGE_INBOX, 0x7B1FA2},
+};
+
+static constexpr uint8_t HOME_SHORTCUT_COUNT = sizeof(HOME_SHORTCUTS) / sizeof(HOME_SHORTCUTS[0]);
+static lv_obj_t *homeShortcutSlots[HOME_SHORTCUT_COUNT] = {nullptr};
+static lv_obj_t *homeShortcutButtons[HOME_SHORTCUT_COUNT] = {nullptr};
+static lv_obj_t *homeShortcutIcons[HOME_SHORTCUT_COUNT] = {nullptr};
+static lv_obj_t *homeShortcutLabels[HOME_SHORTCUT_COUNT] = {nullptr};
 
 static lv_obj_t *wifiLabel = nullptr;
 static lv_obj_t *wsLabel = nullptr;
@@ -187,6 +214,15 @@ static uint32_t lastPhotoSettingsRequestMs = 0;
 static uint32_t lastPhotoSettingsApplyMs = 0;
 static uint32_t lastPhotoAutoAdvanceMs = 0;
 static constexpr uint32_t PHOTO_SETTINGS_POLL_INTERVAL_MS = 10000;
+static uint32_t lastPhotoStateReportMs = 0;
+static uint32_t lastPhotoStateEventMs = 0;
+static constexpr uint32_t PHOTO_STATE_REPORT_INTERVAL_MS = 15000;
+static constexpr uint32_t PHOTO_STATE_EVENT_MIN_GAP_MS = 400;
+static char currentPhotoName[64] = "";
+static char currentPhotoPath[192] = "";
+static char currentPhotoDecoder[16] = "-";
+static bool currentPhotoValid = false;
+static uint16_t sdPhotoLimitSkipped = 0;
 
 enum PomodoroMode {
   POMODORO_WORK = 0,
@@ -270,11 +306,18 @@ static void updateClockDisplay();
 static void setWifiStatus(const String &text);
 static void setWsStatus(const String &text);
 static void gestureEventCallback(lv_event_t *e);
+static void attachGestureHandlers(lv_obj_t *obj);
 static void refreshInboxView();
 static void loadSdPhotoList();
 static void showCurrentPhotoFrame();
 static void requestPhotoFrameSettings(bool force = false);
 static void processPhotoFrameAutoPlay();
+static void sendPhotoFrameState(const char *reason, bool force = false);
+static void handlePhotoControlCommand(const JsonObjectConst &data);
+static bool shouldSuppressClick();
+static void suppressClicksAfterHome();
+static void homeShortcutEventCallback(lv_event_t *e);
+static void layoutHomeShortcuts();
 
 static int clampPercent(float value) {
   int v = (int)(value + 0.5f);
@@ -414,6 +457,9 @@ static void inboxActionEventCallback(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
     return;
   }
+  if (shouldSuppressClick()) {
+    return;
+  }
 
   intptr_t raw = (intptr_t)lv_event_get_user_data(e);
   InboxAction action = (InboxAction)raw;
@@ -467,6 +513,8 @@ static lv_obj_t *createInboxButton(lv_obj_t *parent, const char *text, lv_coord_
   lv_obj_set_style_bg_color(btn, lv_color_hex(0x2E2E2E), LV_PART_MAIN | LV_STATE_PRESSED);
   lv_obj_set_style_border_color(btn, lv_color_hex(0x3A3A3A), LV_PART_MAIN);
   lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN);
+  lv_obj_add_flag(btn, LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_PRESS_LOCK);
+  attachGestureHandlers(btn);
   lv_obj_add_event_cb(btn, inboxActionEventCallback, LV_EVENT_CLICKED, (void *)((intptr_t)action));
 
   lv_obj_t *label = lv_label_create(btn);
@@ -717,6 +765,15 @@ static const char *baseNameFromPath(const char *path) {
     return path;
   }
   return base + 1;
+}
+
+static int getPhotoScanLimit() {
+  int hardLimit = (int)(sizeof(sdPhotoFiles) / sizeof(sdPhotoFiles[0]));
+  int configuredLimit = (int)photoFrameSettings.maxPhotoCount;
+  if (configuredLimit <= 0) {
+    return hardLimit;
+  }
+  return min(hardLimit, configuredLimit);
 }
 
 static void freePhotoRawBytes() {
@@ -1023,7 +1080,9 @@ static void addPhotoCandidate(const char *path) {
   if (path == nullptr || path[0] == '\0') {
     return;
   }
-  if (sdPhotoCount >= (int)(sizeof(sdPhotoFiles) / sizeof(sdPhotoFiles[0]))) {
+  int limit = getPhotoScanLimit();
+  if (sdPhotoCount >= limit) {
+    sdPhotoLimitSkipped++;
     return;
   }
 
@@ -1037,7 +1096,8 @@ static void scanPhotoDirectoryRecursive(const char *dirPath, int depth) {
   if (dirPath == nullptr || depth > 4) {
     return;
   }
-  if (sdPhotoCount >= (int)(sizeof(sdPhotoFiles) / sizeof(sdPhotoFiles[0]))) {
+  int limit = getPhotoScanLimit();
+  if (sdPhotoCount >= limit) {
     return;
   }
 
@@ -1046,7 +1106,7 @@ static void scanPhotoDirectoryRecursive(const char *dirPath, int depth) {
     return;
   }
 
-  while (sdPhotoCount < (int)(sizeof(sdPhotoFiles) / sizeof(sdPhotoFiles[0]))) {
+  while (sdPhotoCount < limit) {
     File entry = dir.openNextFile();
     if (!entry) {
       break;
@@ -1079,6 +1139,7 @@ static void scanPhotoDirectoryRecursive(const char *dirPath, int depth) {
 static void loadSdPhotoList() {
   sdPhotoCount = 0;
   sdPhotoIndex = 0;
+  sdPhotoLimitSkipped = 0;
 
   if (!sdMounted) {
     setPhotoFrameStatus("SD not mounted", lv_color_hex(0xEF5350));
@@ -1087,13 +1148,18 @@ static void loadSdPhotoList() {
   }
 
   scanPhotoDirectoryRecursive("/", 0);
-  Serial.printf("[Photo] scanned %d image files (jpg/jpeg/sjpg)\n", sdPhotoCount);
+  Serial.printf("[Photo] scanned %d image files (jpg/jpeg/sjpg), skippedByLimit=%u limit=%d\n",
+                sdPhotoCount, sdPhotoLimitSkipped, getPhotoScanLimit());
 
   if (sdPhotoCount <= 0) {
     setPhotoFrameStatus("No JPG/JPEG/SJPG found", lv_color_hex(0xFFB74D));
   } else {
-    char status[48];
-    snprintf(status, sizeof(status), "Found %d images", sdPhotoCount);
+    char status[72];
+    if (sdPhotoLimitSkipped > 0) {
+      snprintf(status, sizeof(status), "Loaded %d images (limit %d)", sdPhotoCount, getPhotoScanLimit());
+    } else {
+      snprintf(status, sizeof(status), "Found %d images", sdPhotoCount);
+    }
     setPhotoFrameStatus(status, lv_color_hex(0x81C784));
   }
 
@@ -1189,7 +1255,12 @@ static void showCurrentPhotoFrame() {
     lv_label_set_text(photoFrameNameLabel, "No SD card");
     lv_label_set_text(photoFrameIndexLabel, "0/0");
     setPhotoFrameStatus("SD not mounted", lv_color_hex(0xEF5350));
+    currentPhotoValid = false;
+    copyText(currentPhotoName, sizeof(currentPhotoName), "");
+    copyText(currentPhotoPath, sizeof(currentPhotoPath), "");
+    copyText(currentPhotoDecoder, sizeof(currentPhotoDecoder), "-");
     updatePhotoFrameNavButtons();
+    sendPhotoFrameState("no_sd");
     return;
   }
 
@@ -1199,7 +1270,12 @@ static void showCurrentPhotoFrame() {
     lv_label_set_text(photoFrameNameLabel, "No JPG/JPEG/SJPG on SD");
     lv_label_set_text(photoFrameIndexLabel, "0/0");
     setPhotoFrameStatus("Tap Reload to rescan", lv_color_hex(0xFFB74D));
+    currentPhotoValid = false;
+    copyText(currentPhotoName, sizeof(currentPhotoName), "");
+    copyText(currentPhotoPath, sizeof(currentPhotoPath), "");
+    copyText(currentPhotoDecoder, sizeof(currentPhotoDecoder), "-");
     updatePhotoFrameNavButtons();
+    sendPhotoFrameState("empty");
     return;
   }
 
@@ -1264,7 +1340,12 @@ static void showCurrentPhotoFrame() {
     char status[96];
     snprintf(status, sizeof(status), "Decode failed: %s", failReason[0] == '\0' ? "unsupported files" : failReason);
     setPhotoFrameStatus(status, lv_color_hex(0xEF5350));
+    currentPhotoValid = false;
+    copyText(currentPhotoName, sizeof(currentPhotoName), "");
+    copyText(currentPhotoPath, sizeof(currentPhotoPath), "");
+    copyText(currentPhotoDecoder, sizeof(currentPhotoDecoder), "-");
     updatePhotoFrameNavButtons();
+    sendPhotoFrameState("decode_fail");
     return;
   }
 
@@ -1309,11 +1390,19 @@ static void showCurrentPhotoFrame() {
   char status[64];
   snprintf(status, sizeof(status), "Photo loaded (%s)", shownDecoder);
   setPhotoFrameStatus(status, lv_color_hex(0x81C784));
+  currentPhotoValid = true;
+  copyText(currentPhotoName, sizeof(currentPhotoName), photo.name);
+  copyText(currentPhotoPath, sizeof(currentPhotoPath), photo.path);
+  copyText(currentPhotoDecoder, sizeof(currentPhotoDecoder), shownDecoder);
   updatePhotoFrameNavButtons();
+  sendPhotoFrameState("show");
 }
 
 static void photoFrameControlCallback(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  if (shouldSuppressClick()) {
     return;
   }
 
@@ -1521,6 +1610,9 @@ static void settingsActionEventCallback(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
     return;
   }
+  if (shouldSuppressClick()) {
+    return;
+  }
 
   intptr_t raw = (intptr_t)lv_event_get_user_data(e);
   SettingsAction action = (SettingsAction)raw;
@@ -1567,6 +1659,8 @@ static lv_obj_t *createSettingsButton(lv_obj_t *parent, const char *text, lv_coo
   lv_obj_set_style_bg_color(btn, lv_color_hex(0x2B2B2B), LV_PART_MAIN | LV_STATE_PRESSED);
   lv_obj_set_style_border_color(btn, lv_color_hex(0x3A3A3A), LV_PART_MAIN);
   lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN);
+  lv_obj_add_flag(btn, LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_PRESS_LOCK);
+  attachGestureHandlers(btn);
   lv_obj_add_event_cb(btn, settingsActionEventCallback, LV_EVENT_CLICKED, (void *)((intptr_t)action));
 
   lv_obj_t *label = lv_label_create(btn);
@@ -1575,32 +1669,17 @@ static lv_obj_t *createSettingsButton(lv_obj_t *parent, const char *text, lv_coo
   return btn;
 }
 
-static bool getActiveTouchPoint(lv_point_t *point) {
-  lv_indev_t *indev = lv_indev_get_act();
-  if (indev == nullptr || point == nullptr) {
-    return false;
-  }
-
-  lv_indev_get_point(indev, point);
-  return true;
+static bool shouldSuppressClick() {
+  return (int32_t)(millis() - suppressClickUntilMs) < 0;
 }
 
-static bool isInsideCenter(const lv_point_t &point) {
-  lv_disp_t *disp = lv_disp_get_default();
-  if (disp == nullptr) {
-    return false;
-  }
-
-  int16_t cx = lv_disp_get_hor_res(disp) / 2;
-  int16_t cy = lv_disp_get_ver_res(disp) / 2;
-  int32_t dx = (int32_t)point.x - cx;
-  int32_t dy = (int32_t)point.y - cy;
-  return (dx * dx + dy * dy) <= (CENTER_RADIUS * CENTER_RADIUS);
+static void suppressClicksAfterHome() {
+  suppressClickUntilMs = millis() + CLICK_SUPPRESS_MS_AFTER_HOME;
 }
 
 static void updatePageIndicator() {
   if (pageIndicatorLabel != nullptr) {
-    lv_label_set_text_fmt(pageIndicatorLabel, "%d/%d", currentPage + 1, UI_PAGE_COUNT);
+    lv_obj_add_flag(pageIndicatorLabel, LV_OBJ_FLAG_HIDDEN);
   }
 }
 
@@ -1632,6 +1711,90 @@ static void showPage(int pageIndex) {
     requestPhotoFrameSettings(true);
   }
   updatePageIndicator();
+}
+
+static void homeShortcutEventCallback(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  if (shouldSuppressClick()) {
+    return;
+  }
+
+  intptr_t idxRaw = (intptr_t)lv_event_get_user_data(e);
+  if (idxRaw < 0 || idxRaw >= HOME_SHORTCUT_COUNT) {
+    return;
+  }
+
+  UiPage page = HOME_SHORTCUTS[idxRaw].page;
+  if (page >= 0 && page < UI_PAGE_COUNT) {
+    showPage((int)page);
+  }
+}
+
+static void layoutHomeShortcuts() {
+  lv_disp_t *disp = lv_disp_get_default();
+  if (disp == nullptr) {
+    return;
+  }
+
+  int16_t cx = lv_disp_get_hor_res(disp) / 2;
+  int16_t cy = lv_disp_get_ver_res(disp) / 2 + 4;
+  uint8_t total = HOME_SHORTCUT_COUNT;
+  uint8_t outerCount = (total > 8) ? 8 : total;
+  uint8_t innerCount = (total > outerCount) ? (total - outerCount) : 0;
+
+  for (uint8_t i = 0; i < outerCount; ++i) {
+    if (homeShortcutSlots[i] == nullptr || homeShortcutButtons[i] == nullptr || homeShortcutIcons[i] == nullptr || homeShortcutLabels[i] == nullptr) {
+      continue;
+    }
+
+    float angleDeg = -90.0f + (360.0f * (float)i / (float)outerCount);
+    float rad = angleDeg * HOME_DEG_TO_RAD;
+    int16_t slotSize = 88;
+    int16_t buttonSize = 56;
+    int16_t radius = 124;
+    int16_t x = cx + (int16_t)lroundf(cosf(rad) * radius) - slotSize / 2;
+    int16_t y = cy + (int16_t)lroundf(sinf(rad) * radius) - slotSize / 2;
+
+    lv_obj_set_size(homeShortcutSlots[i], slotSize, slotSize);
+    lv_obj_set_pos(homeShortcutSlots[i], x, y);
+    lv_obj_set_size(homeShortcutButtons[i], buttonSize, buttonSize);
+    lv_obj_set_style_radius(homeShortcutButtons[i], buttonSize / 2, LV_PART_MAIN);
+    lv_obj_align(homeShortcutButtons[i], LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_text_font(homeShortcutIcons[i], &lv_font_montserrat_22, LV_PART_MAIN);
+    lv_obj_center(homeShortcutIcons[i]);
+    lv_obj_set_style_text_font(homeShortcutLabels[i], &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_align(homeShortcutLabels[i], LV_ALIGN_BOTTOM_MID, 0, 0);
+  }
+
+  for (uint8_t i = 0; i < innerCount; ++i) {
+    uint8_t idx = outerCount + i;
+    if (idx >= HOME_SHORTCUT_COUNT) {
+      break;
+    }
+    if (homeShortcutSlots[idx] == nullptr || homeShortcutButtons[idx] == nullptr || homeShortcutIcons[idx] == nullptr || homeShortcutLabels[idx] == nullptr) {
+      continue;
+    }
+
+    float angleDeg = -90.0f + (360.0f * (float)i / (float)innerCount) + (180.0f / (float)innerCount);
+    float rad = angleDeg * HOME_DEG_TO_RAD;
+    int16_t slotSize = 72;
+    int16_t buttonSize = 44;
+    int16_t radius = 84;
+    int16_t x = cx + (int16_t)lroundf(cosf(rad) * radius) - slotSize / 2;
+    int16_t y = cy + (int16_t)lroundf(sinf(rad) * radius) - slotSize / 2;
+
+    lv_obj_set_size(homeShortcutSlots[idx], slotSize, slotSize);
+    lv_obj_set_pos(homeShortcutSlots[idx], x, y);
+    lv_obj_set_size(homeShortcutButtons[idx], buttonSize, buttonSize);
+    lv_obj_set_style_radius(homeShortcutButtons[idx], buttonSize / 2, LV_PART_MAIN);
+    lv_obj_align(homeShortcutButtons[idx], LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_text_font(homeShortcutIcons[idx], &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_center(homeShortcutIcons[idx]);
+    lv_obj_set_style_text_font(homeShortcutLabels[idx], &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_align(homeShortcutLabels[idx], LV_ALIGN_BOTTOM_MID, 0, 0);
+  }
 }
 
 static void attachGestureHandlers(lv_obj_t *obj) {
@@ -1762,6 +1925,9 @@ static void pomodoroTimerCallback(lv_timer_t *timer) {
 
 static void pomodoroControlCallback(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  if (shouldSuppressClick()) {
     return;
   }
 
@@ -1910,6 +2076,7 @@ static uint16_t clampPhotoMaxCount(long value) {
 static void applyPhotoFrameSettings(const JsonObjectConst &data) {
   uint16_t oldInterval = photoFrameSettings.slideshowIntervalSec;
   bool oldAutoPlay = photoFrameSettings.autoPlay;
+  uint16_t oldMaxPhotoCount = photoFrameSettings.maxPhotoCount;
   char oldTheme[24];
   copyText(oldTheme, sizeof(oldTheme), photoFrameSettings.theme);
 
@@ -1997,6 +2164,15 @@ static void applyPhotoFrameSettings(const JsonObjectConst &data) {
     );
     pushInboxMessage("event", "Photo settings synced", body);
   }
+
+  if (sdMounted && oldMaxPhotoCount != photoFrameSettings.maxPhotoCount) {
+    loadSdPhotoList();
+    if (currentPage == UI_PAGE_PHOTO_FRAME) {
+      showCurrentPhotoFrame();
+    }
+  }
+
+  sendPhotoFrameState("settings_sync", true);
 }
 
 static void requestPhotoFrameSettings(bool force) {
@@ -2042,6 +2218,134 @@ static void processPhotoFrameAutoPlay() {
   sdPhotoIndex = (sdPhotoIndex + 1) % sdPhotoCount;
   showCurrentPhotoFrame();
   lastPhotoAutoAdvanceMs = now;
+}
+
+static void sendPhotoFrameState(const char *reason, bool force) {
+  if (!isConnected) {
+    return;
+  }
+
+  uint32_t now = millis();
+  if (!force && (now - lastPhotoStateEventMs) < PHOTO_STATE_EVENT_MIN_GAP_MS) {
+    return;
+  }
+  if (force) {
+    lastPhotoStateReportMs = now;
+  }
+  lastPhotoStateEventMs = now;
+
+  StaticJsonDocument<512> doc;
+  doc["type"] = "photo_state";
+  JsonObject data = doc.createNestedObject("data");
+  data["deviceId"] = DEVICE_ID;
+  data["reason"] = (reason != nullptr) ? reason : "update";
+  data["pageActive"] = (currentPage == UI_PAGE_PHOTO_FRAME);
+  data["sdMounted"] = sdMounted;
+  data["total"] = sdPhotoCount;
+  data["index"] = (sdPhotoCount > 0) ? (sdPhotoIndex + 1) : 0;
+  data["autoPlay"] = photoFrameSettings.autoPlay;
+  data["slideshowInterval"] = photoFrameSettings.slideshowIntervalSec;
+  data["theme"] = photoFrameSettings.theme;
+  data["settingsSynced"] = photoFrameSettings.valid;
+  data["currentPhoto"] = currentPhotoName;
+  data["decoder"] = currentPhotoDecoder;
+  data["valid"] = currentPhotoValid;
+  data["maxPhotoCount"] = photoFrameSettings.maxPhotoCount;
+  data["skippedByLimit"] = sdPhotoLimitSkipped;
+  data["uptime"] = now / 1000;
+
+  String output;
+  serializeJson(doc, output);
+  webSocket.sendTXT(output);
+}
+
+static void handlePhotoControlCommand(const JsonObjectConst &data) {
+  const char *action = data["action"] | "";
+  if (action[0] == '\0') {
+    return;
+  }
+
+  bool handled = false;
+  if (strcmp(action, "prev") == 0) {
+    if (sdPhotoCount > 0) {
+      sdPhotoIndex = (sdPhotoIndex - 1 + sdPhotoCount) % sdPhotoCount;
+      showCurrentPhotoFrame();
+      lastPhotoAutoAdvanceMs = millis();
+      handled = true;
+      if (currentPage == UI_PAGE_PHOTO_FRAME) {
+        setPhotoFrameStatus("Remote: previous", lv_color_hex(0x90CAF9));
+      }
+    }
+  } else if (strcmp(action, "next") == 0) {
+    if (sdPhotoCount > 0) {
+      sdPhotoIndex = (sdPhotoIndex + 1) % sdPhotoCount;
+      showCurrentPhotoFrame();
+      lastPhotoAutoAdvanceMs = millis();
+      handled = true;
+      if (currentPage == UI_PAGE_PHOTO_FRAME) {
+        setPhotoFrameStatus("Remote: next", lv_color_hex(0x90CAF9));
+      }
+    }
+  } else if (strcmp(action, "reload") == 0) {
+    detectAndScanSdCard();
+    loadSdPhotoList();
+    showCurrentPhotoFrame();
+    lastPhotoAutoAdvanceMs = millis();
+    handled = true;
+    if (currentPage == UI_PAGE_PHOTO_FRAME) {
+      setPhotoFrameStatus("Remote: reload", lv_color_hex(0x90CAF9));
+    }
+  } else if (strcmp(action, "play") == 0) {
+    photoFrameSettings.autoPlay = true;
+    photoFrameSettings.valid = true;
+    lastPhotoAutoAdvanceMs = millis();
+    handled = true;
+    if (currentPage == UI_PAGE_PHOTO_FRAME) {
+      char status[64];
+      snprintf(status, sizeof(status), "Remote: auto on (%us)", photoFrameSettings.slideshowIntervalSec);
+      setPhotoFrameStatus(status, lv_color_hex(0x81C784));
+    }
+  } else if (strcmp(action, "pause") == 0) {
+    photoFrameSettings.autoPlay = false;
+    photoFrameSettings.valid = true;
+    handled = true;
+    if (currentPage == UI_PAGE_PHOTO_FRAME) {
+      setPhotoFrameStatus("Remote: auto off", lv_color_hex(0xFFB74D));
+    }
+  } else if (strcmp(action, "set_interval") == 0) {
+    long interval = photoFrameSettings.slideshowIntervalSec;
+    if (!data["intervalSec"].isNull()) {
+      interval = data["intervalSec"].as<long>();
+    } else if (!data["interval"].isNull()) {
+      interval = data["interval"].as<long>();
+    } else if (!data["slideshowInterval"].isNull()) {
+      interval = data["slideshowInterval"].as<long>();
+    }
+    photoFrameSettings.slideshowIntervalSec = clampPhotoSlideInterval(interval);
+    photoFrameSettings.valid = true;
+    lastPhotoAutoAdvanceMs = millis();
+    handled = true;
+    if (currentPage == UI_PAGE_PHOTO_FRAME) {
+      char status[64];
+      snprintf(status, sizeof(status), "Remote: interval %us", photoFrameSettings.slideshowIntervalSec);
+      setPhotoFrameStatus(status, lv_color_hex(0x81C784));
+    }
+  }
+
+  if (!handled) {
+    if (currentPage == UI_PAGE_PHOTO_FRAME) {
+      setPhotoFrameStatus("Remote command ignored", lv_color_hex(0xEF5350));
+    }
+    sendPhotoFrameState("remote_ignored", true);
+    return;
+  }
+
+  char body[112];
+  snprintf(body, sizeof(body), "Action=%s auto=%s interval=%us", action,
+           photoFrameSettings.autoPlay ? "on" : "off",
+           photoFrameSettings.slideshowIntervalSec);
+  pushInboxMessage("event", "Photo remote control", body);
+  sendPhotoFrameState("remote_control", true);
 }
 
 static uint32_t getColorFromString(const char* str) {
@@ -2226,6 +2530,7 @@ static void updateAppLauncherDisplay() {
     // Add click event
     lv_obj_add_event_cb(item, [](lv_event_t *e) {
       if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+      if (shouldSuppressClick()) return;
 
       lv_obj_t *target = lv_event_get_target(e);
       int appIdx = (int)(intptr_t)lv_obj_get_user_data(target);
@@ -2283,6 +2588,7 @@ static void updateAppLauncherDisplay() {
 
 static void appLauncherPageCallback(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (shouldSuppressClick()) return;
 
   intptr_t direction = (intptr_t)lv_event_get_user_data(e);
   int totalPages = (appCount > 0) ? ((appCount + APPS_PER_PAGE - 1) / APPS_PER_PAGE) : 1;
@@ -2301,15 +2607,19 @@ static void appLauncherPageCallback(lv_event_t *e) {
 }
 
 static void updateClockDisplay() {
-  if (clockLabel == nullptr) {
-    return;
-  }
-
   if (ntpConfigured) {
     struct tm timeinfo;
     if (getLocalTime(&timeinfo, 5)) {
       ntpSynced = true;
-      lv_label_set_text_fmt(clockLabel, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+      if (clockLabel != nullptr) {
+        lv_label_set_text_fmt(clockLabel, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+      }
+      if (homeClockLabel != nullptr) {
+        lv_label_set_text_fmt(homeClockLabel, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+      }
+      if (homeDateLabel != nullptr) {
+        lv_label_set_text_fmt(homeDateLabel, "%02d/%02d", timeinfo.tm_mon + 1, timeinfo.tm_mday);
+      }
 
       if (clockSecondLabel != nullptr) {
         lv_label_set_text_fmt(clockSecondLabel, ":%02d", timeinfo.tm_sec);
@@ -2337,7 +2647,15 @@ static void updateClockDisplay() {
   uint32_t h = (totalSeconds / 3600) % 24;
   uint32_t m = (totalSeconds / 60) % 60;
   uint32_t s = totalSeconds % 60;
-  lv_label_set_text_fmt(clockLabel, "%02lu:%02lu", h, m);
+  if (clockLabel != nullptr) {
+    lv_label_set_text_fmt(clockLabel, "%02lu:%02lu", h, m);
+  }
+  if (homeClockLabel != nullptr) {
+    lv_label_set_text_fmt(homeClockLabel, "%02lu:%02lu", h, m);
+  }
+  if (homeDateLabel != nullptr) {
+    lv_label_set_text(homeDateLabel, "syncing...");
+  }
 
   if (clockSecondLabel != nullptr) {
     lv_label_set_text_fmt(clockSecondLabel, ":%02lu", s);
@@ -2359,13 +2677,9 @@ static void gestureEventCallback(lv_event_t *e) {
   lv_event_code_t code = lv_event_get_code(e);
 
   if (code == LV_EVENT_PRESSED) {
-    lv_point_t point = {0, 0};
-    if (getActiveTouchPoint(&point)) {
-      gestureState.pressed = true;
-      gestureState.longPressHandled = false;
-      gestureState.startPoint = point;
-      gestureState.startMs = millis();
-    }
+    gestureState.pressed = true;
+    gestureState.longPressHandled = false;
+    gestureState.startMs = millis();
     return;
   }
 
@@ -2378,16 +2692,10 @@ static void gestureEventCallback(lv_event_t *e) {
       return;
     }
 
-    lv_point_t point = {0, 0};
-    if (!getActiveTouchPoint(&point)) {
-      return;
-    }
-
-    if (isInsideCenter(point)) {
-      gestureState.longPressHandled = true;
-      if (currentPage != UI_PAGE_HOME) {
-        showPage(UI_PAGE_HOME);
-      }
+    gestureState.longPressHandled = true;
+    if (currentPage != UI_PAGE_HOME) {
+      showPage(UI_PAGE_HOME);
+      suppressClicksAfterHome();
     }
     return;
   }
@@ -2396,25 +2704,6 @@ static void gestureEventCallback(lv_event_t *e) {
     if (!gestureState.pressed) {
       return;
     }
-
-    if (!gestureState.longPressHandled) {
-      lv_point_t endPoint = gestureState.startPoint;
-      getActiveTouchPoint(&endPoint);
-
-      int32_t dx = (int32_t)endPoint.x - gestureState.startPoint.x;
-      int32_t dy = (int32_t)endPoint.y - gestureState.startPoint.y;
-      int32_t adx = (dx >= 0) ? dx : -dx;
-      int32_t ady = (dy >= 0) ? dy : -dy;
-
-      if (adx >= SWIPE_THRESHOLD && adx > (ady + SWIPE_DIRECTION_MARGIN)) {
-        if (dx < 0) {
-          showPage(currentPage + 1);
-        } else {
-          showPage(currentPage - 1);
-        }
-      }
-    }
-
     gestureState = TouchGestureState();
     return;
   }
@@ -2428,24 +2717,108 @@ static void createUi() {
   lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_text_color(lv_scr_act(), lv_color_hex(0xFFFFFF), LV_PART_MAIN);
 
-  // Page 1: Home
+  // Page 1: Home Hub
   pages[UI_PAGE_HOME] = createBasePage();
-  lv_obj_t *homeTitle = lv_label_create(pages[UI_PAGE_HOME]);
-  lv_label_set_text(homeTitle, "ESP32 Desktop");
-  lv_obj_align(homeTitle, LV_ALIGN_TOP_MID, 0, 18);
 
-  homeWifiLabel = lv_label_create(pages[UI_PAGE_HOME]);
-  lv_label_set_text(homeWifiLabel, "WiFi: connecting...");
-  lv_obj_align(homeWifiLabel, LV_ALIGN_CENTER, 0, -18);
+  lv_obj_t *homeOuter = lv_obj_create(pages[UI_PAGE_HOME]);
+  lv_obj_set_size(homeOuter, 344, 344);
+  lv_obj_align(homeOuter, LV_ALIGN_CENTER, 0, 4);
+  lv_obj_set_style_radius(homeOuter, 172, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(homeOuter, lv_color_hex(0x0B0F20), LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_color(homeOuter, lv_color_hex(0x121A3A), LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_dir(homeOuter, LV_GRAD_DIR_VER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(homeOuter, 2, LV_PART_MAIN);
+  lv_obj_set_style_border_color(homeOuter, lv_color_hex(0x1C2448), LV_PART_MAIN);
+  lv_obj_clear_flag(homeOuter, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(homeOuter, LV_OBJ_FLAG_CLICKABLE);
 
-  homeWsLabel = lv_label_create(pages[UI_PAGE_HOME]);
-  lv_label_set_text(homeWsLabel, "WS: disconnected");
-  lv_obj_align(homeWsLabel, LV_ALIGN_CENTER, 0, 8);
+  lv_obj_t *homeInner = lv_obj_create(pages[UI_PAGE_HOME]);
+  lv_obj_set_size(homeInner, 304, 304);
+  lv_obj_align(homeInner, LV_ALIGN_CENTER, 0, 4);
+  lv_obj_set_style_radius(homeInner, 152, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(homeInner, lv_color_hex(0x111735), LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_color(homeInner, lv_color_hex(0x191F43), LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_dir(homeInner, LV_GRAD_DIR_VER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(homeInner, 1, LV_PART_MAIN);
+  lv_obj_set_style_border_color(homeInner, lv_color_hex(0x222B58), LV_PART_MAIN);
+  lv_obj_clear_flag(homeInner, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(homeInner, LV_OBJ_FLAG_CLICKABLE);
+
+  for (uint8_t i = 0; i < HOME_SHORTCUT_COUNT; ++i) {
+    const HomeShortcutConfig &item = HOME_SHORTCUTS[i];
+
+    homeShortcutSlots[i] = lv_obj_create(pages[UI_PAGE_HOME]);
+    lv_obj_remove_style_all(homeShortcutSlots[i]);
+    lv_obj_set_size(homeShortcutSlots[i], 88, 88);
+    lv_obj_set_style_bg_opa(homeShortcutSlots[i], LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_clear_flag(homeShortcutSlots[i], LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(homeShortcutSlots[i], LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(homeShortcutSlots[i], LV_OBJ_FLAG_GESTURE_BUBBLE);
+    attachGestureHandlers(homeShortcutSlots[i]);
+
+    homeShortcutButtons[i] = lv_btn_create(homeShortcutSlots[i]);
+    lv_obj_set_size(homeShortcutButtons[i], 56, 56);
+    lv_obj_align(homeShortcutButtons[i], LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_radius(homeShortcutButtons[i], 28, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(homeShortcutButtons[i], lv_color_hex(item.accentColor), LV_PART_MAIN);
+    lv_obj_set_style_bg_grad_color(homeShortcutButtons[i], lv_color_hex(0x8E24AA), LV_PART_MAIN);
+    lv_obj_set_style_bg_grad_dir(homeShortcutButtons[i], LV_GRAD_DIR_VER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(homeShortcutButtons[i], lv_color_hex(0x4A148C), LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_shadow_width(homeShortcutButtons[i], 14, LV_PART_MAIN);
+    lv_obj_set_style_shadow_color(homeShortcutButtons[i], lv_color_hex(item.accentColor), LV_PART_MAIN);
+    lv_obj_set_style_shadow_opa(homeShortcutButtons[i], LV_OPA_60, LV_PART_MAIN);
+    lv_obj_set_style_border_width(homeShortcutButtons[i], 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(homeShortcutButtons[i], lv_color_hex(0xD1C4E9), LV_PART_MAIN);
+    lv_obj_add_flag(homeShortcutButtons[i], LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_PRESS_LOCK);
+    attachGestureHandlers(homeShortcutButtons[i]);
+    lv_obj_add_event_cb(homeShortcutButtons[i], homeShortcutEventCallback, LV_EVENT_CLICKED, (void *)((intptr_t)i));
+
+    homeShortcutIcons[i] = lv_label_create(homeShortcutButtons[i]);
+    lv_label_set_text(homeShortcutIcons[i], item.icon);
+    lv_obj_set_style_text_color(homeShortcutIcons[i], lv_color_hex(0xF5EEFF), LV_PART_MAIN);
+    lv_obj_set_style_text_font(homeShortcutIcons[i], &lv_font_montserrat_22, LV_PART_MAIN);
+    lv_obj_center(homeShortcutIcons[i]);
+
+    homeShortcutLabels[i] = lv_label_create(homeShortcutSlots[i]);
+    lv_label_set_text(homeShortcutLabels[i], item.label);
+    lv_obj_set_style_text_color(homeShortcutLabels[i], lv_color_hex(0xC8D0FF), LV_PART_MAIN);
+    lv_obj_set_style_text_font(homeShortcutLabels[i], &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_align(homeShortcutLabels[i], LV_ALIGN_BOTTOM_MID, 0, 0);
+  }
+
+  lv_obj_t *homeCenter = lv_obj_create(pages[UI_PAGE_HOME]);
+  lv_obj_set_size(homeCenter, 128, 128);
+  lv_obj_align(homeCenter, LV_ALIGN_CENTER, 0, 4);
+  lv_obj_set_style_radius(homeCenter, 64, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(homeCenter, lv_color_hex(0x18305C), LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_color(homeCenter, lv_color_hex(0x102242), LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_dir(homeCenter, LV_GRAD_DIR_VER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(homeCenter, 2, LV_PART_MAIN);
+  lv_obj_set_style_border_color(homeCenter, lv_color_hex(0x2D5AA0), LV_PART_MAIN);
+  lv_obj_set_style_shadow_width(homeCenter, 20, LV_PART_MAIN);
+  lv_obj_set_style_shadow_color(homeCenter, lv_color_hex(0x1A3B74), LV_PART_MAIN);
+  lv_obj_set_style_shadow_opa(homeCenter, LV_OPA_50, LV_PART_MAIN);
+  lv_obj_clear_flag(homeCenter, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(homeCenter, LV_OBJ_FLAG_CLICKABLE);
+
+  homeClockLabel = lv_label_create(homeCenter);
+  lv_label_set_text(homeClockLabel, "--:--");
+  lv_obj_set_style_text_font(homeClockLabel, &lv_font_montserrat_32, LV_PART_MAIN);
+  lv_obj_set_style_text_color(homeClockLabel, lv_color_hex(0xF2F7FF), LV_PART_MAIN);
+  lv_obj_align(homeClockLabel, LV_ALIGN_CENTER, 0, -14);
+
+  homeDateLabel = lv_label_create(homeCenter);
+  lv_label_set_text(homeDateLabel, "--/--");
+  lv_obj_set_style_text_font(homeDateLabel, &lv_font_montserrat_16, LV_PART_MAIN);
+  lv_obj_set_style_text_color(homeDateLabel, lv_color_hex(0xB7D1FF), LV_PART_MAIN);
+  lv_obj_align(homeDateLabel, LV_ALIGN_CENTER, 0, 26);
 
   lv_obj_t *homeHint = lv_label_create(pages[UI_PAGE_HOME]);
-  lv_label_set_text(homeHint, "Swipe Left/Right to switch\nLong-press center to go Home");
-  lv_obj_set_style_text_align(homeHint, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-  lv_obj_align(homeHint, LV_ALIGN_BOTTOM_MID, 0, -34);
+  lv_label_set_text(homeHint, "Tap icon to open");
+  lv_obj_set_style_text_color(homeHint, lv_color_hex(0x8A93C8), LV_PART_MAIN);
+  lv_obj_align(homeHint, LV_ALIGN_BOTTOM_MID, 0, -10);
+
+  layoutHomeShortcuts();
 
   // Page 2: Monitor
   pages[UI_PAGE_MONITOR] = createBasePage();
@@ -2565,7 +2938,7 @@ static void createUi() {
   lv_obj_align(clockDateLabel, LV_ALIGN_BOTTOM_MID, 0, -54);
 
   lv_obj_t *clockHint = lv_label_create(pages[UI_PAGE_CLOCK]);
-  lv_label_set_text(clockHint, "Long-press center to return Home");
+  lv_label_set_text(clockHint, "Long-press anywhere to return Home");
   lv_obj_align(clockHint, LV_ALIGN_BOTTOM_MID, 0, -30);
 
   // Page 4: Settings & Diagnostics
@@ -2641,6 +3014,8 @@ static void createUi() {
   lv_obj_align(brightnessSlider, LV_ALIGN_TOP_LEFT, 90, 10);
   lv_slider_set_range(brightnessSlider, 5, 100);
   lv_slider_set_value(brightnessSlider, screenBrightness, LV_ANIM_OFF);
+  lv_obj_add_flag(brightnessSlider, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  attachGestureHandlers(brightnessSlider);
   lv_obj_add_event_cb(brightnessSlider, brightnessSliderEventCallback, LV_EVENT_VALUE_CHANGED, nullptr);
   lv_obj_add_event_cb(brightnessSlider, brightnessSliderEventCallback, LV_EVENT_RELEASED, nullptr);
 
@@ -2704,7 +3079,7 @@ static void createUi() {
   inboxDoneBtn = createInboxButton(pages[UI_PAGE_INBOX], "Mark Done", 190, 254, 136, INBOX_ACTION_DONE);
 
   inboxActionLabel = lv_label_create(pages[UI_PAGE_INBOX]);
-  lv_label_set_text(inboxActionLabel, "Swipe to browse");
+  lv_label_set_text(inboxActionLabel, "Use buttons | long-press for Home");
   lv_obj_set_style_text_color(inboxActionLabel, lv_color_hex(0xAFAFAF), LV_PART_MAIN);
   lv_obj_align(inboxActionLabel, LV_ALIGN_TOP_MID, 0, 296);
 
@@ -2754,6 +3129,8 @@ static void createUi() {
   lv_obj_align(startBtn, LV_ALIGN_BOTTOM_LEFT, 30, -36);
   lv_obj_set_style_radius(startBtn, 10, LV_PART_MAIN);
   lv_obj_set_style_bg_color(startBtn, lv_color_hex(0x1E1E1E), LV_PART_MAIN);
+  lv_obj_add_flag(startBtn, LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_PRESS_LOCK);
+  attachGestureHandlers(startBtn);
   lv_obj_add_event_cb(startBtn, pomodoroControlCallback, LV_EVENT_CLICKED, (void*)0);
   lv_obj_t *startLabel = lv_label_create(startBtn);
   lv_label_set_text(startLabel, "Start");
@@ -2764,6 +3141,8 @@ static void createUi() {
   lv_obj_align(resetBtn, LV_ALIGN_BOTTOM_MID, 0, -36);
   lv_obj_set_style_radius(resetBtn, 10, LV_PART_MAIN);
   lv_obj_set_style_bg_color(resetBtn, lv_color_hex(0x1E1E1E), LV_PART_MAIN);
+  lv_obj_add_flag(resetBtn, LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_PRESS_LOCK);
+  attachGestureHandlers(resetBtn);
   lv_obj_add_event_cb(resetBtn, pomodoroControlCallback, LV_EVENT_CLICKED, (void*)1);
   lv_obj_t *resetLabel = lv_label_create(resetBtn);
   lv_label_set_text(resetLabel, "Reset");
@@ -2774,6 +3153,8 @@ static void createUi() {
   lv_obj_align(skipBtn, LV_ALIGN_BOTTOM_RIGHT, -30, -36);
   lv_obj_set_style_radius(skipBtn, 10, LV_PART_MAIN);
   lv_obj_set_style_bg_color(skipBtn, lv_color_hex(0x1E1E1E), LV_PART_MAIN);
+  lv_obj_add_flag(skipBtn, LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_PRESS_LOCK);
+  attachGestureHandlers(skipBtn);
   lv_obj_add_event_cb(skipBtn, pomodoroControlCallback, LV_EVENT_CLICKED, (void*)2);
   lv_obj_t *skipLabel = lv_label_create(skipBtn);
   lv_label_set_text(skipLabel, "Skip");
@@ -3157,6 +3538,7 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
 
       // Request photo settings
       requestPhotoFrameSettings(true);
+      sendPhotoFrameState("ws_connected", true);
       break;
 
     case WStype_TEXT: {
@@ -3309,6 +3691,9 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
       } else if (strcmp(messageType, "photo_settings") == 0) {
         JsonObjectConst data = doc["data"].as<JsonObjectConst>();
         applyPhotoFrameSettings(data);
+      } else if (strcmp(messageType, "photo_control") == 0) {
+        JsonObjectConst data = doc["data"].as<JsonObjectConst>();
+        handlePhotoControlCommand(data);
       } else {
         Serial.printf("[WebSocket] unhandled type: %s\n", messageType);
         char body[96];
@@ -3418,6 +3803,10 @@ void loop() {
   if (currentPage == UI_PAGE_PHOTO_FRAME) {
     requestPhotoFrameSettings(false);
     processPhotoFrameAutoPlay();
+  }
+
+  if (isConnected && (millis() - lastPhotoStateReportMs) >= PHOTO_STATE_REPORT_INTERVAL_MS) {
+    sendPhotoFrameState("periodic", true);
   }
 
   lv_timer_handler();
