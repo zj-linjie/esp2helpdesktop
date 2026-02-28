@@ -1,12 +1,12 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-// WiFi 配置
+// WiFi 配置（本地开发请改为你的网络）
 #define WIFI_SSID "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 
-// WebSocket 服务器配置
-#define WS_SERVER_HOST "192.168.1.100"  // 替换为你的 Mac IP
+// WebSocket 服务器配置（本地开发请改为你的 Mac IP）
+#define WS_SERVER_HOST "192.168.1.100"
 #define WS_SERVER_PORT 8765
 
 // 屏幕配置

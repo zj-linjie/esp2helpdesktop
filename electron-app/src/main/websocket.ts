@@ -1,5 +1,9 @@
 import { WebSocketServer, WebSocket } from 'ws'
 import { SystemMonitor } from './system.js'
+import { exec } from 'child_process'
+import { promisify } from 'util'
+
+const execAsync = promisify(exec)
 
 interface ClientInfo {
   ws: WebSocket
@@ -143,6 +147,14 @@ export class DeviceWebSocketServer {
         this.handleWeatherRequest(ws, client, message)
         break
 
+      case 'app_list_request':
+        this.handleAppListRequest(ws, client, message)
+        break
+
+      case 'launch_app':
+        this.handleLaunchApp(ws, client, message)
+        break
+
       default:
         console.log('未知消息类型:', message.type)
     }
@@ -275,6 +287,97 @@ export class DeviceWebSocketServer {
           condition: 'Error',
           city: 'Beijing',
           updateTime: new Date().toISOString()
+        }
+      })
+    }
+  }
+
+  private async handleAppListRequest(ws: WebSocket, client: ClientInfo, message: any) {
+    if (client.type !== 'esp32_device') return
+
+    console.log(`[应用列表请求] 设备: ${client.deviceId}`)
+
+    try {
+      // 扫描 /Applications 目录
+      const { stdout } = await execAsync('ls -1 /Applications | grep ".app$"')
+      const appNames = stdout.trim().split('\n').filter((name: string) => name.length > 0)
+
+      const apps = appNames.slice(0, 12).map((name: string, index: number) => ({
+        id: `app-${index}`,
+        name: name.replace('.app', ''),
+        path: `/Applications/${name}`
+      }))
+
+      console.log(`[应用列表] 找到 ${apps.length} 个应用`)
+      console.log(`[应用列表] 应用:`, apps.map(a => a.name).join(', '))
+
+      // 发送应用列表给设备
+      this.sendMessage(ws, {
+        type: 'app_list',
+        data: {
+          apps
+        }
+      })
+    } catch (error) {
+      console.error('[应用列表请求] 失败:', error)
+      // 发送默认应用列表
+      this.sendMessage(ws, {
+        type: 'app_list',
+        data: {
+          apps: [
+            { id: 'app-1', name: 'Safari', path: '/Applications/Safari.app' },
+            { id: 'app-2', name: 'Mail', path: '/Applications/Mail.app' },
+            { id: 'app-3', name: 'Calendar', path: '/Applications/Calendar.app' },
+            { id: 'app-4', name: 'Notes', path: '/Applications/Notes.app' },
+            { id: 'app-5', name: 'Music', path: '/Applications/Music.app' },
+            { id: 'app-6', name: 'Photos', path: '/Applications/Photos.app' }
+          ]
+        }
+      })
+    }
+  }
+
+  private async handleLaunchApp(ws: WebSocket, client: ClientInfo, message: any) {
+    if (client.type !== 'esp32_device') return
+
+    const { appPath } = message.data
+    console.log(`[启动应用] 设备: ${client.deviceId}, 应用: ${appPath}`)
+
+    try {
+      // 使用 open 命令启动应用
+      await execAsync(`open "${appPath}"`)
+
+      console.log(`[启动应用] 成功: ${appPath}`)
+
+      // 发送成功响应
+      this.sendMessage(ws, {
+        type: 'launch_app_response',
+        data: {
+          success: true,
+          appPath,
+          message: 'App launched successfully'
+        }
+      })
+
+      // 转发到控制面板
+      this.broadcastToControlPanels({
+        type: 'app_launched',
+        data: {
+          deviceId: client.deviceId,
+          appPath,
+          success: true
+        }
+      })
+    } catch (error) {
+      console.error('[启动应用] 失败:', error)
+
+      // 发送失败响应
+      this.sendMessage(ws, {
+        type: 'launch_app_response',
+        data: {
+          success: false,
+          appPath,
+          message: 'Failed to launch app'
         }
       })
     }
