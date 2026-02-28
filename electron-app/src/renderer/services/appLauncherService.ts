@@ -19,6 +19,36 @@ export interface AppLauncherSettings {
 const STORAGE_KEY = 'app_launcher_settings';
 
 class AppLauncherService {
+  private syncSettingsToMainProcess(settings: AppLauncherSettings): void {
+    try {
+      const { ipcRenderer } = window.require('electron');
+      ipcRenderer.invoke('app-launcher-sync-settings', {
+        apps: settings.apps,
+      }).catch((error: unknown) => {
+        console.error('同步应用启动器设置到主进程失败:', error);
+      });
+    } catch (error) {
+      // In web-only environment, IPC may not be available.
+      console.debug('IPC 不可用，跳过主进程同步');
+    }
+  }
+
+  async loadSettingsFromMainProcess(): Promise<MacApp[] | null> {
+    try {
+      const { ipcRenderer } = window.require('electron');
+      const result = await ipcRenderer.invoke('app-launcher-get-settings');
+      if (result?.success && Array.isArray(result.apps)) {
+        const settings = this.getSettings();
+        settings.apps = result.apps;
+        this.saveSettings(settings);
+        return settings.apps;
+      }
+    } catch (error) {
+      console.error('从主进程读取应用启动器设置失败:', error);
+    }
+    return null;
+  }
+
   /**
    * 获取应用启动器设置
    */
@@ -26,13 +56,17 @@ class AppLauncherService {
     try {
       const stored = localStorage.getItem(STORAGE_KEY);
       if (stored) {
-        return JSON.parse(stored);
+        const parsed = JSON.parse(stored);
+        this.syncSettingsToMainProcess(parsed);
+        return parsed;
       }
     } catch (error) {
       console.error('读取应用启动器设置失败:', error);
     }
 
-    return this.getDefaultSettings();
+    const defaultSettings = this.getDefaultSettings();
+    this.syncSettingsToMainProcess(defaultSettings);
+    return defaultSettings;
   }
 
   /**
@@ -41,6 +75,7 @@ class AppLauncherService {
   saveSettings(settings: AppLauncherSettings): void {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+      this.syncSettingsToMainProcess(settings);
     } catch (error) {
       console.error('保存应用启动器设置失败:', error);
     }

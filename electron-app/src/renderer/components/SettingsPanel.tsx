@@ -55,7 +55,9 @@ const SettingsPanel: React.FC = () => {
     loadCities();
     loadApiKey();
     loadPhotoSettings();
-    loadApps();
+    loadApps().catch((error) => {
+      console.error('加载应用设置失败:', error);
+    });
   }, []);
 
   const loadCities = () => {
@@ -78,7 +80,12 @@ const SettingsPanel: React.FC = () => {
     setAutoCompress(settings.autoCompress);
   };
 
-  const loadApps = () => {
+  const loadApps = async () => {
+    const fromMain = await appLauncherService.loadSettingsFromMainProcess();
+    if (fromMain) {
+      setApps(fromMain);
+      return;
+    }
     const savedApps = appLauncherService.getApps();
     setApps(savedApps);
   };
@@ -97,14 +104,14 @@ const SettingsPanel: React.FC = () => {
 
   const handleAddApp = (app: MacApp) => {
     appLauncherService.addApp(app);
-    loadApps();
+    loadApps().catch((error) => console.error('刷新应用列表失败:', error));
     setAppSaveSuccess(true);
     setTimeout(() => setAppSaveSuccess(false), 2000);
   };
 
   const handleRemoveApp = (appId: string) => {
     appLauncherService.removeApp(appId);
-    loadApps();
+    loadApps().catch((error) => console.error('刷新应用列表失败:', error));
   };
 
   // 过滤可添加的应用

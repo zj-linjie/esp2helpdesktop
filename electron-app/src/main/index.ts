@@ -18,6 +18,69 @@ let wsServer: DeviceWebSocketServer
 let aiSimulator: AISimulator | null = null
 let mainWindow: BrowserWindow | null = null
 
+interface LauncherAppConfig {
+  id: string
+  name: string
+  path: string
+}
+
+const APP_LAUNCHER_SETTINGS_FILE = 'app-launcher-settings.json'
+let cachedCustomLauncherApps: LauncherAppConfig[] = []
+
+const normalizeLauncherApps = (apps: unknown): LauncherAppConfig[] => {
+  if (!Array.isArray(apps)) return []
+
+  const normalized: LauncherAppConfig[] = []
+  const seenPaths = new Set<string>()
+
+  for (const item of apps) {
+    if (!item || typeof item !== 'object') continue
+    const obj = item as Record<string, unknown>
+    const name = typeof obj.name === 'string' ? obj.name.trim() : ''
+    const appPath = typeof obj.path === 'string' ? obj.path.trim() : ''
+    if (!name || !appPath || seenPaths.has(appPath)) continue
+
+    seenPaths.add(appPath)
+    normalized.push({
+      id: typeof obj.id === 'string' && obj.id.trim() ? obj.id.trim() : `custom-${normalized.length + 1}`,
+      name,
+      path: appPath,
+    })
+
+    if (normalized.length >= 64) {
+      break
+    }
+  }
+
+  return normalized
+}
+
+const getAppLauncherSettingsPath = () => path.join(app.getPath('userData'), APP_LAUNCHER_SETTINGS_FILE)
+
+const loadCustomLauncherApps = async (): Promise<LauncherAppConfig[]> => {
+  try {
+    const filePath = getAppLauncherSettingsPath()
+    const raw = await fs.readFile(filePath, 'utf-8')
+    const parsed = JSON.parse(raw) as { apps?: unknown }
+    const apps = normalizeLauncherApps(parsed?.apps || [])
+    console.log(`[AppLauncher] 已加载自定义应用 ${apps.length} 项`)
+    return apps
+  } catch (error) {
+    // ignore file not found and start with empty configuration
+    return []
+  }
+}
+
+const saveCustomLauncherApps = async (apps: LauncherAppConfig[]): Promise<void> => {
+  const filePath = getAppLauncherSettingsPath()
+  const payload = {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    apps,
+  }
+  await fs.writeFile(filePath, JSON.stringify(payload, null, 2), 'utf-8')
+}
+
 // ASR 相关变量
 let asrSocket: WebSocket | null = null
 let asrTaskId: string | null = null
@@ -232,9 +295,11 @@ function createWindow() {
   }
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  cachedCustomLauncherApps = await loadCustomLauncherApps()
   createWindow()
   wsServer = new DeviceWebSocketServer(8765)
+  wsServer.setCustomLaunchApps(cachedCustomLauncherApps)
 
   // 注册 IPC 处理器
   setupIpcHandlers()
@@ -272,6 +337,33 @@ function setupIpcHandlers() {
       return { success: true, apps }
     } catch (error) {
       console.error('扫描应用失败:', error)
+      return { success: false, error: String(error), apps: [] }
+    }
+  })
+
+  ipcMain.handle('app-launcher-sync-settings', async (_event, payload: { apps?: unknown }) => {
+    try {
+      const apps = normalizeLauncherApps(payload?.apps || [])
+      cachedCustomLauncherApps = apps
+      await saveCustomLauncherApps(cachedCustomLauncherApps)
+      wsServer?.setCustomLaunchApps(cachedCustomLauncherApps)
+      console.log(`[AppLauncher] 已同步自定义应用 ${apps.length} 项`)
+      return { success: true, apps }
+    } catch (error) {
+      console.error('[AppLauncher] 同步设置失败:', error)
+      return { success: false, error: String(error) }
+    }
+  })
+
+  ipcMain.handle('app-launcher-get-settings', async () => {
+    try {
+      if (cachedCustomLauncherApps.length === 0) {
+        cachedCustomLauncherApps = await loadCustomLauncherApps()
+        wsServer?.setCustomLaunchApps(cachedCustomLauncherApps)
+      }
+      return { success: true, apps: cachedCustomLauncherApps }
+    } catch (error) {
+      console.error('[AppLauncher] 读取设置失败:', error)
       return { success: false, error: String(error), apps: [] }
     }
   })

@@ -16,12 +16,19 @@ interface ClientInfo {
   lastHeartbeat: number
 }
 
+interface LaunchAppConfig {
+  id: string
+  name: string
+  path: string
+}
+
 export class DeviceWebSocketServer {
   private wss: WebSocketServer
   private clients: Map<WebSocket, ClientInfo> = new Map()
   private systemMonitor: SystemMonitor
   private systemBroadcastInterval: NodeJS.Timeout | null = null
   private heartbeatMonitorInterval: NodeJS.Timeout | null = null
+  private customLaunchApps: LaunchAppConfig[] = []
 
   constructor(port: number = 8765) {
     this.wss = new WebSocketServer({ port })
@@ -72,6 +79,31 @@ export class DeviceWebSocketServer {
     })
 
     console.log(`WebSocket 服务器运行在端口 ${this.wss.options.port}`)
+  }
+
+  public setCustomLaunchApps(apps: Array<Partial<LaunchAppConfig>>): void {
+    const normalized: LaunchAppConfig[] = []
+    const seenPaths = new Set<string>()
+
+    for (const item of apps) {
+      const name = typeof item.name === 'string' ? item.name.trim() : ''
+      const path = typeof item.path === 'string' ? item.path.trim() : ''
+      if (!name || !path || seenPaths.has(path)) {
+        continue
+      }
+      seenPaths.add(path)
+      normalized.push({
+        id: typeof item.id === 'string' && item.id.trim() ? item.id.trim() : `custom-${normalized.length + 1}`,
+        name,
+        path
+      })
+      if (normalized.length >= 64) {
+        break
+      }
+    }
+
+    this.customLaunchApps = normalized
+    console.log(`[应用列表配置] 自定义应用已更新: ${this.customLaunchApps.length}`)
   }
 
   private async startSystemBroadcast() {
@@ -299,6 +331,16 @@ export class DeviceWebSocketServer {
     if (client.type !== 'esp32_device') return
 
     console.log(`[应用列表请求] 设备: ${client.deviceId}`)
+
+    if (this.customLaunchApps.length > 0) {
+      const apps = this.customLaunchApps.slice(0, 12)
+      console.log(`[应用列表] 使用自定义配置 ${apps.length} 项`)
+      this.sendMessage(ws, {
+        type: 'app_list',
+        data: { apps }
+      })
+      return
+    }
 
     try {
       // 扫描 /Applications 目录

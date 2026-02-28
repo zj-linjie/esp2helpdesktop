@@ -347,3 +347,30 @@ ioreg -p IOUSB -w0 -l | rg -i "esp|usb jtag|serial"
 
 - 现在 ESP32 从 WebSocket 端拿到的是后端临时扫描的 top 12。
 - 若要“后台自定义后再同步到硬件”，下一步应把 SettingsPanel 里维护的 app 列表接入 `websocket.ts` 的 `app_list_request` 响应源（而不是每次临时扫描）。
+
+---
+
+## 13. 2026-02-28 主线推进：自定义应用列表已接入 ESP32
+
+本轮已完成“Electron 后台自定义配置 -> ESP32 App Launcher”闭环：
+
+1. 主进程新增持久化  
+- 文件：`~/Library/Application Support/electron-app/app-launcher-settings.json`
+- 启动时自动加载并注入到 WebSocket 服务。
+
+2. WebSocket `app_list_request` 改造  
+- 优先返回主进程的自定义应用列表（最多 12 项）。
+- 仅当自定义列表为空时，才退回扫描 `/Applications`。
+
+3. IPC 同步接口  
+- `app-launcher-sync-settings`：渲染层保存后同步到主进程并落盘
+- `app-launcher-get-settings`：渲染层可从主进程拉取配置
+
+4. 渲染层服务接入  
+- `appLauncherService.saveSettings()` 自动触发 IPC 同步
+- 设置页加载时优先尝试从主进程读取，避免前后端配置漂移
+
+联调结果（已验证）：
+
+- 写入 2 条自定义应用（Safari/Calendar）后，设备请求 `app_list_request` 返回即为这 2 条；
+- 后端日志出现：`[应用列表] 使用自定义配置 2 项`。
