@@ -54,7 +54,9 @@ const SettingsPanel: React.FC = () => {
   useEffect(() => {
     loadCities();
     loadApiKey();
-    loadPhotoSettings();
+    loadPhotoSettings().catch((error) => {
+      console.error('加载相册设置失败:', error);
+    });
     loadApps().catch((error) => {
       console.error('加载应用设置失败:', error);
     });
@@ -70,8 +72,9 @@ const SettingsPanel: React.FC = () => {
     setApiKey(settings.apiKey || weatherConfig.apiKey);
   };
 
-  const loadPhotoSettings = () => {
-    const settings = settingsService.getPhotoSettings();
+  const loadPhotoSettings = async () => {
+    const fromMain = await settingsService.loadPhotoSettingsFromMainProcess();
+    const settings = fromMain || settingsService.getPhotoSettings();
     setPhotoFolder(settings.folderPath);
     setSlideshowInterval(settings.slideshowInterval);
     setAutoPlay(settings.autoPlay);

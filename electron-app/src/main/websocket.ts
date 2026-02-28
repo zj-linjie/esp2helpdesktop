@@ -22,6 +22,26 @@ interface LaunchAppConfig {
   path: string
 }
 
+export interface PhotoFrameSettings {
+  folderPath: string
+  slideshowInterval: number
+  autoPlay: boolean
+  theme: string
+  maxFileSize: number
+  autoCompress: boolean
+  maxPhotoCount: number
+}
+
+const DEFAULT_PHOTO_FRAME_SETTINGS: PhotoFrameSettings = {
+  folderPath: '/photos',
+  slideshowInterval: 5,
+  autoPlay: true,
+  theme: 'dark-gallery',
+  maxFileSize: 2,
+  autoCompress: true,
+  maxPhotoCount: 20,
+}
+
 export class DeviceWebSocketServer {
   private wss: WebSocketServer
   private clients: Map<WebSocket, ClientInfo> = new Map()
@@ -29,6 +49,7 @@ export class DeviceWebSocketServer {
   private systemBroadcastInterval: NodeJS.Timeout | null = null
   private heartbeatMonitorInterval: NodeJS.Timeout | null = null
   private customLaunchApps: LaunchAppConfig[] = []
+  private photoFrameSettings: PhotoFrameSettings = { ...DEFAULT_PHOTO_FRAME_SETTINGS }
 
   constructor(port: number = 8765) {
     this.wss = new WebSocketServer({ port })
@@ -104,6 +125,55 @@ export class DeviceWebSocketServer {
 
     this.customLaunchApps = normalized
     console.log(`[应用列表配置] 自定义应用已更新: ${this.customLaunchApps.length}`)
+  }
+
+  public setPhotoFrameSettings(settings: Partial<PhotoFrameSettings> | null | undefined): void {
+    if (!settings || typeof settings !== 'object') {
+      this.photoFrameSettings = { ...DEFAULT_PHOTO_FRAME_SETTINGS }
+      return
+    }
+
+    const slideshowIntervalRaw = Number(settings.slideshowInterval)
+    const maxFileSizeRaw = Number(settings.maxFileSize)
+    const maxPhotoCountRaw = Number(settings.maxPhotoCount)
+
+    this.photoFrameSettings = {
+      folderPath: typeof settings.folderPath === 'string' && settings.folderPath.trim().length > 0
+        ? settings.folderPath.trim()
+        : DEFAULT_PHOTO_FRAME_SETTINGS.folderPath,
+      slideshowInterval: Number.isFinite(slideshowIntervalRaw)
+        ? Math.max(3, Math.min(30, Math.round(slideshowIntervalRaw)))
+        : DEFAULT_PHOTO_FRAME_SETTINGS.slideshowInterval,
+      autoPlay: settings.autoPlay !== undefined ? Boolean(settings.autoPlay) : DEFAULT_PHOTO_FRAME_SETTINGS.autoPlay,
+      theme: typeof settings.theme === 'string' && settings.theme.trim().length > 0
+        ? settings.theme.trim()
+        : DEFAULT_PHOTO_FRAME_SETTINGS.theme,
+      maxFileSize: Number.isFinite(maxFileSizeRaw)
+        ? Math.max(1, Math.min(5, Math.round(maxFileSizeRaw * 2) / 2))
+        : DEFAULT_PHOTO_FRAME_SETTINGS.maxFileSize,
+      autoCompress: settings.autoCompress !== undefined ? Boolean(settings.autoCompress) : DEFAULT_PHOTO_FRAME_SETTINGS.autoCompress,
+      maxPhotoCount: Number.isFinite(maxPhotoCountRaw)
+        ? Math.max(1, Math.min(100, Math.round(maxPhotoCountRaw)))
+        : DEFAULT_PHOTO_FRAME_SETTINGS.maxPhotoCount,
+    }
+
+    console.log(
+      `[相册设置] 已更新: interval=${this.photoFrameSettings.slideshowInterval}s autoPlay=${this.photoFrameSettings.autoPlay} theme=${this.photoFrameSettings.theme}`
+    )
+  }
+
+  public getPhotoFrameSettings(): PhotoFrameSettings {
+    return { ...this.photoFrameSettings }
+  }
+
+  public broadcastPhotoFrameSettings(): void {
+    this.broadcastToDevices({
+      type: 'photo_settings',
+      data: {
+        ...this.photoFrameSettings,
+        timestamp: Date.now(),
+      },
+    })
   }
 
   private async startSystemBroadcast() {
@@ -190,9 +260,26 @@ export class DeviceWebSocketServer {
         this.handleLaunchApp(ws, client, message)
         break
 
+      case 'photo_settings_request':
+        this.handlePhotoSettingsRequest(ws, client)
+        break
+
       default:
         console.log('未知消息类型:', message.type)
     }
+  }
+
+  private handlePhotoSettingsRequest(ws: WebSocket, client: ClientInfo) {
+    if (client.type !== 'esp32_device') return
+
+    console.log(`[相册设置请求] 设备: ${client.deviceId}`)
+    this.sendMessage(ws, {
+      type: 'photo_settings',
+      data: {
+        ...this.photoFrameSettings,
+        timestamp: Date.now(),
+      },
+    })
   }
 
   private handleAIStatus(ws: WebSocket, client: ClientInfo, message: any) {

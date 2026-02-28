@@ -33,6 +33,34 @@ const STORAGE_KEY = 'weather_settings';
 const PHOTO_STORAGE_KEY = 'photo_settings';
 
 class SettingsService {
+  private syncPhotoSettingsToMainProcess(settings: PhotoSettings): void {
+    try {
+      const { ipcRenderer } = window.require('electron');
+      ipcRenderer.invoke('photo-frame-sync-settings', {
+        settings,
+      }).catch((error: unknown) => {
+        console.error('同步相册设置到主进程失败:', error);
+      });
+    } catch {
+      // In browser-only mode, IPC is unavailable.
+    }
+  }
+
+  async loadPhotoSettingsFromMainProcess(): Promise<PhotoSettings | null> {
+    try {
+      const { ipcRenderer } = window.require('electron');
+      const result = await ipcRenderer.invoke('photo-frame-get-settings');
+      if (result?.success && result.settings) {
+        const normalized = result.settings as PhotoSettings;
+        localStorage.setItem(PHOTO_STORAGE_KEY, JSON.stringify(normalized));
+        return normalized;
+      }
+    } catch (error) {
+      console.error('从主进程读取相册设置失败:', error);
+    }
+    return null;
+  }
+
   /**
    * 获取天气设置
    */
@@ -187,6 +215,7 @@ class SettingsService {
   savePhotoSettings(settings: PhotoSettings): void {
     try {
       localStorage.setItem(PHOTO_STORAGE_KEY, JSON.stringify(settings));
+      this.syncPhotoSettingsToMainProcess(settings);
     } catch (error) {
       console.error('保存相册设置失败:', error);
     }

@@ -172,6 +172,22 @@ static uint8_t *photoDecodedData = nullptr;
 static size_t photoDecodedDataSize = 0;
 static lv_img_dsc_t photoDecodedDsc;
 
+struct PhotoFrameRemoteSettings {
+  uint16_t slideshowIntervalSec = 5;
+  bool autoPlay = true;
+  char theme[24] = "dark-gallery";
+  float maxFileSizeMb = 2.0f;
+  bool autoCompress = true;
+  uint16_t maxPhotoCount = 20;
+  bool valid = false;
+};
+
+static PhotoFrameRemoteSettings photoFrameSettings;
+static uint32_t lastPhotoSettingsRequestMs = 0;
+static uint32_t lastPhotoSettingsApplyMs = 0;
+static uint32_t lastPhotoAutoAdvanceMs = 0;
+static constexpr uint32_t PHOTO_SETTINGS_POLL_INTERVAL_MS = 10000;
+
 enum PomodoroMode {
   POMODORO_WORK = 0,
   POMODORO_SHORT_BREAK = 1,
@@ -257,6 +273,8 @@ static void gestureEventCallback(lv_event_t *e);
 static void refreshInboxView();
 static void loadSdPhotoList();
 static void showCurrentPhotoFrame();
+static void requestPhotoFrameSettings(bool force = false);
+static void processPhotoFrameAutoPlay();
 
 static int clampPercent(float value) {
   int v = (int)(value + 0.5f);
@@ -1306,17 +1324,21 @@ static void photoFrameControlCallback(lv_event_t *e) {
       setPhotoFrameStatus("Loading previous photo...", lv_color_hex(0x90CAF9));
       sdPhotoIndex = (sdPhotoIndex - 1 + sdPhotoCount) % sdPhotoCount;
       showCurrentPhotoFrame();
+      lastPhotoAutoAdvanceMs = millis();
     }
   } else if (action == 1) { // Reload
     setPhotoFrameStatus("Rescanning SD...", lv_color_hex(0x90CAF9));
     detectAndScanSdCard();
     loadSdPhotoList();
     showCurrentPhotoFrame();
+    lastPhotoAutoAdvanceMs = millis();
+    requestPhotoFrameSettings(true);
   } else if (action == 2) { // Next
     if (sdPhotoCount > 0) {
       setPhotoFrameStatus("Loading next photo...", lv_color_hex(0x90CAF9));
       sdPhotoIndex = (sdPhotoIndex + 1) % sdPhotoCount;
       showCurrentPhotoFrame();
+      lastPhotoAutoAdvanceMs = millis();
     }
   }
 }
@@ -1606,6 +1628,8 @@ static void showPage(int pageIndex) {
       loadSdPhotoList();
     }
     showCurrentPhotoFrame();
+    lastPhotoAutoAdvanceMs = millis();
+    requestPhotoFrameSettings(true);
   }
   updatePageIndicator();
 }
@@ -1863,6 +1887,161 @@ static void weatherTimerCallback(lv_timer_t *timer) {
   if (!currentWeather.valid || (millis() - lastWeatherUpdateMs) >= WEATHER_UPDATE_INTERVAL_MS) {
     fetchWeatherData();
   }
+}
+
+static uint16_t clampPhotoSlideInterval(long value) {
+  if (value < 3) return 3;
+  if (value > 30) return 30;
+  return (uint16_t)value;
+}
+
+static float clampPhotoMaxFileSize(float value) {
+  if (value < 1.0f) return 1.0f;
+  if (value > 5.0f) return 5.0f;
+  return value;
+}
+
+static uint16_t clampPhotoMaxCount(long value) {
+  if (value < 1) return 1;
+  if (value > 100) return 100;
+  return (uint16_t)value;
+}
+
+static void applyPhotoFrameSettings(const JsonObjectConst &data) {
+  uint16_t oldInterval = photoFrameSettings.slideshowIntervalSec;
+  bool oldAutoPlay = photoFrameSettings.autoPlay;
+  char oldTheme[24];
+  copyText(oldTheme, sizeof(oldTheme), photoFrameSettings.theme);
+
+  long intervalValue = photoFrameSettings.slideshowIntervalSec;
+  if (!data["slideshowInterval"].isNull()) {
+    intervalValue = data["slideshowInterval"].as<long>();
+  } else if (!data["slideshow_interval"].isNull()) {
+    intervalValue = data["slideshow_interval"].as<long>();
+  }
+  photoFrameSettings.slideshowIntervalSec = clampPhotoSlideInterval(intervalValue);
+
+  if (!data["autoPlay"].isNull()) {
+    photoFrameSettings.autoPlay = data["autoPlay"].as<bool>();
+  } else if (!data["auto_play"].isNull()) {
+    photoFrameSettings.autoPlay = data["auto_play"].as<bool>();
+  }
+
+  const char *theme = photoFrameSettings.theme;
+  if (!data["theme"].isNull()) {
+    theme = data["theme"].as<const char *>();
+  }
+  copyText(photoFrameSettings.theme, sizeof(photoFrameSettings.theme), theme);
+
+  float maxFileSizeValue = photoFrameSettings.maxFileSizeMb;
+  if (!data["maxFileSize"].isNull()) {
+    maxFileSizeValue = data["maxFileSize"].as<float>();
+  } else if (!data["max_file_size"].isNull()) {
+    maxFileSizeValue = data["max_file_size"].as<float>();
+  }
+  photoFrameSettings.maxFileSizeMb = clampPhotoMaxFileSize(maxFileSizeValue);
+
+  if (!data["autoCompress"].isNull()) {
+    photoFrameSettings.autoCompress = data["autoCompress"].as<bool>();
+  } else if (!data["auto_compress"].isNull()) {
+    photoFrameSettings.autoCompress = data["auto_compress"].as<bool>();
+  }
+
+  long maxPhotoCountValue = photoFrameSettings.maxPhotoCount;
+  if (!data["maxPhotoCount"].isNull()) {
+    maxPhotoCountValue = data["maxPhotoCount"].as<long>();
+  } else if (!data["max_photo_count"].isNull()) {
+    maxPhotoCountValue = data["max_photo_count"].as<long>();
+  }
+  photoFrameSettings.maxPhotoCount = clampPhotoMaxCount(maxPhotoCountValue);
+  photoFrameSettings.valid = true;
+  lastPhotoSettingsApplyMs = millis();
+  lastPhotoAutoAdvanceMs = millis();
+
+  bool changed =
+    oldInterval != photoFrameSettings.slideshowIntervalSec ||
+    oldAutoPlay != photoFrameSettings.autoPlay ||
+    strcmp(oldTheme, photoFrameSettings.theme) != 0;
+
+  Serial.printf(
+    "[PhotoSettings] synced interval=%us autoPlay=%s theme=%s maxSize=%.1fMB autoCompress=%s maxCount=%u\n",
+    photoFrameSettings.slideshowIntervalSec,
+    photoFrameSettings.autoPlay ? "true" : "false",
+    photoFrameSettings.theme,
+    (double)photoFrameSettings.maxFileSizeMb,
+    photoFrameSettings.autoCompress ? "true" : "false",
+    photoFrameSettings.maxPhotoCount
+  );
+
+  if (currentPage == UI_PAGE_PHOTO_FRAME) {
+    char status[96];
+    snprintf(
+      status,
+      sizeof(status),
+      "Synced %us | %s",
+      photoFrameSettings.slideshowIntervalSec,
+      photoFrameSettings.autoPlay ? "auto on" : "auto off"
+    );
+    setPhotoFrameStatus(status, lv_color_hex(0x81C784));
+  }
+
+  if (changed) {
+    char body[112];
+    snprintf(
+      body,
+      sizeof(body),
+      "Interval %us, %s, %s",
+      photoFrameSettings.slideshowIntervalSec,
+      photoFrameSettings.autoPlay ? "auto on" : "auto off",
+      photoFrameSettings.theme
+    );
+    pushInboxMessage("event", "Photo settings synced", body);
+  }
+}
+
+static void requestPhotoFrameSettings(bool force) {
+  if (!isConnected) {
+    return;
+  }
+
+  uint32_t now = millis();
+  if (!force && (now - lastPhotoSettingsRequestMs) < PHOTO_SETTINGS_POLL_INTERVAL_MS) {
+    return;
+  }
+  lastPhotoSettingsRequestMs = now;
+
+  StaticJsonDocument<256> doc;
+  doc["type"] = "photo_settings_request";
+  JsonObject data = doc.createNestedObject("data");
+  data["deviceId"] = DEVICE_ID;
+  data["page"] = "photo_frame";
+  String output;
+  serializeJson(doc, output);
+  webSocket.sendTXT(output);
+  Serial.println("[PhotoSettings] request sent");
+}
+
+static void processPhotoFrameAutoPlay() {
+  if (currentPage != UI_PAGE_PHOTO_FRAME) {
+    return;
+  }
+  if (!photoFrameSettings.autoPlay || sdPhotoCount <= 1) {
+    return;
+  }
+
+  uint32_t intervalMs = (uint32_t)photoFrameSettings.slideshowIntervalSec * 1000UL;
+  if (intervalMs < 3000UL) {
+    intervalMs = 3000UL;
+  }
+
+  uint32_t now = millis();
+  if ((now - lastPhotoAutoAdvanceMs) < intervalMs) {
+    return;
+  }
+
+  sdPhotoIndex = (sdPhotoIndex + 1) % sdPhotoCount;
+  showCurrentPhotoFrame();
+  lastPhotoAutoAdvanceMs = now;
 }
 
 static uint32_t getColorFromString(const char* str) {
@@ -2975,6 +3154,9 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
 
       // Request app list
       requestAppList();
+
+      // Request photo settings
+      requestPhotoFrameSettings(true);
       break;
 
     case WStype_TEXT: {
@@ -3124,6 +3306,9 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
         appPage = 0;
         setAppLauncherStatus("App list updated", lv_color_hex(0x9CCC65), true, 1600);
         updateAppLauncherDisplay();
+      } else if (strcmp(messageType, "photo_settings") == 0) {
+        JsonObjectConst data = doc["data"].as<JsonObjectConst>();
+        applyPhotoFrameSettings(data);
       } else {
         Serial.printf("[WebSocket] unhandled type: %s\n", messageType);
         char body[96];
@@ -3228,6 +3413,11 @@ void loop() {
     } else {
       Serial.println("NTP retry failed");
     }
+  }
+
+  if (currentPage == UI_PAGE_PHOTO_FRAME) {
+    requestPhotoFrameSettings(false);
+    processPhotoFrameAutoPlay();
   }
 
   lv_timer_handler();

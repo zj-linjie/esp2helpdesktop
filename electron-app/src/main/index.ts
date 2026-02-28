@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, shell } from 'electron'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { DeviceWebSocketServer } from './websocket.js'
+import { DeviceWebSocketServer, type PhotoFrameSettings } from './websocket.js'
 import { AISimulator } from './ai-simulator.js'
 import fs from 'fs/promises'
 import crypto from 'crypto'
@@ -26,6 +26,17 @@ interface LauncherAppConfig {
 
 const APP_LAUNCHER_SETTINGS_FILE = 'app-launcher-settings.json'
 let cachedCustomLauncherApps: LauncherAppConfig[] = []
+const PHOTO_FRAME_SETTINGS_FILE = 'photo-frame-settings.json'
+const DEFAULT_PHOTO_FRAME_SETTINGS: PhotoFrameSettings = {
+  folderPath: '/photos',
+  slideshowInterval: 5,
+  autoPlay: true,
+  theme: 'dark-gallery',
+  maxFileSize: 2,
+  autoCompress: true,
+  maxPhotoCount: 20,
+}
+let cachedPhotoFrameSettings: PhotoFrameSettings = { ...DEFAULT_PHOTO_FRAME_SETTINGS }
 
 const normalizeLauncherApps = (apps: unknown): LauncherAppConfig[] => {
   if (!Array.isArray(apps)) return []
@@ -56,6 +67,7 @@ const normalizeLauncherApps = (apps: unknown): LauncherAppConfig[] => {
 }
 
 const getAppLauncherSettingsPath = () => path.join(app.getPath('userData'), APP_LAUNCHER_SETTINGS_FILE)
+const getPhotoFrameSettingsPath = () => path.join(app.getPath('userData'), PHOTO_FRAME_SETTINGS_FILE)
 
 const loadCustomLauncherApps = async (): Promise<LauncherAppConfig[]> => {
   try {
@@ -77,6 +89,64 @@ const saveCustomLauncherApps = async (apps: LauncherAppConfig[]): Promise<void> 
     version: 1,
     updatedAt: new Date().toISOString(),
     apps,
+  }
+  await fs.writeFile(filePath, JSON.stringify(payload, null, 2), 'utf-8')
+}
+
+const normalizePhotoFrameSettings = (settings: unknown): PhotoFrameSettings => {
+  if (!settings || typeof settings !== 'object') {
+    return { ...DEFAULT_PHOTO_FRAME_SETTINGS }
+  }
+
+  const source = settings as Record<string, unknown>
+  const slideshowIntervalRaw = Number(source.slideshowInterval)
+  const maxFileSizeRaw = Number(source.maxFileSize)
+  const maxPhotoCountRaw = Number(source.maxPhotoCount)
+
+  return {
+    folderPath: typeof source.folderPath === 'string' && source.folderPath.trim().length > 0
+      ? source.folderPath.trim()
+      : DEFAULT_PHOTO_FRAME_SETTINGS.folderPath,
+    slideshowInterval: Number.isFinite(slideshowIntervalRaw)
+      ? Math.max(3, Math.min(30, Math.round(slideshowIntervalRaw)))
+      : DEFAULT_PHOTO_FRAME_SETTINGS.slideshowInterval,
+    autoPlay: source.autoPlay !== undefined ? Boolean(source.autoPlay) : DEFAULT_PHOTO_FRAME_SETTINGS.autoPlay,
+    theme: typeof source.theme === 'string' && source.theme.trim().length > 0
+      ? source.theme.trim()
+      : DEFAULT_PHOTO_FRAME_SETTINGS.theme,
+    maxFileSize: Number.isFinite(maxFileSizeRaw)
+      ? Math.max(1, Math.min(5, Math.round(maxFileSizeRaw * 2) / 2))
+      : DEFAULT_PHOTO_FRAME_SETTINGS.maxFileSize,
+    autoCompress: source.autoCompress !== undefined
+      ? Boolean(source.autoCompress)
+      : DEFAULT_PHOTO_FRAME_SETTINGS.autoCompress,
+    maxPhotoCount: Number.isFinite(maxPhotoCountRaw)
+      ? Math.max(1, Math.min(100, Math.round(maxPhotoCountRaw)))
+      : DEFAULT_PHOTO_FRAME_SETTINGS.maxPhotoCount,
+  }
+}
+
+const loadPhotoFrameSettings = async (): Promise<PhotoFrameSettings> => {
+  try {
+    const filePath = getPhotoFrameSettingsPath()
+    const raw = await fs.readFile(filePath, 'utf-8')
+    const parsed = JSON.parse(raw) as { settings?: unknown }
+    const settings = normalizePhotoFrameSettings(parsed?.settings ?? parsed)
+    console.log(
+      `[PhotoFrame] 已加载设置 interval=${settings.slideshowInterval}s autoPlay=${settings.autoPlay} theme=${settings.theme}`
+    )
+    return settings
+  } catch {
+    return { ...DEFAULT_PHOTO_FRAME_SETTINGS }
+  }
+}
+
+const savePhotoFrameSettings = async (settings: PhotoFrameSettings): Promise<void> => {
+  const filePath = getPhotoFrameSettingsPath()
+  const payload = {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    settings,
   }
   await fs.writeFile(filePath, JSON.stringify(payload, null, 2), 'utf-8')
 }
@@ -297,9 +367,11 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   cachedCustomLauncherApps = await loadCustomLauncherApps()
+  cachedPhotoFrameSettings = await loadPhotoFrameSettings()
   createWindow()
   wsServer = new DeviceWebSocketServer(8765)
   wsServer.setCustomLaunchApps(cachedCustomLauncherApps)
+  wsServer.setPhotoFrameSettings(cachedPhotoFrameSettings)
 
   // 注册 IPC 处理器
   setupIpcHandlers()
@@ -365,6 +437,34 @@ function setupIpcHandlers() {
     } catch (error) {
       console.error('[AppLauncher] 读取设置失败:', error)
       return { success: false, error: String(error), apps: [] }
+    }
+  })
+
+  ipcMain.handle('photo-frame-sync-settings', async (_event, payload: { settings?: unknown }) => {
+    try {
+      const settings = normalizePhotoFrameSettings(payload?.settings)
+      cachedPhotoFrameSettings = settings
+      await savePhotoFrameSettings(cachedPhotoFrameSettings)
+      wsServer?.setPhotoFrameSettings(cachedPhotoFrameSettings)
+      wsServer?.broadcastPhotoFrameSettings()
+      console.log(
+        `[PhotoFrame] 已同步设置 interval=${settings.slideshowInterval}s autoPlay=${settings.autoPlay} theme=${settings.theme}`
+      )
+      return { success: true, settings }
+    } catch (error) {
+      console.error('[PhotoFrame] 同步设置失败:', error)
+      return { success: false, error: String(error), settings: cachedPhotoFrameSettings }
+    }
+  })
+
+  ipcMain.handle('photo-frame-get-settings', async () => {
+    try {
+      cachedPhotoFrameSettings = await loadPhotoFrameSettings()
+      wsServer?.setPhotoFrameSettings(cachedPhotoFrameSettings)
+      return { success: true, settings: cachedPhotoFrameSettings }
+    } catch (error) {
+      console.error('[PhotoFrame] 读取设置失败:', error)
+      return { success: false, error: String(error), settings: cachedPhotoFrameSettings }
     }
   })
 
