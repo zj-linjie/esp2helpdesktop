@@ -267,6 +267,28 @@ static void lcd_self_test_pattern(ESP_PanelLcd *panel)
   heap_caps_free(line_buf);
 }
 
+static void lcd_fill_color(ESP_PanelLcd *panel, uint16_t color)
+{
+  if (panel == NULL)
+    return;
+
+  uint16_t *line_buf = (uint16_t *)heap_caps_malloc(SCREEN_RES_HOR * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (line_buf == NULL)
+    return;
+
+  for (int x = 0; x < SCREEN_RES_HOR; ++x)
+  {
+    line_buf[x] = color;
+  }
+
+  for (int y = 0; y < SCREEN_RES_VER; ++y)
+  {
+    panel->drawBitmap(0, y, SCREEN_RES_HOR, 1, (const uint8_t *)line_buf);
+  }
+
+  heap_caps_free(line_buf);
+}
+
 void setRotation(uint8_t rot)
 {
   if (rot > 3)
@@ -438,9 +460,10 @@ void scr_lvgl_init()
   screen_switch(true);
   backlight->setBrightness(100); // 设置亮度
 
-  // Draw a low-level pattern before LVGL starts.
-  lcd_self_test_pattern(lcd);
-  delay(200);
+  // Clear LCD GRAM immediately after power-on to avoid random "snow" pixels
+  // before LVGL draws the first frame.
+  lcd_fill_color(lcd, 0x0000);
+  // Skip low-level RGB self-test pattern to avoid startup color bars.
 
   size_t lv_cache_rows = 72;
 

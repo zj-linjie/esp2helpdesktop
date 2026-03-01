@@ -198,6 +198,7 @@ static lv_obj_t *homeWallpaperImage = nullptr;
 static lv_obj_t *clockWallpaperImage = nullptr;
 static lv_obj_t *homeWallpaperShade = nullptr;
 static lv_obj_t *clockWallpaperShade = nullptr;
+static lv_obj_t *bootSplashOverlay = nullptr;
 
 static lv_obj_t *videoStatusLabel = nullptr;
 static lv_obj_t *videoTrackLabel = nullptr;
@@ -559,6 +560,8 @@ static void processDynamicWallpapers();
 static void refreshDynamicWallpaperSources();
 static void prepareDynamicWallpaperForPage(int pageIndex, bool forceFrame = false);
 static void pauseDynamicWallpapersForMs(uint32_t durationMs);
+static bool showBootSplashFromSd(uint32_t holdMs);
+static void clearBootSplashOverlay();
 static void sendSdListResponse(const char *requestId, int offset, int limit);
 static void sendSdDeleteResponse(const char *requestId, const char *targetPath, bool success, const char *reason);
 static void sendSdPreviewResponse(const char *requestId, const char *targetPath, bool success, uint32_t len, const char *reason);
@@ -2289,6 +2292,166 @@ static bool decodeVideoJpegToTrueColor(const uint8_t *jpegData, size_t jpegSize,
   copyText(reason, reasonSize, "sjpg disabled");
   return false;
 #endif
+}
+
+static bool showBootSplashFromSd(uint32_t holdMs) {
+  if (!sdMounted) {
+    Serial.printf("[BootSplash] skipped: SD unavailable (%s)\n", sdMountReason);
+    return false;
+  }
+  if (!ensurePhotoDecoderReady()) {
+    Serial.println("[BootSplash] decoder unavailable");
+    return false;
+  }
+  if (!ensureVideoFrameBuffer()) {
+    Serial.println("[BootSplash] frame buffer OOM");
+    return false;
+  }
+
+  char splashPath[192];
+  splashPath[0] = '\0';
+  bool gotPath = false;
+
+  if (photoFrameSettings.homeWallpaperPath[0] != '\0' &&
+      hasMjpegPlaybackExtension(photoFrameSettings.homeWallpaperPath) &&
+      SD_MMC.exists(photoFrameSettings.homeWallpaperPath)) {
+    copyText(splashPath, sizeof(splashPath), photoFrameSettings.homeWallpaperPath);
+    gotPath = true;
+  }
+
+  if (!gotPath) {
+    static const char *BOOT_SPLASH_CANDIDATES[] = {
+      "/night7/boot.mjpeg",
+      "/night7/rhythmbg.mjpeg",
+      "/mjpeg/my0.mjpeg",
+      "/mjpeg/my1.mjpeg",
+    };
+    gotPath = pickFirstExistingPath(
+      BOOT_SPLASH_CANDIDATES,
+      sizeof(BOOT_SPLASH_CANDIDATES) / sizeof(BOOT_SPLASH_CANDIDATES[0]),
+      splashPath,
+      sizeof(splashPath)
+    );
+  }
+
+  if (!gotPath) {
+    gotPath = findFirstMjpegInDirectory("/night7", 0, splashPath, sizeof(splashPath)) ||
+              findFirstMjpegInDirectory("/mjpeg", 0, splashPath, sizeof(splashPath));
+  }
+  if (!gotPath) {
+    Serial.println("[BootSplash] no mjpeg source");
+    return false;
+  }
+
+  File splashFile = SD_MMC.open(splashPath, FILE_READ);
+  if (!splashFile) {
+    Serial.printf("[BootSplash] open failed: %s\n", splashPath);
+    return false;
+  }
+
+  size_t frameSize = 0;
+  char reason[72];
+  bool gotFrame = readNextMjpegFrame(
+    splashFile,
+    videoFrameData,
+    VIDEO_FRAME_MAX_BYTES,
+    &frameSize,
+    reason,
+    sizeof(reason)
+  );
+  splashFile.close();
+  if (!gotFrame || frameSize == 0) {
+    Serial.printf("[BootSplash] frame read failed: %s\n", reason[0] == '\0' ? "unknown" : reason);
+    return false;
+  }
+
+  lv_img_header_t frameHeader;
+  if (!decodeVideoJpegToTrueColor(videoFrameData, frameSize, &frameHeader, reason, sizeof(reason))) {
+    Serial.printf("[BootSplash] frame decode failed: %s\n", reason[0] == '\0' ? "unknown" : reason);
+    return false;
+  }
+
+  lv_obj_t *splashImage = lv_img_create(lv_scr_act());
+  lv_obj_clear_flag(splashImage, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+  lv_img_set_src(splashImage, (const void *)&videoDecodedDsc);
+
+  int32_t zoomW = ((int32_t)SCREEN_RES_HOR * 256) / frameHeader.w;
+  int32_t zoomH = ((int32_t)SCREEN_RES_VER * 256) / frameHeader.h;
+  int32_t zoom = (zoomW < zoomH) ? zoomW : zoomH;
+  if (zoom > 256) zoom = 256;
+  if (zoom < 16) zoom = 16;
+  lv_obj_set_size(splashImage, frameHeader.w, frameHeader.h);
+  lv_img_set_pivot(splashImage, frameHeader.w / 2, frameHeader.h / 2);
+  lv_img_set_zoom(splashImage, (uint16_t)zoom);
+  lv_obj_center(splashImage);
+
+  lv_timer_handler();
+  Serial.printf("[BootSplash] showing %s for %u ms\n", splashPath, (unsigned)holdMs);
+  uint32_t startMs = millis();
+  uint32_t nextAnimMs = startMs + 60;
+  uint32_t minEndMs = startMs + holdMs;
+  uint32_t hardEndMs = startMs + holdMs + 60000;
+  uint32_t frameCount = 1;
+  bool reachedEof = false;
+  File animFile = SD_MMC.open(splashPath, FILE_READ);
+  while (true) {
+    uint32_t now = millis();
+    if (!reachedEof && animFile && now >= nextAnimMs) {
+      size_t animFrameSize = 0;
+      char animReason[48];
+      if (!readNextMjpegFrame(animFile, videoFrameData, VIDEO_FRAME_MAX_BYTES, &animFrameSize, animReason, sizeof(animReason))) {
+        reachedEof = true;
+      }
+      if (animFrameSize > 0) {
+        lv_img_header_t animHeader;
+        if (decodeVideoJpegToTrueColor(videoFrameData, animFrameSize, &animHeader, animReason, sizeof(animReason))) {
+          lv_img_set_src(splashImage, nullptr);
+          lv_img_set_src(splashImage, (const void *)&videoDecodedDsc);
+          frameCount++;
+          if (animHeader.w != frameHeader.w || animHeader.h != frameHeader.h) {
+            int32_t zW = ((int32_t)SCREEN_RES_HOR * 256) / animHeader.w;
+            int32_t zH = ((int32_t)SCREEN_RES_VER * 256) / animHeader.h;
+            int32_t z = (zW < zH) ? zW : zH;
+            if (z > 256) z = 256;
+            if (z < 16) z = 16;
+            lv_obj_set_size(splashImage, animHeader.w, animHeader.h);
+            lv_img_set_pivot(splashImage, animHeader.w / 2, animHeader.h / 2);
+            lv_img_set_zoom(splashImage, (uint16_t)z);
+            lv_obj_center(splashImage);
+            frameHeader = animHeader;
+          }
+        }
+      }
+      nextAnimMs = now + 60;
+    }
+    lv_timer_handler();
+    delay(4);
+    if (reachedEof && now >= minEndMs) {
+      break;
+    }
+    if (now >= hardEndMs) {
+      Serial.printf("[BootSplash] timeout after %u ms, frames=%u\n", (unsigned)(now - startMs), (unsigned)frameCount);
+      break;
+    }
+  }
+  if (animFile) {
+    animFile.close();
+  }
+
+  if (bootSplashOverlay != nullptr && bootSplashOverlay != splashImage) {
+    lv_obj_del(bootSplashOverlay);
+  }
+  bootSplashOverlay = splashImage;
+  Serial.printf("[BootSplash] done, frames=%u eof=%d\n", (unsigned)frameCount, reachedEof ? 1 : 0);
+  return true;
+}
+
+static void clearBootSplashOverlay() {
+  if (bootSplashOverlay != nullptr) {
+    lv_obj_del(bootSplashOverlay);
+    bootSplashOverlay = nullptr;
+    lv_timer_handler();
+  }
 }
 
 static bool renderNextVideoFrame(bool allowLoop, char *reason, size_t reasonSize) {
@@ -7665,9 +7828,28 @@ void setup() {
   }
 
   scr_lvgl_init();
-  createUi();
   resetSdUploadSession(false);
   detectAndScanSdCard();
+  // Some cards need a short settle period right after power-on.
+  if (!sdMounted) {
+    delay(120);
+    detectAndScanSdCard();
+  }
+  bool bootSplashShown = showBootSplashFromSd(1800);
+  createUi();
+  clearBootSplashOverlay();
+  if (!bootSplashShown) {
+    if (!sdMounted) {
+      detectAndScanSdCard();
+    }
+    if (sdMounted) {
+      Serial.println("[BootSplash] retry after UI init");
+      bootSplashShown = showBootSplashFromSd(1200);
+      clearBootSplashOverlay();
+    }
+  }
+  refreshDynamicWallpaperSources();
+  prepareDynamicWallpaperForPage(currentPage, true);
   if (sdMounted) {
     char body[128];
     snprintf(
